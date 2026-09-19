@@ -1,0 +1,5 @@
+[run]
+workers = 2
+
+[order]
+first = ["slow thing"]

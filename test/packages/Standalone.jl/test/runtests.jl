@@ -1,0 +1,2 @@
+using YATF
+YATF.runtests()

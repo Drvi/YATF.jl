@@ -1,0 +1,110 @@
+using YATF: read_config, ConfigError, Profile, DEFAULT_PROFILE, auto_workers
+
+function with_toml(f, contents::AbstractString)
+    dir = mktempdir()
+    write(joinpath(dir, "TestItems.toml"), contents)
+    return f(dir)
+end
+
+@testset "config" begin
+    @testset "defaults without a TestItems.toml" begin
+        cfg = read_config(mktempdir())
+        @test cfg.workers >= 1
+        @test cfg.timeout_s == 30 * 60
+        @test cfg.retries == 0
+        @test cfg.memory_threshold == 0.9
+        @test haskey(cfg.profiles, DEFAULT_PROFILE)
+        @test isempty(cfg.order_first) && isempty(cfg.order_last)
+    end
+
+    @testset "TestItems.toml is read" begin
+        with_toml("""
+        [run]
+        workers = 3
+        timeout = 120
+        retries = 2
+        logs = "eager"
+
+        [order]
+        first = ["a"]
+        last = ["z"]
+
+        [profiles.bounds]
+        julia_args = ["--check-bounds=yes"]
+        threads = "4"
+        env = { FOO = "1" }
+        init = "using Test"
+        test_end = "GC.gc(true)"
+        """) do dir
+            cfg = read_config(dir)
+            @test cfg.workers == 3
+            @test cfg.timeout_s == 120
+            @test cfg.retries == 2
+            @test cfg.logs === :eager
+            @test cfg.order_first == ["a"] && cfg.order_last == ["z"]
+            p = cfg.profiles[:bounds]
+            @test p.julia_args == ["--check-bounds=yes"]
+            @test p.threads == "4"
+            @test p.env == ["FOO" => "1"]
+            @test p.init.head === :block && !isempty(p.init.args)
+            @test p.test_end.head === :block
+        end
+    end
+
+    @testset "an explicit keyword beats the file" begin
+        with_toml("[run]\nworkers = 3\n") do dir
+            @test read_config(dir; workers=7).workers == 7
+            @test read_config(dir).workers == 3
+        end
+    end
+
+    @testset "unknown keys are errors, not no-ops" begin
+        for (toml, needle) in (
+            ("[run]\nworkerz = 2\n", "unknown key `workerz`"),
+            ("[orderr]\nfirst = []\n", "unknown key `orderr`"),
+            ("[order]\nfirstt = []\n", "unknown key `firstt`"),
+            ("[profiles.p]\njulia_argz = []\n", "unknown key `julia_argz`"),
+        )
+            with_toml(toml) do dir
+                err = try; read_config(dir); catch e; e; end
+                @test err isa ConfigError
+                @test occursin(needle, sprint(showerror, err))
+            end
+        end
+    end
+
+    @testset "init expressions are parsed here, not on a worker" begin
+        with_toml("[profiles.p]\ninit = \"using \"\n") do dir
+            err = try; read_config(dir); catch e; e; end
+            @test err isa ConfigError
+            @test occursin("could not parse `init`", sprint(showerror, err))
+        end
+        with_toml("[profiles.p]\ntest_end = \"1 +\"\n") do dir
+            @test_throws ConfigError read_config(dir)
+        end
+    end
+
+    @testset "values are validated" begin
+        for toml in ("[run]\nworkers = -1\n", "[run]\ntimeout = 0\n", "[run]\nretries = -1\n",
+                     "[run]\nmemory_threshold = 1.5\n", "[run]\nlogs = \"loud\"\n",
+                     "[run]\nworkers = \"most\"\n")
+            with_toml(toml) do dir
+                @test_throws ConfigError read_config(dir)
+            end
+        end
+    end
+
+    @testset "malformed TOML is an error with the file named" begin
+        with_toml("[run\n") do dir
+            err = try; read_config(dir); catch e; e; end
+            @test err isa ConfigError
+            @test occursin("TestItems.toml", sprint(showerror, err))
+        end
+    end
+
+    @testset "auto worker count" begin
+        @test auto_workers("2", 0) >= 1
+        @test auto_workers("2", 1) == 1          # never more workers than there is work
+        @test auto_workers("2", 100) <= 8
+    end
+end
