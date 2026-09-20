@@ -1,8 +1,7 @@
 # YATF.jl
 
 Yet another testing framework. Runs a package's tests as independent *test items*
-across worker processes, with the framework's own failure modes pinned down
-([`docs/design.md`](docs/design.md)).
+across worker processes.
 
 Julia 1.12+. Three dependencies: `TestEnv` to build the environment tests run in,
 `PrecompileTools` to keep the time before the first test item short, and
