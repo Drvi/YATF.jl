@@ -24,7 +24,7 @@ using YATFWorkers: YATFWorkers
     lines = split(log, '\n')
 
     @testset "every item announces its start and its end" begin
-        starts = filter(l -> occursin("· START", l), lines)
+        starts = filter(l -> occursin("· RUN", l), lines)
         dones  = filter(l -> occursin("· DONE", l), lines)
         @test length(starts) == 6
         @test length(dones) == 6
@@ -33,12 +33,12 @@ using YATFWorkers: YATFWorkers
         for l in starts
             @test occursin(
                 Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_RUNNING) w\\d+ · " *
-                      "\\d\\d:\\d\\d:\\d\\d · START · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
+                      "\\d\\d:\\d\\d:\\d\\d · RUN  · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
         end
         for l in dones
             @test occursin(
                 Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_PASSED) w\\d+ · " *
-                      "\\d\\d:\\d\\d:\\d\\d · DONE  · \\d/6 · \".+\"\\s+· PASS · "), l)
+                      "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
             @test occursin("maxrss", l)
         end
     end
@@ -69,7 +69,8 @@ using YATFWorkers: YATFWorkers
         @test any(l -> occursin("mem ", l), status)
         @test any(l -> occursin("load ", l), status)   # CPU load, as well as memory
         @test any(l -> occursin("workers", l), status)
-        @test any(l -> occursin("tree max", l), status)
+        @test any(l -> occursin("tree mem", l), status)
+        @test any(l -> occursin("(max ", l), status)
     end
 
     @testset "a run with no workers concludes without claiming one" begin
@@ -184,7 +185,7 @@ using YATFWorkers: YATFWorkers
     @testset "no two writers share a line" begin
         # A marker that starts a line must never appear in the middle of one:
         # that is what interleaved writes look like.
-        for marker in ("[YATF]", "· START", "· DONE", "Captured logs:")
+        for marker in ("[YATF]", "· RUN", "· DONE", "Captured logs:")
             for l in lines
                 occursin(marker, l) || continue
                 @test count(marker, l) == 1

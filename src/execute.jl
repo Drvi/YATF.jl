@@ -180,6 +180,9 @@ mutable struct Run
     const t0::Float64
     runstate::Union{Nothing, RunStateFile}
     monitor::Union{Nothing, Monitor}
+    # Profile name -> the project directory its workers run in. Only profiles that
+    # declare preferences have one; everything else uses the test environment.
+    const profile_projects::Dict{Symbol, String}
     @atomic ndone::Int
 end
 
@@ -200,7 +203,7 @@ function execute(p::Plan, target)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"),
         YATFWorkers.name_width(p.items.name; columns = YATFWorkers.terminal_columns()),
-        ReentrantLock(), time(), nothing, nothing, 0
+        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0
     )
     run.runstate = open_runstate(p)
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
@@ -223,6 +226,7 @@ function execute(p::Plan, target)
             p.startup.env = time() - t_env
             with_load_path(setup_path) do
                 t_pre = time()
+                profile_projects!(run, p)
                 precompile_phase(run, p, target)
                 p.startup.precompile = time() - t_pre
                 # Printed once everything before the tests is done, so it can say what
@@ -438,7 +442,180 @@ end
 # One process precompiles what every worker is about to need. Without this, N
 # workers hit the same cold cache at the same moment and serialize on Julia's
 # precompilation lock exactly when the run starts.
+"""
+    profile_projects!(run, p)
+
+Give every profile that declares preferences a project of its own, and record
+where it is.
+
+A package takes its preferences from the environment that owns it. A second
+environment stacked above the first is not consulted — measured — so a profile's
+preferences cannot be layered onto the test environment and have to arrive as the
+worker's own project. Each directory holds the test environment's `Project.toml`
+and `Manifest.toml`, so every package resolves to the same version it would
+otherwise, over a `LocalPreferences.toml` of the environment's own preferences
+with the profile's laid on top.
+
+Preferences are part of a cache's identity, so these projects keep caches of their
+own rather than displacing the ones the other workers use.
+"""
+function profile_projects!(run::Run, p::Plan)
+    env = Base.active_project()
+    env === nothing && return nothing
+    root = dirname(env)
+    for prof in values(p.profiles)
+        isempty(prof.preferences) && continue
+        dir = joinpath(root, string("yatf_profile_", prof.name))
+        mkpath(dir)
+        for file in ("Project.toml", "Manifest.toml")
+            src = joinpath(root, file)
+            isfile(src) && cp(src, joinpath(dir, file); force = true)
+        end
+        own = joinpath(root, "LocalPreferences.toml")
+        merged = isfile(own) ? TOML.parsefile(own) : Dict{String, Any}()
+        for (pkg, table) in TOML.parsefile(prof.preferences)
+            # Per package, not per key: a half-overridden preferences table is a
+            # configuration nobody wrote down.
+            merged[pkg] = table
+        end
+        open(io -> TOML.print(io, merged), joinpath(dir, "LocalPreferences.toml"), "w")
+        run.profile_projects[prof.name] = dir
+    end
+    return nothing
+end
+
 function precompile_phase(run::Run, p::Plan, target)
+    precompile_setups(run, p, target)
+    precompile_profiles(run, p)
+    return nothing
+end
+
+"""
+    cache_flags_for(julia_args) -> Base.CacheFlags
+
+The cache flags a worker started with `julia_args` will have.
+
+Asked of a process started the same way rather than derived from the arguments:
+which of them reach the cache key is Julia's business and changes between
+versions, and a wrong answer here silently precompiles for the wrong key.
+"""
+cache_flags_for(julia_args::Cmd) = parse(
+    Base.CacheFlags,
+    read(
+        `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e "show(Base.CacheFlags())"`,
+        String
+    )
+)
+
+"""
+    precompile_profiles(run, p)
+
+Precompile the test environment once for each set of cache flags the run's pools
+imply.
+
+Every test item's module loads the package under test, and a package image built
+under other julia flags cannot be used, so the first worker of a pool with
+`julia_args` compiles that package and everything it depends on. Left alone that
+happens inside the worker: serially, with no output, while the run looks stalled
+on its first item. Here it is one parallel pass that says what it is doing, and
+what it writes serves every later worker and every later run.
+"""
+function precompile_profiles(run::Run, p::Plan)
+    mine = Base.CacheFlags()
+    configs = Pair{Cmd, Base.CacheFlags}[]
+    names = String[]
+    seen = Set{Base.CacheFlags}()
+    for pool in p.pools
+        prof = p.profiles[pool.profile]
+        # A profile with preferences runs in a project of its own, and a project is
+        # not something `configs` can carry, so it gets a call to itself below.
+        haskey(run.profile_projects, prof.name) && continue
+        # Only julia arguments reach the cache key; a profile that differs only in
+        # threads or environment shares the flags this process already compiled for.
+        isempty(prof.julia_args) && continue
+        args = Cmd(prof.julia_args)
+        flags = try
+            cache_flags_for(args)
+        catch e
+            e isa InterruptException && rethrow()
+            @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
+                   workers will compile what they need themselves" exception = e
+            continue
+        end
+        (flags == mine || flags in seen) && continue
+        push!(seen, flags)
+        push!(configs, args => flags)
+        push!(names, String(prof.name))
+    end
+    for prof in values(p.profiles)
+        dir = get(run.profile_projects, prof.name, nothing)
+        dir === nothing && continue
+        precompile_profile_project(run, prof, dir)
+    end
+    isempty(configs) && return nothing
+    printline(
+        run, string(
+            yatf_prefix(), "precompiling the test environment for ",
+            plural(length(names), "profile"), ": ", join(names, ", ")
+        )
+    )
+    try
+        # `Pkg` draws its own progress by moving the cursor, so ours comes down.
+        with_status_line_off(run.monitor) do
+            Pkg.precompile(
+                Pkg.Types.Context(), Pkg.Types.PackageSpec[];
+                configs, warn_loaded = false, already_instantiated = true, io = stdout
+            )
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        # Work brought forward, not work that has to succeed: a worker that finds
+        # nothing cached still compiles what it needs, one process at a time.
+        @warn "YATF: could not precompile the test environment for \
+               $(join(names, ", ")); its workers will compile what they need \
+               themselves" exception = e
+    end
+    return nothing
+end
+
+# One call each, because a project is part of a cache's identity and `configs`
+# only carries julia arguments: two profiles with different preferences are two
+# environments, not two configurations of one.
+function precompile_profile_project(run::Run, prof::Profile, dir::AbstractString)
+    args = Cmd(prof.julia_args)
+    flags = try
+        isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(args)
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
+               workers will compile what they need themselves" exception = e
+        return nothing
+    end
+    printline(
+        run,
+        string(yatf_prefix(), "precompiling the test environment for profile ", prof.name)
+    )
+    original = Base.active_project()
+    try
+        with_status_line_off(run.monitor) do
+            Base.set_active_project(joinpath(dir, "Project.toml"))
+            Pkg.precompile(
+                Pkg.Types.Context(), Pkg.Types.PackageSpec[];
+                configs = args => flags, warn_loaded = false,
+                already_instantiated = true, io = stdout
+            )
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "YATF: could not precompile the test environment for profile \
+               `$(prof.name)`; its workers will compile what they need themselves" exception = e
+    finally
+        Base.set_active_project(original)
+    end
+    return nothing
+end
+
+function precompile_setups(run::Run, p::Plan, target)
     isempty(p.setups) && return nothing
     # `isprecompiled` asks whether there is a *valid* cache, which is the question:
     # a cache file left over from another checkout of the same setup would be
@@ -641,7 +818,8 @@ function worker_env(run::Run, slot::Slot, target)
     # would otherwise be the project its items resolve against — and the test
     # environment this run just built, holding the package under test and its test
     # dependencies, would be the one thing the items could not see.
-    proj = Base.active_project()
+    proj = get(run.profile_projects, slot.profile.name, nothing)
+    proj === nothing && (proj = Base.active_project())
     proj === nothing || push!(env, "JULIA_PROJECT" => proj)
     append!(env, slot.profile.env)
     return env

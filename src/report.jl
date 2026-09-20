@@ -129,10 +129,10 @@ const GUTTER = "  "
 
 # Worker lifecycle, test items and the run's own report share one line shape, so
 # they line up in a log and a reader can skim by glyph before reading:
-#     ⚫ w1 · 16:30:28 · UP    · pid 48123 · threads 2,1
-#     🔵 w1 · 16:30:28 · START ·  1/11 · "passes" · at test/basics_test.jl:1
-#     🟢 w1 · 16:30:29 · DONE  ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
-#     ⚪ w0 · 16:30:29 · INFO  ·  3/11 · 0 failed · 2/2 workers · w0 1.1G · …
+#     ⚫ w1 · 16:30:28 · UP   · pid 48123 · threads 2,1
+#     🔵 w1 · 16:30:28 · RUN  ·  1/11 · "passes" · at test/basics_test.jl:1
+#     🟢 w1 · 16:30:29 · DONE ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
+#     ⚪ w0 · 16:30:29 · INFO ·  3/11 · 0 failed · 2/2 workers · tree mem 1.1G (max 1.2G) · …
 #
 # A circle is the framework speaking, and its colour is the news: blue in flight,
 # green passed, red not, yellow set aside, black the worker itself, white the run

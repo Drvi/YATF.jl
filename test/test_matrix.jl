@@ -121,11 +121,11 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
             end
 
             @testset "every item announces its start and its end, once" begin
-                starts = filter(l -> occursin("· START", l), lines)
+                starts = filter(l -> occursin("· RUN", l), lines)
                 dones = filter(l -> occursin("· DONE", l), lines)
                 @test length(starts) == length(MATRIX_STATES)
                 @test length(dones) == length(MATRIX_STATES)
-                @test all(l -> count("· START", l) <= 1, lines)
+                @test all(l -> count("· RUN", l) <= 1, lines)
                 @test all(l -> count("· DONE", l) <= 1, lines)
                 # A start says where the item is declared.
                 @test any(l -> occursin("\"matrix fails\"", l) && occursin(at_line("fail_item"), l),
@@ -157,7 +157,7 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
                 # Every name this run can hold is padded to the same width, so the
                 # outcome after it starts in the same column on every line.
                 fitting = filter(dones) do l
-                    name = match(r"DONE  · [\d/]+ · (\"[^\"]*\")", l)
+                    name = match(r"DONE · [\d/]+ · (\"[^\"]*\")", l)
                     name !== nothing && textwidth(name.captures[1]) <= width
                 end
                 @test !isempty(fitting)
@@ -267,7 +267,7 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
             end
 
             @testset "no two writers share a line" begin
-                for marker in ("┌ [", "· START", "· DONE", "┌ Captured logs")
+                for marker in ("┌ [", "· RUN", "· DONE", "┌ Captured logs")
                     @test all(l -> count(marker, l) <= 1, lines)
                 end
             end

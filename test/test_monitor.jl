@@ -111,7 +111,32 @@ end
         @test occursin("failed", line)
         @test occursin("workers", line)
         @test occursin("mem ", line)
-        @test occursin("tree max", line)
+
+        # Each memory field says which number it is, and is that number. `w0` was
+        # none of the three: it labelled the whole tree summed with the name of one
+        # process in it, and `child max` labelled a reading from the newest sample
+        # as a record.
+        m = run.monitor
+        s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
+        if YATF.Platform.PER_PROCESS_OK[] && s.total_rss > 0
+            @test occursin(
+                "tree mem " * sprint(io -> print_bytes(io, s.total_rss, YATF.TOTAL_WIDTH)), line
+            )
+            @test occursin(
+                "(max " * sprint(io -> print_bytes(io, m.stats.peak_total_bytes)) * ")",
+                line
+            )
+            @test occursin(
+                "child max " * sprint(io -> print_bytes(io, m.stats.peak_single_bytes, YATF.TOTAL_WIDTH)),
+                line
+            )
+            # A sum is at least its largest term, so the same holds of the peaks,
+            # and a peak is at least the reading it was taken from.
+            @test s.total_rss >= s.largest_rss
+            @test m.stats.peak_total_bytes >= m.stats.peak_single_bytes
+            @test m.stats.peak_total_bytes >= s.total_rss
+        end
+        @test count("w0", line) == 1        # the speaker, and no longer a field label
 
         # It is redrawn after every line the run prints, so it must not allocate to
         # do it: this is the one place in the run where formatting is on the hot path.
@@ -257,8 +282,8 @@ end
         # One process, so one memory figure and its peak, not three names for it.
         @test occursin("rss ", info)
         @test occursin("max ", info)
-        @test !occursin("tree max", info)
-        @test !occursin("child max", info)
+        @test !occursin("tree", info)
+        @test !occursin("child", info)
 
         # ...and the same in the summary.
         summary = sprint(io -> print_memory_summary(io, run.monitor))

@@ -62,7 +62,7 @@ const DEPS = fixture("TestDeps.jl")
             @test state_of(ts) === PASSED
             @test ts.n_passed == 2
             # It announces itself the way a scheduled item does.
-            @test occursin("START", out)
+            @test occursin("RUN", out)
             @test occursin("DONE", out)
             @test occursin("pasted pass", out)
         end

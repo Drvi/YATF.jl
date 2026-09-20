@@ -412,8 +412,11 @@ const PHASE_WIDTH = 9     # "reporting"
 
 # How long the reporting stage has to take before it is worth a line of its own.
 const REPORT_WORTH_SAYING = 1.0
-# The run's own total is the one figure that is reliably single-digit gibibytes;
-# the peak and the largest child get a column wide enough for two.
+
+procs_text(n::Integer) = string("over ", plural(n, "process", "processes"))
+# Four holds every figure up to `9.9G`; a tree past that is one character wider and
+# shifts the rest of the line, which is the price of not carrying a blank column
+# on every redraw for the runs that never get there.
 const TOTAL_WIDTH = 4     # "1.1G", "612M"
 const BYTES_WIDTH = 5     # "12.3G"
 const RUNNING_WIDTH = 28
@@ -462,15 +465,31 @@ function print_status_line(io::IO, m::Monitor)
             # One process: its total, its peak, and nothing to compare them to.
             print(io, " · rss ")
             print_bytes(io, s.total_rss, TOTAL_WIDTH)
-            print(io, " · max ")
-            print_bytes(io, m.stats.peak_total_bytes, TOTAL_WIDTH)
+            print(io, " (max ")
+            print_bytes(io, m.stats.peak_total_bytes)
+            write(io, UInt8(')'))
         else
-            print(io, " · w0 ")
+            # Both current figures come from the newest sample and the peak from the
+            # run so far, so each says which it is. `total_rss` is the whole tree
+            # summed, the coordinator among it — not the coordinator's own size —
+            # and `largest_rss` is the biggest process in that same sample, which is
+            # a reading and not a record.
+            # One width for both readings: they are the same kind of number and a
+            # column each keeps them under one another. The tree is the larger of
+            # the two, so it is the one that sets the width.
+            # The tree as it stands, with its peak alongside: the peak belongs to
+            # the reading it qualifies rather than to a field of its own, and it is
+            # unpadded because the brackets already say where it ends.
+            print(io, " · tree mem ")
             print_bytes(io, s.total_rss, TOTAL_WIDTH)
-            print(io, " · tree max ")
-            print_bytes(io, m.stats.peak_total_bytes, BYTES_WIDTH)
+            print(io, " (max ")
+            print_bytes(io, m.stats.peak_total_bytes)
+            write(io, UInt8(')'))
+            # The largest any one process has been, not the largest right now: a
+            # current reading fluctuates with whichever worker is mid-item, while
+            # the peak is the number that says whether one of them got too big.
             print(io, " · child max ")
-            print_bytes(io, s.largest_rss, BYTES_WIDTH)
+            print_bytes(io, m.stats.peak_single_bytes, TOTAL_WIDTH)
         end
     end
     if s.machine_total > 0
@@ -486,11 +505,48 @@ function print_status_line(io::IO, m::Monitor)
         write(io, UInt8('/'))
         print_int(io, cpu_count())
     end
-    # What the run is doing, and the first thing it is doing it to. Last, because
-    # it is the only field that changes width.
-    print(io, " · ", phase_name(s.phase))
+    # What the run is doing, how long it has been doing it, and the first thing it
+    # is doing it to. Last, because it is the only field that changes width. The
+    # age qualifies the stage rather than taking a column of its own: this line is
+    # busy enough.
+    print(io, " · ", phase_name(s.phase), " ")
+    print_age(io, run.t0 + Float64(s.t) - phase_stats(m.stats, s.phase).entered)
     running = running_items!(m)
     isempty(running) || (print(io, " · "); print_clipped(io, first(running), RUNNING_WIDTH))
+    return nothing
+end
+
+"""
+    print_age(io, seconds)
+
+An elapsed time as `45s`, `1m12s` or `2h05m`, written a digit at a time.
+
+The status line is redrawn after every line the run prints, so this formats into
+the caller's buffer rather than building a string to throw away.
+"""
+function print_age(io::IO, seconds::Real)
+    s = seconds > 0 ? unsafe_trunc(Int, seconds) : 0
+    if s < 60
+        print_int(io, s)
+        write(io, UInt8('s'))
+    elseif s < 3600
+        print_int(io, s ÷ 60)
+        write(io, UInt8('m'))
+        print_int2(io, s % 60)
+        write(io, UInt8('s'))
+    else
+        print_int(io, s ÷ 3600)
+        write(io, UInt8('h'))
+        print_int2(io, (s % 3600) ÷ 60)
+        write(io, UInt8('m'))
+    end
+    return nothing
+end
+
+# Zero-padded to two digits: `1m05s` reads as one duration, `1m5s` as two numbers.
+function print_int2(io::IO, n::Integer)
+    n < 10 && write(io, UInt8('0'))
+    print_int(io, n)
     return nothing
 end
 
@@ -660,6 +716,21 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
     finish = time()
     solo = single_process(run_of(m).plan)
     if PER_PROCESS_OK[]
+        # Two passes: the columns are as wide as the widest thing that will go in
+        # them, so `5m57.7s` next to `12.0s` does not push a whole line right of
+        # the one above it.
+        shown(phase) = let ps = phase_stats(st, phase)
+            ps.entered != 0 &&
+                !(phase === PHASE_REPORT && phase_seconds(st, phase, finish) < REPORT_WORTH_SAYING)
+        end
+        time_width, procs_width = 0, 0
+        for phase in instances(RunPhase)
+            shown(phase) || continue
+            ps = phase_stats(st, phase)
+            time_width = max(time_width, length(fmt_seconds(phase_seconds(st, phase, finish))))
+            (solo || ps.peak_total <= 0) && continue
+            procs_width = max(procs_width, length(procs_text(ps.nprocs_at_peak)))
+        end
         for phase in instances(RunPhase)
             ps = phase_stats(st, phase)
             # Every stage the run entered gets a line, whether or not a sample
@@ -673,15 +744,21 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
             # once the workers had gone. It earns a line only when it took long
             # enough to mean something went wrong on the way out.
             phase === PHASE_REPORT && seconds < REPORT_WORTH_SAYING && continue
+            more_follows = ps.starts > nslots(run_of(m).plan) ||
+                (phase === PHASE_TEST && sum(run_of(m).statuses.elapsed; init = 0.0f0) > 0)
             print(io, indent, rpad(phase_name(phase), PHASE_WIDTH), FIELD)
-            print(io, lpad(fmt_seconds(seconds), 6))
+            print(io, lpad(fmt_seconds(seconds), time_width))
             if ps.peak_total > 0
                 print(io, FIELD, solo ? "rss " : "tree max ")
                 print_bytes(io, ps.peak_total, BYTES_WIDTH)
                 if !solo
                     print(io, FIELD, "child max ")
                     print_bytes(io, ps.peak_single, BYTES_WIDTH)
-                    print(io, FIELD, "over ", plural(ps.nprocs_at_peak, "process", "processes"))
+                    text = procs_text(ps.nprocs_at_peak)
+                    print(io, FIELD, text)
+                    # Padded only to line up a field that follows; a line that ends
+                    # here ends at its last character.
+                    more_follows && pad_to(io, procs_width, length(text))
                 end
             end
             # Only when workers were replaced rather than reused: otherwise this is

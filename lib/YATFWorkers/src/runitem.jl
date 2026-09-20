@@ -148,7 +148,7 @@ Evaluate one test item in a fresh module and return its results. Never throws fo
 a failing test: a failure is a result, not an error.
 """
 function run_item(spec::ItemSpec; printing::Bool=false)
-    log_item(spec, "START")
+    log_item(spec, "RUN")
     result = in_item(spec; printing) do
         _run_item(spec)
     end
@@ -475,7 +475,9 @@ as one table rather than as two nested ones.
 """
 const FIELD = " · "
 
-const WORKER_STATE_WIDTH = 5   # "START"; the worker words ("UP", "EXIT", "KILL", "LOST") are shorter
+# "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" and "UP" are shorter. Nothing here
+# reaches five, and every line in the run pays for this column.
+const WORKER_STATE_WIDTH = 4
 const STATE_WIDTH = 4     # "PASS"; the rarer outcomes are longer and may overflow
 const TIME_WIDTH  = 5     # "99.9s"; an item that runs longer than that pushes the column
 

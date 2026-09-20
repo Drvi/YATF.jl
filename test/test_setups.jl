@@ -114,3 +114,59 @@ using YATF: PASSED, ERRORED, ConfigError, prepare, execute, nitems, setup_module
         @test LOAD_PATH == before
     end
 end
+@testset "profile preferences" begin
+    @testset "a profile's preferences reach the items that run under it" begin
+        dir = make_pkg("PrefProfile")
+        # A package the test environment can see, which reads a preference when it
+        # is compiled.
+        pkgdir = joinpath(dir, "PrefTarget")
+        mkpath(joinpath(pkgdir, "src"))
+        u = "9f2b1c3d-0000-4000-8000-00000000abcd"
+        write(joinpath(pkgdir, "Project.toml"),
+              "name = \"PrefTarget\"\nuuid = \"$u\"\nversion = \"0.1.0\"\n")
+        write(joinpath(pkgdir, "src", "PrefTarget.jl"), """
+        module PrefTarget
+        const UUID = Base.UUID("$u")
+        Base.record_compiletime_preference(UUID, "mode")
+        const MODE = get(Base.get_preferences(UUID), "mode", "unset")
+        end
+        """)
+        write(joinpath(dir, "prefs.toml"), "[PrefTarget]\nmode = \"fast\"\n")
+        write(joinpath(dir, "test", "TestItems.toml"), """
+        [profiles.tuned]
+        preferences = "../prefs.toml"
+        """)
+        write(joinpath(dir, "test", "t_test.jl"), """
+        @testitem "default sees no preference" begin
+            using PrefTarget
+            @test PrefTarget.MODE == "unset"
+        end
+        @testitem "tuned sees it" sandbox=:tuned begin
+            using PrefTarget
+            @test PrefTarget.MODE == "fast"
+        end
+        """)
+        Pkg = Base.require(Base.PkgId(Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f"), "Pkg"))
+        orig = Base.active_project()
+        Pkg.activate(dir; io=devnull)
+        Pkg.develop(path=pkgdir; io=devnull)
+        Pkg.activate(orig; io=devnull)
+
+        states, run, _ = run_states(dir; workers=2, logs=:issues, monitor=false)
+        @test states["default sees no preference"] === PASSED
+        @test states["tuned sees it"] === PASSED
+        # The tuned profile ran in a project of its own, carrying the same manifest.
+        proj = run.profile_projects[:tuned]
+        @test isfile(joinpath(proj, "Manifest.toml"))
+        @test occursin("fast", read(joinpath(proj, "LocalPreferences.toml"), String))
+    end
+
+    @testset "a preferences file that is missing or broken is a config error" begin
+        dir = make_pkg("BadPrefs", "test/t_test.jl" => """
+        @testitem "x" begin
+            @test true
+        end
+        """, "test/TestItems.toml" => "[profiles.p]\npreferences = \"nope.toml\"\n")
+        @test_throws YATF.ConfigError YATF.prepare((dir,); workers=1, monitor=false)
+    end
+end

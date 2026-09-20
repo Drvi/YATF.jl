@@ -19,13 +19,17 @@ struct Profile
     env::Vector{Pair{String, String}}
     init::Expr
     test_end::Expr
+    # An absolute path to a preferences file, or empty. Preferences reach a package
+    # from the environment that owns it, so this becomes the worker's own project
+    # rather than anything layered on the test environment.
+    preferences::String
 end
 
 Profile(
     name::Symbol; julia_args = String[], threads = "2,1", env = Pair{String, String}[],
-    init = Expr(:block), test_end = Expr(:block)
+    init = Expr(:block), test_end = Expr(:block), preferences = ""
 ) =
-    Profile(name, julia_args, threads, env, init, test_end)
+    Profile(name, julia_args, threads, env, init, test_end, preferences)
 
 Base.@kwdef struct RunConfig
     workers::Int
@@ -57,7 +61,7 @@ const RUN_KEYS = (
     :monitor, :monitor_interval, :full_stacktraces,
 )
 const ORDER_KEYS = (:first, :last)
-const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end)
+const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
 const TOP_KEYS = (:run, :order, :profiles)
 const LOG_MODES = (:eager, :batched, :issues)
 
@@ -186,12 +190,46 @@ function read_profiles(path, toml, default_threads::String)
             Symbol(name), args,
             string(get(p, "threads", default_threads)), env,
             parse_expr(path, name, "init", get(p, "init", "")),
-            parse_expr(path, name, "test_end", get(p, "test_end", ""))
+            parse_expr(path, name, "test_end", get(p, "test_end", "")),
+            profile_preferences(path, name, get(p, "preferences", ""))
         )
     end
     haskey(profiles, DEFAULT_PROFILE) ||
         (profiles[DEFAULT_PROFILE] = Profile(DEFAULT_PROFILE; threads = default_threads))
     return profiles
+end
+
+"""
+    profile_preferences(config_path, name, value) -> String
+
+The absolute path to a profile's preferences file, or `""` when it declares none.
+
+Read and parsed here so that a missing or malformed file is an error before any
+worker starts, rather than a worker that comes up without the preferences its
+items were written for and passes.
+"""
+function profile_preferences(config_path, name, value)
+    value isa AbstractString ||
+        throw(ConfigError("`preferences` of [profiles.$name] must be a path to a TOML file"))
+    isempty(value) && return ""
+    path = isabspath(value) ? value : normpath(joinpath(dirname(config_path), value))
+    isfile(path) || throw(
+        ConfigError(
+            "`preferences` of [profiles.$name] points at $(relpath_or_path(path)), " *
+                "which does not exist"
+        )
+    )
+    try
+        TOML.parsefile(path)
+    catch e
+        throw(
+            ConfigError(
+                "`preferences` of [profiles.$name]: could not parse " *
+                    "$(relpath_or_path(path)): $(sprint(showerror, e))"
+            )
+        )
+    end
+    return path
 end
 
 # Parsed here, never evaluated here: a syntax error in an init expression is a

@@ -91,7 +91,7 @@ const PRECOMPILE_SIGNATURES = (
             state_of(ts)
             transferrable(ts)
             result = ItemResult(Int32(1), PASSED, ts, PerfStats())
-            log_item(spec, "START")
+            log_item(spec, "RUN")
             log_item(spec, "DONE", result)
             softscope_all!(Expr(:block, :(x = 1)))
             short_state(PASSED); state_color(FAILED)
