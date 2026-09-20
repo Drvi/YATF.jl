@@ -628,7 +628,7 @@ a subprocess on the path between `runtests()` and the first test item costs more
 than the answer is worth.
 
 It identifies the commit and not the working tree, so local edits do not change
-it. See `issues/runstate-worktree-identity.md`.
+it: two runs can carry the same revision and have tested different source.
 """
 function project_revision(root::AbstractString)
     try

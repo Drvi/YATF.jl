@@ -96,7 +96,7 @@ end
         # not accept a cache compiled without it. A setup module has no UUID, so
         # Julia keys its cache by name alone with no room for the flags — the
         # worker recompiles into the same file and the next run under the ordinary
-        # flags finds it stale. See `issues/setup-cache-collisions.md`.
+        # flags finds it stale.
         write(joinpath(dir, "test", "a_test.jl"), """
         @testitem "checked" sandbox=:bounds begin
             using $setup
