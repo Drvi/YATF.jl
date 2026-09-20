@@ -86,7 +86,10 @@ function print_item(io::IO, p::Plan, i::ItemIdx, indent::AbstractString)
     return nothing
 end
 
-plural(n::Integer, what::AbstractString) = string(n, " ", what, n == 1 ? "" : "s")
+# The plural is spelled out when adding an `s` does not make one: "2 processs" is
+# the kind of thing a reader notices instead of the number in front of it.
+plural(n::Integer, one::AbstractString, many::AbstractString = one * "s") =
+    string(n, " ", n == 1 ? one : many)
 
 # The same shape `Test` uses for its own Time column, so every duration a run
 # prints reads the same way.
@@ -126,19 +129,50 @@ const GUTTER = "  "
 
 # Worker lifecycle, test items and the run's own report share one line shape, so
 # they line up in a log and a reader can skim by glyph before reading:
-#     🔧 w1 | 16:30:28 | UP    pid 48123 · threads 2,1
-#     🧪 w1 | 16:30:28 | START ( 1/11) "passes" at test/basics_test.jl:1
-#     📊 w0 | 16:30:28 | INFO  ( 3/11) · 2/2 workers · w0 1.1G · …
+#     ⚫ w1 · 16:30:28 · UP    · pid 48123 · threads 2,1
+#     🔵 w1 · 16:30:28 · START ·  1/11 · "passes" · at test/basics_test.jl:1
+#     🟢 w1 · 16:30:29 · DONE  ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
+#     ⚪ w0 · 16:30:29 · INFO  ·  3/11 · 0 failed · 2/2 workers · w0 1.1G · …
+#
+# A circle is the framework speaking, and its colour is the news: blue in flight,
+# green passed, red not, yellow set aside, black the worker itself, white the run
+# reporting on itself. The one glyph that is not a circle is the one line that is
+# not the framework — `MARK_ITEM`, for what a test item printed for itself.
 #
 # Every glyph here is two columns wide in Unicode's width tables and carries no
 # variation selector, which is what keeps the `w1 |` column in the same place on
 # every line. The obvious picks — 🛠️ and ℹ️ — are width 1 in those tables and
 # width 2 in most terminals, and a log comes out ragged wherever the two disagree.
-const MARK_WORKER = "🔧"   # a worker's own lifecycle
-const MARK_ITEM = "🧪"   # anything a worker said while it was running items
-const MARK_INFO = "📊"   # the run reporting on itself
+const MARK_WORKER = "⚫"   # a worker's own lifecycle
+const MARK_ITEM = "🧪"   # whatever a test item printed for itself
+const MARK_INFO = "⚪"   # the run reporting on itself
 const MARK_INDENT = "   "
-const WORKER_STATE_WIDTH = 5
+
+# A test item's own lines come in already carrying the glyph for how the item went
+# (`YATFWorkers.ITEM_MARKS`): blue while it runs, then the colour of its outcome.
+# Everything else a worker says is the item talking, and gets `MARK_ITEM`.
+const LINE_MARKS = (YATFWorkers.ITEM_MARKS..., MARK_ITEM)
+
+"""
+    mark_index(line) -> (index, at)
+
+Which of [`LINE_MARKS`](@ref) a relayed line calls for, and the byte its text
+starts at.
+
+A line the worker's own `log_item` wrote begins with its glyph and a space; a line
+a test item printed begins with whatever the item printed. Splitting them here is
+what lets the worker choose the colour and the coordinator choose the layout.
+"""
+function mark_index(line::AbstractString)
+    for (i, mark) in pairs(YATFWorkers.ITEM_MARKS)
+        startswith(line, mark) && return i, ncodeunits(mark) + 2
+    end
+    return length(LINE_MARKS), 1
+end
+
+# `MARK_INDENT`, a glyph and a trailing space: what a line with no worker to name
+# is drawn with, one per glyph so the common path is a single concatenation.
+const SOLO_PREFIXES = ntuple(i -> string(MARK_INDENT, LINE_MARKS[i], " "), length(LINE_MARKS))
 
 # The lead-in every one of those lines shares: the glyph, the worker it is about,
 # and the time. The clock is passed in rather than read here, because the line
@@ -147,9 +181,19 @@ const WORKER_STATE_WIDTH = 5
 function print_line_head(io::IO, mark::AbstractString, slot_id::Integer, clock::AbstractString)
     print(io, MARK_INDENT, mark, " w")
     print_int(io, slot_id)
-    print(io, " | ", clock, " | ")
+    print(io, FIELD, clock, FIELD)
     return nothing
 end
+
+# A run with no workers has nothing to number. The column is dropped rather than
+# filled with a zero that stands for a process nobody asked for.
+function print_line_head(io::IO, mark::AbstractString, ::Nothing, clock::AbstractString)
+    print(io, MARK_INDENT, mark, " ", clock, FIELD)
+    return nothing
+end
+
+# Everything a test item says when it is running here rather than on a worker.
+
 
 clock_now() = Libc.strftime("%H:%M:%S", time())
 
@@ -168,7 +212,7 @@ function print_worker_line(run, slot_id, state::AbstractString, text::AbstractSt
     io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
     print_line_head(io, MARK_WORKER, slot_id, clock_now())
     printstyled(io, rpad(state, WORKER_STATE_WIDTH); bold = true)
-    print(io, " ", text)
+    print(io, FIELD, text)
     printline(run, String(take!(buf)))
     return nothing
 end
@@ -251,7 +295,7 @@ never end up on the same line.
 function printline(run, text::AbstractString)
     @lock run.printer begin
         m = run.monitor
-        if m === nothing || !m.tty || m.stop
+        if m === nothing || !drawing(m)
             print(stdout, text)
             endswith(text, "\n") || println(stdout)
             flush(stdout)
@@ -310,8 +354,8 @@ function print_conclusion(run)
     st = run.statuses
     head = IOBuffer()
     print(
-        head, "ran ", plural(nitems(p), "test item"), " in ",
-        fmt_seconds(time() - run.t0), " on ", plural(length(run.slots), "worker")
+        head, "ran ", plural(nitems(p), "test item"), " in ", fmt_seconds(time() - run.t0),
+        single_process(p) ? " in this process" : string(" on ", plural(length(run.slots), "worker"))
     )
     tally = state_tally(st, nitems(p))
     print(head, isempty(tally) ? ", all passed" : string(", ", join(tally, ", ")))
@@ -443,7 +487,12 @@ function report_item!(run, i::ItemIdx, state::ItemState, n::Integer, msg::Abstra
     footer = string(
         "@ ", itemfile(p, i), ":", p.items.line[i], on_worker(run, i)
     )
-    printline(run, bracket(String(take!(body)), label, rest, footer, YATFWorkers.state_color(state)))
+    printline(
+        run, bracket(
+            strip_root(String(take!(body)), p.root), label, rest, footer,
+            YATFWorkers.state_color(state)
+        )
+    )
     return nothing
 end
 
@@ -485,6 +534,26 @@ function bracket(
         println(io)
     end
     return String(take!(buf))
+end
+
+"""
+    strip_root(text, root)
+
+`text` with the project's own directory taken off the front of every path in it.
+
+`Test` and the stacktrace printer name a file by the path the parser was given,
+and that path is absolute on purpose: it is also what `@__FILE__` expands to, and
+what `@__DIR__` is derived from, so a test item that loads a fixture next to
+itself depends on it. The shortening therefore happens here, on the way out,
+where it is presentation and cannot change what the item's code means.
+"""
+function strip_root(text::AbstractString, root::AbstractString)
+    isempty(root) && return text
+    out = replace(text, root * "/" => "")
+    # The stacktrace printer contracts the home directory, so the same path
+    # arrives spelled two ways.
+    home = Base.contractuser(root)
+    return home == root ? out : replace(out, home * "/" => "")
 end
 
 function print_failures(io::IO, run, i::ItemIdx)
@@ -529,8 +598,12 @@ end
 trim_blank_lines(text::AbstractString) =
     replace(replace(text, r"\A(?:[ \t]*\n)+" => ""), r"(?:\n[ \t]*)+\z" => "")
 
+# With no workers there is no worker to name: the slot exists so the scheduler has
+# something to talk about, and saying "on worker 1" about this process is telling
+# the reader about a process that was never started.
 on_worker(run, i::ItemIdx) =
-    run.statuses.slot[i] == 0 ? "" : string(" on worker ", run.statuses.slot[i])
+    (single_process(run.plan) || run.statuses.slot[i] == 0) ? "" :
+    string(" on worker ", run.statuses.slot[i])
 
 item_logpath(run, i::ItemIdx) =
     item_log_path(run.logprefix, i, max(run.statuses.attempt[i], 1))

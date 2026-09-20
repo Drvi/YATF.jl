@@ -54,6 +54,40 @@ filtered(paths...; kwargs...) =
         @test_throws NoTestsError filtered(dir; tags=[:fast, :slow])
     end
 
+    @testset "by tag expression: `!`, `&&` and `||`" begin
+        @test filtered(dir; tags="!slow") ==
+            ["adds numbers", "multiplies numbers", "step one", "step two", "unrelated"]
+        @test filtered(dir; tags="fast && !math") == ["multiplies numbers"]
+        @test filtered(dir; tags="slow || fast") == ["adds numbers", "multiplies numbers", "solves slowly"]
+        @test filtered(dir; tags="math && !fast || fast && !math") == ["multiplies numbers", "solves slowly"]
+        @test_throws NoTestsError filtered(dir; tags="fast && slow")
+        @test_throws ArgumentError filtered(dir; tags=":fast")
+        @test_throws ArgumentError filtered(dir; tags="fast &&")
+        @test_throws ArgumentError filtered(dir; tags="fast & slow")
+        @test_throws ArgumentError filtered(dir; tags="")
+    end
+
+    @testset "a tag written as a string is a tag, and a bad one says so" begin
+        # Strings are what a caller reaches for first, and the element types line
+        # up badly: a `Vector{String}` handed to a `Vector{Symbol}` field fails
+        # somewhere inside `convert`, naming neither the keyword nor the value.
+        @test filtered(dir; tags=["fast"]) == filtered(dir; tags=[:fast])
+        @test filtered(dir; tags=("fast", "math")) == filtered(dir; tags=[:fast, :math])
+        @test filtered(dir; tags=Set([:fast])) == filtered(dir; tags=[:fast])
+        # An expression split across elements would read as a tag named `!slow`,
+        # which matches nothing and reports nothing.
+        e = try
+            filtered(dir; tags=["!slow"])
+        catch err
+            err
+        end
+        @test e isa ArgumentError
+        @test occursin("!slow", e.msg) && occursin("one string", e.msg)
+        for bad in (["fast || slow"], [1, 2], 42)
+            @test_throws ArgumentError filtered(dir; tags=bad)
+        end
+    end
+
     @testset "by path: a file, a directory, or a line inside one" begin
         @test filtered(dir, joinpath(dir, "test", "a_test.jl")) ==
             ["adds numbers", "multiplies numbers", "solves slowly"]
@@ -115,6 +149,10 @@ filtered(paths...; kwargs...) =
             prepare((dir,); tags=:fast)
         end
         @test occursin("matching tags = [:fast]", plain)
+        _, expr = capture_run() do
+            prepare((dir,); tags="!slow")
+        end
+        @test occursin("matching tags = \"!slow\"", expr)
     end
 
     @testset "a filtered run still honours forced order" begin

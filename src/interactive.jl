@@ -113,9 +113,22 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     isempty(errors) || throw(ScanFailure(errors))
     warn_ignored(item)
     return with_interactive_env(target) do
-        result = item.exclusive || item.profile !== DEFAULT_PROFILE ?
-            run_sandboxed(item, target) : run_item(interactive_spec(item, target); printing = true)
-        return result.testset
+        # The item's own lines carry the glyph for how it went; here there is no
+        # coordinator relaying them, so the sink does what the relay would.
+        previous = YATFWorkers.LOG_SINK[]
+        YATFWorkers.LOG_SINK[] = function (line)
+            mark, at = mark_index(line)
+            print(stdout, SOLO_PREFIXES[mark], SubString(line, at))
+            flush(stdout)
+        end
+        try
+            result = item.exclusive || item.profile !== DEFAULT_PROFILE ?
+                run_sandboxed(item, target) :
+                run_item(interactive_spec(item, target); printing = true)
+            return result.testset
+        finally
+            YATFWorkers.LOG_SINK[] = previous
+        end
     end
 end
 
@@ -167,7 +180,9 @@ function interactive_spec(item::RawItem, target)
     return ItemSpec(
         Int32(1), Int32(0), item.name, item.file, item.line, location,
         item.code, item.skip, item.failfast == 1, project, item.profile,
-        Int8(1), Int8(1), false, ""
+        Int8(1), Int8(1), false, "",
+        # One item, so the column is exactly as wide as its own name.
+        Int32(YATFWorkers.quoted_width(item.name))
     )
 end
 

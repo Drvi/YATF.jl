@@ -99,6 +99,10 @@ end
 nslots(p::Plan) = length(p.slot_pool)
 nitems(p::Plan) = length(p.items)
 
+# No workers: everything happens here, so there is no worker to name, no pool to
+# count and no second process to compare memory against.
+single_process(p::Plan) = p.cfg.workers == 0
+
 # Where an item is, as the run reports it.
 itemfile(p::Plan, i::Integer) = p.relfiles[p.items.fileidx[i]]
 itemlocation(p::Plan, i::Integer) = p.locations[i]

@@ -25,7 +25,7 @@ using CRC32c: crc32c
 using Dates: Dates
 
 const RS_MAGIC = 0x59415446   # "YATF"
-const RS_VERSION = UInt32(3)
+const RS_VERSION = UInt32(4)
 # 40 bytes of counts and times, then eight section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
@@ -311,8 +311,8 @@ function write_memory!(rsf::Union{Nothing, RunStateFile}, m)
             write(rsf.io, Float32(m.peak_total_at))
             write(rsf.io, Float32(m.peak_single_bytes / 2^20))
             write(rsf.io, Int32(m.peak_single_pid))
-            write(rsf.io, Float32(m.peak_precompile_bytes / 2^20))
-            write(rsf.io, Float32(m.peak_test_bytes / 2^20))
+            write(rsf.io, Float32(phase_peak(m, PHASE_SETUP) / 2^20))
+            write(rsf.io, Float32(phase_peak(m, PHASE_TEST) / 2^20))
             write(rsf.io, Int32(m.nprocs_peak))
             flush(rsf.io)
         catch e

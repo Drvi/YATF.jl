@@ -28,7 +28,8 @@ using TOML: TOML
 using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_yatf_run, run_item,
-    with_testset_printing, without_enclosing_testset, pad_to
+    with_testset_printing, without_enclosing_testset, pad_to, FIELD,
+    WORKER_STATE_WIDTH
 
 export @testitem
 
@@ -68,7 +69,8 @@ the item that line is inside.
 # Keywords
 
 Selection: `name` (`String` for an exact match, `Regex` for a partial one) and
-`tags` (a symbol or vector of symbols; an item must carry all of them).
+`tags` (a symbol or vector of symbols an item must carry all of, or a string
+expression such as `"!slow"` or `"juliac || serializer"`).
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
@@ -321,6 +323,30 @@ end
 
 using PrecompileTools: @setup_workload, @compile_workload
 
+"""
+    PRECOMPILE_SIGNATURES
+
+The paths a run takes that the workload below cannot take for it, as signatures.
+
+Two things stop the workload from simply running a suite: starting a worker means
+starting a process while the package is being built, and running a test item
+means evaluating code into `Main`, which leaves a module behind and makes Julia
+warn that incremental compilation may be broken. Everything either of those leads
+to is listed here instead.
+
+`with_test_env` is deliberately absent: its first argument is a closure, and there
+is no concrete signature to name.
+"""
+const PRECOMPILE_SIGNATURES = (
+    (test_env, (Target,)),
+    (resolve_target, (Tuple{String},)),
+    (prepare, (Tuple{String},)),
+    (execute, (Plan, Target)),
+    (report, (Run,)),
+    (run_on_workers, (Run, Target)),
+    (run_slot, (Run, Slot, Target)),
+)
+
 # Everything between `runtests()` being called and the first test item starting:
 # reading the files, resolving the configuration, planning, and the shapes the run
 # prints. Measured on a 2000-item suite, this path takes 2.3s the first time it
@@ -359,24 +385,39 @@ using PrecompileTools: @setup_workload, @compile_workload
         items = scan(files, Filter(), setups; ntasks = 2)
         scan(files, Filter(name = "precompile one"), setups; ntasks = 1)
         cfg = read_config(testdir; nunits = length(items), monitor = false)
-        h = history(dir)
-        p = plan(items, cfg; history = h, root = dir)
+        p = plan(items, cfg; history = history(dir), root = dir)
         print_plan(devnull, p)
         Queues(p); Statuses(nitems(p))
+
+        # The run state, written before the first item starts and read by the run
+        # after this one.
+        statepath = joinpath(dir, "precompile.yatf")
+        rsf = init_run_state(statepath, p)
+        write_status!(rsf, 1, RUNNING, 1, 1)
+        write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1, compile = 0.05)
+        write_memory!(rsf, MemStats())
+        finish_run_state!(rsf)
+        read_run_state(statepath)
+        withenv("YATF_RUNSTATE_DIR" => dir) do
+            history(dir)
+        end
+
+        # The shapes a run prints. The first three run once per field of the
+        # progress line, which is redrawn after every line the run writes.
+        buf = IOBuffer()
+        print_bytes(buf, 3.5 * 2^30, BYTES_WIDTH)
+        print_bytes(buf, 512 * 2^20, TOTAL_WIDTH)
+        print_1dp(buf, 2.5, 4)
+        print_int(buf, 42, 4)
+        YATFWorkers.print_quoted(buf, "an item")
+        item_log_path("/precompile/item_", 1, 1)
         bracket("a line\nanother", "[1/2] FAIL", "\"an item\"", "@ a_test.jl:1", :red)
-        fmt_seconds(0.5); plural(2, "worker")
+        fmt_seconds(0.5); plural(2, "worker"); plural(1, "process", "processes")
     end
     rm(dir; force = true, recursive = true)
-    # The environment path cannot be run here — it resolves a real project, which
-    # a build sandbox may not be able to do — so it is precompiled by signature.
-    precompile(test_env, (Target,))
-    precompile(with_test_env, (Function, Target))
-    precompile(resolve_target, (Tuple{String},))
-    precompile(prepare, (Tuple{String},))
-    precompile(execute, (Plan, Target))
-    precompile(report, (Run,))
-    precompile(run_on_workers, (Run, Target))
-    precompile(run_slot, (Run, Slot, Target))
+    for (f, types) in PRECOMPILE_SIGNATURES
+        YATFWorkers.precompile_or_throw(f, types)
+    end
 end
 
 end # module YATF

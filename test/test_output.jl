@@ -24,19 +24,21 @@ using YATFWorkers: YATFWorkers
     lines = split(log, '\n')
 
     @testset "every item announces its start and its end" begin
-        starts = filter(l -> occursin(" | START", l), lines)
-        dones  = filter(l -> occursin(" | DONE", l), lines)
+        starts = filter(l -> occursin("· START", l), lines)
+        dones  = filter(l -> occursin("· DONE", l), lines)
         @test length(starts) == 6
         @test length(dones) == 6
+        # Blue while it runs, then the colour of how it went — every item in this
+        # fixture passes.
         for l in starts
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_ITEM) w\\d+ \\| \\d\\d:\\d\\d:\\d\\d \\| " *
-                      "START \\(\\d/6\\) \".+\"\\s+at \\S+:\\d+\$"), l)
+                Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_RUNNING) w\\d+ · " *
+                      "\\d\\d:\\d\\d:\\d\\d · START · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
         end
         for l in dones
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_ITEM) w\\d+ \\| \\d\\d:\\d\\d:\\d\\d \\| " *
-                      "DONE  \\(\\d/6\\) \".+\"\\s+PASS\\s+in\\s+"), l)
+                Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_PASSED) w\\d+ · " *
+                      "\\d\\d:\\d\\d:\\d\\d · DONE  · \\d/6 · \".+\"\\s+· PASS · "), l)
             @test occursin("maxrss", l)
         end
     end
@@ -45,24 +47,114 @@ using YATFWorkers: YATFWorkers
         # One shape for the lot: glyph, who, when, what. The glyphs are all two
         # columns wide, so `w1 |` lands in the same place whichever kind of line
         # it is — which is the only reason a log of them is readable.
-        heads = filter(l -> occursin(r" w\d+ \| \d\d:\d\d:\d\d \| ", l), lines)
+        heads = filter(l -> occursin(r" w\d+ · \d\d:\d\d:\d\d · ", l), lines)
         @test !isempty(heads)
         @test all(l -> startswith(l, YATF.MARK_INDENT), heads)
         marks = unique(first(split(strip(l))) for l in heads)
-        @test sort(marks) == sort([YATF.MARK_WORKER, YATF.MARK_ITEM, YATF.MARK_INFO])
+        known = Set([YATF.MARK_WORKER, YATF.MARK_INFO, YATF.LINE_MARKS...])
+        @test issubset(marks, known)
+        # This fixture starts workers, runs items that pass, and reports.
+        @test YATF.MARK_WORKER in marks
+        @test YATFWorkers.MARK_RUNNING in marks
+        @test YATFWorkers.MARK_PASSED in marks
         # ...and the column `w<n>` starts in is the same on all of them.
-        cols = unique(length(SubString(l, 1, prevind(l, first(findfirst(r" w\d+ \| ", l))))) for l in heads)
+        cols = unique(length(SubString(l, 1, prevind(l, first(findfirst(r" w\d+ · ", l))))) for l in heads)
         @test length(cols) == 1
     end
 
     @testset "the run reports on itself when there is no terminal" begin
-        status = filter(l -> occursin(" | INFO ", l), lines)
+        status = filter(l -> occursin("· INFO ", l), lines)
         @test !isempty(status)
-        @test all(l -> startswith(l, YATF.MARK_INDENT * YATF.MARK_INFO * " w0 | "), status)
+        @test all(l -> startswith(l, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATFWorkers.FIELD), status)
         @test any(l -> occursin("mem ", l), status)
         @test any(l -> occursin("load ", l), status)   # CPU load, as well as memory
         @test any(l -> occursin("workers", l), status)
         @test any(l -> occursin("tree max", l), status)
+    end
+
+    @testset "a run with no workers concludes without claiming one" begin
+        _, solo = capture_run() do
+            run_states(fixture("Basic.jl"); workers=0, logs=:issues, monitor=false)
+        end
+        @test occursin("in this process", solo)
+        @test !occursin("on 1 worker", solo)
+    end
+
+    @testset "a path is shortened on the way out, not on the way in" begin
+        root = "/some/where/MyPkg"
+        text = "Error During Test at $root/test/a_test.jl:7\n  @ $root/test/b_test.jl:2\n"
+        short = YATF.strip_root(text, root)
+        @test occursin("at test/a_test.jl:7", short)
+        @test occursin("@ test/b_test.jl:2", short)
+        @test !occursin(root, short)
+        # The stacktrace printer writes the home directory as `~`, so the same
+        # path arrives spelled two ways and both come off.
+        home = homedir()
+        under = joinpath(home, "proj", "MyPkg")
+        both = "a $(under)/test/x.jl:1 and ~/proj/MyPkg/test/y.jl:2"
+        @test YATF.strip_root(both, under) == "a test/x.jl:1 and test/y.jl:2"
+        # Nothing to strip, nothing changed.
+        @test YATF.strip_root(text, "") == text
+        @test YATF.strip_root("no paths here", root) == "no paths here"
+    end
+
+    @testset "a worker's last line says what it did, not what the slot did" begin
+        # One worker, three items: the count belongs to the process that ran them.
+        _, out = capture_run() do
+            run_states(fixture("Basic.jl"); workers=1, logs=:issues, monitor=false)
+        end
+        exits = filter(l -> occursin("· EXIT", l), collect(eachsplit(out, '\n')))
+        @test length(exits) == 1
+        @test occursin("6 items", only(exits))
+        # A graceful shutdown is not a kill: that word is reserved for a worker
+        # the run put down, and the two must stay distinguishable. It is also not
+        # "DONE", which is an item finishing, nor "LOST", which is a worker that
+        # died on its own — four words, none of them a glance away from another.
+        @test !occursin("KILL", out)
+        @test !occursin("LOST", out)
+        @test count(l -> occursin("· UP ", l), collect(eachsplit(out, '\n'))) == 1
+    end
+
+    @testset "the name column is chosen from the names the run will print" begin
+        nw(names; columns=0) = YATFWorkers.name_width(names; columns)
+        qw = YATFWorkers.quoted_width
+        widest(names) = maximum(qw, names)
+
+        short = ["item $i" for i in 1:100]
+        # They all fit, so they all line up and nothing overflows.
+        @test nw(short) == widest(short)
+        @test count(n -> qw(n) > nw(short), short) == 0
+
+        # Two long names among a hundred short ones do not buy forty columns of
+        # blanks on every line.
+        outliers = vcat(short, ["a much longer outlier name $i" for i in 1:2])
+        @test nw(outliers) < widest(outliers)
+        @test count(n -> qw(n) > nw(outliers), outliers) <= 3
+
+        # A tail that is only a little longer than the rest is covered instead.
+        tight = ["name of length about $i" for i in 1:50]
+        @test nw(tight) == widest(tight)
+
+        # Whatever the distribution, the overflow stays a tail.
+        for names in (short, outliers, tight, vcat(short, ["x"^150]),
+                      vcat(short[1:90], ["slightly longer name $i" for i in 1:10]))
+            over = count(n -> qw(n) > nw(names), names)
+            @test over <= max(YATFWorkers.NAME_OUTLIER_ALLOWANCE,
+                              length(names) ÷ YATFWorkers.NAME_OUTLIER_SHARE)
+        end
+
+        # A terminal narrows the column; a narrow one does not squeeze it away.
+        long = ["a considerably longer test item name $i" for i in 1:100]
+        @test nw(long; columns=200) > nw(long; columns=120) > nw(long; columns=80)
+        @test nw(long; columns=40) >= YATFWorkers.MIN_NAME_WIDTH
+        @test nw(long) <= YATFWorkers.MAX_NAME_WIDTH
+        @test nw(String[]) >= YATFWorkers.MIN_NAME_WIDTH
+        @test nw(["just the one"]) == qw("just the one")
+
+        # The width it counts on is the width the line actually takes.
+        for n in ["plain", "with \"quotes\"", "emoji 🎉", "tab\there", "dollar \$x", ""]
+            @test qw(n) == textwidth(sprint(YATFWorkers.print_quoted, n))
+        end
     end
 
     @testset "a log path is built exactly as `string` would build it" begin
@@ -92,7 +184,7 @@ using YATFWorkers: YATFWorkers
     @testset "no two writers share a line" begin
         # A marker that starts a line must never appear in the middle of one:
         # that is what interleaved writes look like.
-        for marker in ("[YATF]", " | START", " | DONE", "Captured logs:")
+        for marker in ("[YATF]", "· START", "· DONE", "Captured logs:")
             for l in lines
                 occursin(marker, l) || continue
                 @test count(marker, l) == 1
@@ -106,8 +198,8 @@ using YATFWorkers: YATFWorkers
         end
         # Nothing may be printed after a worker's relayed line on the same line.
         for l in lines
-            occursin(r" w\d+ \| \d\d:\d\d:\d\d \| ", l) || continue
-            @test count(r"\sw\d+ \| ", l) == 1
+            occursin(r" w\d+ · \d\d:\d\d:\d\d · ", l) || continue
+            @test count(r"\sw\d+ · ", l) == 1
         end
     end
 

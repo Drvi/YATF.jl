@@ -1,5 +1,7 @@
 using YATF: prepare, execute, report, Monitor, MemStats, start_monitor!, stop_monitor!,
-            set_phase!, PHASE_PRECOMPILE, PHASE_TEST, status_line, print_status_line,
+            set_phase!, PHASE_SETUP, PHASE_TEST, PHASE_REPORT,
+            phase_stats, phase_peak, phase_seconds, MemStats, RunPhase,
+            status_line, print_status_line,
             status_update!, print_memory_summary, fmt_bytes, print_bytes, print_1dp,
             print_int, nitems
 using YATF.Platform: process_rss, child_pids, process_tree, machine_memory,
@@ -72,27 +74,30 @@ end
             # the whole process tree, so more than this process alone
             @test st.peak_total_bytes >= st.peak_single_bytes > 0
             @test st.nprocs_peak >= 1
-            @test st.peak_test_bytes > 0
+            @test phase_peak(st, PHASE_TEST) > 0
         end
         out = sprint(print_memory_summary, run.monitor)
-        @test occursin("memory", out)
         @test occursin("machine", out)
         if PER_PROCESS_OK[]
-            @test occursin("across all YATF processes", out)
-            @test occursin("largest single process", out)
+            @test occursin("testing", out)
             @test occursin("over-count", out)   # the caveat is stated, not hidden
         end
     end
 
-    @testset "precompilation is accounted separately from testing" begin
+    @testset "no stage claims more than the run as a whole" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         st = run.monitor.stats
-        # Whichever phase the peak fell in, the two are tracked apart.
-        @test st.peak_precompile_bytes >= 0
-        @test st.peak_test_bytes >= 0
-        @test st.peak_total_bytes >= max(st.peak_precompile_bytes, st.peak_test_bytes)
+        # The run-wide peak is still the largest of the stages, and each stage's
+        # largest single process is within its own total.
+        for phase in instances(RunPhase)
+            ps = phase_stats(st, phase)
+            @test ps.peak_total <= st.peak_total_bytes
+            @test ps.peak_single <= max(ps.peak_total, 0)
+        end
+        @test st.peak_total_bytes ==
+            maximum(ps -> ps.peak_total, st.phases)
     end
 
     @testset "the status line says what is happening" begin
@@ -100,7 +105,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         line = status_line(run.monitor)
-        @test startswith(line, YATF.MARK_INDENT * YATF.MARK_INFO * " w0 | ")
+        @test startswith(line, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATFWorkers.FIELD)
         @test occursin("INFO", line)
         @test occursin("/", line)             # done/total
         @test occursin("failed", line)
@@ -227,13 +232,221 @@ end
         @test length(m.mark_said) == length(YATF.MEMORY_MARKS)
     end
 
+    @testset "a run with no workers does not talk about workers" begin
+        (_, run, _), out = capture_run() do
+            run_states(fixture("Basic.jl"); workers=0, logs=:issues, monitor=true,
+                       monitor_interval=1)
+        end
+        item_lines = filter(l -> occursin("· START", l) || occursin("· DONE", l),
+                            collect(eachsplit(out, '\n')))
+        @test !isempty(item_lines)
+        # The glyph is still there — it is how a line is read at a glance — but
+        # there is no worker to number.
+        @test all(item_lines) do l
+            any(m -> startswith(l, YATF.MARK_INDENT * m * " "), YATF.LINE_MARKS)
+        end
+        @test !any(l -> occursin(r" w\d+ · ", l), item_lines)
+
+        # Asked for directly rather than waited for: whether a periodic report
+        # lands inside a two-second run depends on how busy the machine is, and
+        # what is being checked here is the shape of one, not its timing.
+        info = status_line(run.monitor)
+        @test startswith(info, YATF.MARK_INDENT * YATF.MARK_INFO * " ")
+        @test !occursin("w0", info)
+        @test !occursin("workers", info)
+        # One process, so one memory figure and its peak, not three names for it.
+        @test occursin("rss ", info)
+        @test occursin("max ", info)
+        @test !occursin("tree max", info)
+        @test !occursin("child max", info)
+
+        # ...and the same in the summary.
+        summary = sprint(io -> print_memory_summary(io, run.monitor))
+        @test occursin("testing", summary)
+        @test !occursin("across all YATF processes", summary)
+        @test !occursin("largest single process", summary)
+    end
+
+    @testset "a count is pluralised correctly even when adding an s would not" begin
+        @test YATF.plural(1, "worker") == "1 worker"
+        @test YATF.plural(2, "worker") == "2 workers"
+        @test YATF.plural(1, "process", "processes") == "1 process"
+        @test YATF.plural(2, "process", "processes") == "2 processes"
+    end
+
+    @testset "a stage lasts until the next one starts" begin
+        st = MemStats()
+        # Nothing entered: nothing to report, and no negative durations.
+        for phase in instances(RunPhase)
+            @test phase_seconds(st, phase, 100.0) == 0.0
+            @test phase_peak(st, phase) == 0
+        end
+        phase_stats(st, PHASE_SETUP).entered = 10.0
+        phase_stats(st, PHASE_TEST).entered = 20.0
+        @test phase_seconds(st, PHASE_SETUP, 100.0) == 10.0
+        # The last stage entered runs until the run ends.
+        @test phase_seconds(st, PHASE_TEST, 100.0) == 80.0
+        # One never entered stays at nothing even with others around it.
+        @test phase_seconds(st, PHASE_REPORT, 100.0) == 0.0
+        # A finish before the stage began is a duration of zero, not a negative.
+        @test phase_seconds(st, PHASE_TEST, 5.0) == 0.0
+    end
+
+    @testset "a sample counts against the stage it was taken in" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        m = run.monitor
+        st = m.stats
+        for ps in st.phases
+            ps.peak_total = 0; ps.peak_single = 0; ps.nprocs_at_peak = 0; ps.starts = 0
+        end
+        sample(phase, total, largest, n) =
+            YATF.Sample(1.0f0, phase, Int16(n), Int64(total), Int64(largest), Int32(1),
+                        Int64(0), Int64(0), 1.0f0)
+        YATF.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
+        YATF.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9))
+        YATF.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5))
+        @test phase_peak(st, PHASE_SETUP) == 800
+        @test phase_peak(st, PHASE_TEST) == 3000        # the larger of the two
+        @test phase_stats(st, PHASE_TEST).peak_single == 900
+        # The count belongs to the sample that set the peak, so that the two read
+        # together. A later sample with more processes and a smaller total is a
+        # different moment and does not contribute its count to this one.
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
+        YATF.update_stats!(m, sample(PHASE_TEST, 2500, 400, 40))
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
+        # ...and a larger total brings its own count with it.
+        YATF.update_stats!(m, sample(PHASE_TEST, 4000, 400, 3))
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 3
+        # A stage that saw no sample keeps nothing from the others.
+        @test phase_peak(st, PHASE_REPORT) == 0
+    end
+
+    @testset "the summary reports each stage the run went through" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        st = run.monitor.stats
+        summary = sprint(io -> print_memory_summary(io, run.monitor))
+
+        # Every stage the run entered is stamped, and the ones it went through
+        # have a line of their own.
+        @test phase_stats(st, PHASE_SETUP).entered > 0
+        @test phase_stats(st, PHASE_TEST).entered >
+            phase_stats(st, PHASE_SETUP).entered
+        @test occursin("setup", summary)
+        @test occursin("testing", summary)
+        @test occursin("tree max", summary)
+        @test occursin("child max", summary)
+        @test occursin("% compile", summary)
+        # Testing starts the workers, so it is the expensive stage.
+        @test phase_peak(st, PHASE_TEST) >= phase_peak(st, PHASE_SETUP)
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak >=
+            phase_stats(st, PHASE_SETUP).nprocs_at_peak
+
+        # The single run-wide peak it used to lead with is gone: the stages say it.
+        @test !occursin("largest single process", summary)
+        @test !occursin("across all YATF processes", summary)
+        @test !occursin("by phase", summary)
+        # The caveat about shared pages survives, once.
+        @test count("over-count", summary) == 1
+        @test occursin("machine", summary)
+
+        # Only the stage that runs items can have a compile share.
+        compile_lines = filter(l -> occursin("% compile", l), collect(eachsplit(summary, '\n')))
+        @test length(compile_lines) == 1
+        @test occursin("testing", only(compile_lines))
+    end
+
+    @testset "replacing workers is reported, reusing them is not" begin
+        # Peak concurrency cannot show process churn: a sandbox worker replaces a
+        # pool worker in the same slot, so a run that starts a process per item
+        # never has more alive at once than one that starts none.
+        dir = make_pkg("ChurnSummary", "test/t_test.jl" => string(
+            ("""
+            @testitem "solo $i" sandbox=true begin
+                @test true
+            end
+            """ for i in 1:4)...
+        ))
+        p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        st = run.monitor.stats
+        @test phase_stats(st, PHASE_TEST).starts == 4
+        @test phase_stats(st, PHASE_TEST).nprocs_at_peak <= 2   # the run and one worker
+        summary = sprint(io -> print_memory_summary(io, run.monitor))
+        @test occursin("4 worker starts", summary)
+
+        # A suite that reuses its worker says nothing about starts: that number
+        # would be the worker count again, under another name.
+        p2, target2 = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
+        run2 = execute(p2, target2)
+        rm(run2.logdir; force=true, recursive=true)
+        @test phase_stats(run2.monitor.stats, PHASE_TEST).starts == 1
+        @test !occursin("worker start", sprint(io -> print_memory_summary(io, run2.monitor)))
+    end
+
+    @testset "a run with no workers reports stages without process counts" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        # A sample of its own: a short run on a busy machine can finish between
+        # two of the monitor's, and what is under test here is the shape of the
+        # line, not whether one happened to land.
+        YATF.update_stats!(run.monitor,
+            YATF.Sample(1.0f0, PHASE_TEST, Int16(1), Int64(500_000_000), Int64(500_000_000),
+                        Int32(getpid()), Int64(0), Int64(0), 1.0f0))
+        summary = sprint(io -> print_memory_summary(io, run.monitor))
+        @test occursin("testing", summary)
+        @test occursin("rss ", summary)
+        # One process, so nothing to total and nothing to compare against.
+        @test !occursin("tree max", summary)
+        @test !occursin("child max", summary)
+        @test !occursin("processes", summary)
+        @test !occursin("over-count", summary)
+    end
+
+    @testset "precompiling a setup is measured as its own stage" begin
+        # A module nothing has compiled before, so the stage actually runs and
+        # spawns the process that does the compiling.
+        dir = make_pkg("ColdStage")
+        setup = string("Cold", string(hash(dir); base=16))
+        mkpath(joinpath(dir, "test", "testsetups"))
+        write(joinpath(dir, "test", "testsetups", setup * ".jl"),
+              "module $setup
+" * join(["f$i(x) = x + $i" for i in 1:200], "
+") * "
+end
+")
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "uses it" begin
+            using $setup
+            @test $setup.f1(1) == 2
+        end
+        """)
+        p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        st = run.monitor.stats
+        # The process doing the compiling is in the tree and counted there, in
+        # the setup stage that spawned it.
+        @test phase_stats(st, PHASE_SETUP).nprocs_at_peak >= 2
+        @test phase_peak(st, PHASE_SETUP) > 0
+        summary = sprint(io -> print_memory_summary(io, run.monitor))
+        @test occursin("setup", summary)
+    end
+
     @testset "the memory summary reports totals, not what was running" begin
         p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         summary = sprint(io -> print_memory_summary(io, run.monitor))
-        @test occursin("memory: peak", summary)
-        @test occursin("largest single process", summary)
+        @test occursin("testing", summary)
+        @test occursin("tree max", summary)
+        # What was running at the peak was never the useful part; which stage the
+        # peak fell in is, and each stage has its own line now.
         @test !occursin("running ", summary)
     end
 
@@ -245,6 +458,101 @@ end
             rm(run.logdir; force=true, recursive=true)
             @test !isempty(YATF.runstate_files(p.root))
             @test YATF.read_run_state(last(YATF.runstate_files(p.root))) !== nothing
+        end
+    end
+end
+
+@testset "the status line and a second writer" begin
+    @testset "withdrawing the line is restored even when the body throws" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        m = run.monitor
+        @test YATF.with_status_line_off(m) do
+            m.quiet
+        end
+        @test !m.quiet
+        @test_throws ErrorException YATF.with_status_line_off(m) do
+            error("boom")
+        end
+        @test !m.quiet
+        # No monitor at all is the common case in these tests, and the body still
+        # runs and still returns what it returned.
+        @test YATF.with_status_line_off(nothing) do
+            :ran
+        end === :ran
+    end
+
+    @testset "nothing is drawn on a terminal while the line is withdrawn" begin
+        # The only path on which the status line is drawn at all is a real
+        # terminal, so this is the only way to see it happen. Without one there is
+        # nothing to test: `drawing` is already false and every branch below is
+        # the one it would take anyway.
+        pty = Sys.which("python3")
+        if pty === nothing
+            @test_skip "a pty is needed to exercise the terminal path"
+        else
+            script = """
+            using YATF
+            using YATF: prepare, execute, printline, with_status_line_off, Monitor
+            p, target = prepare((ARGS[1],); workers=0, logs=:issues, monitor=false)
+            run = execute(p, target)
+            rm(run.logdir; force=true, recursive=true)
+            # Not started: the sampling task would draw on its own clock, and what
+            # is under test is what the printing path does.
+            run.monitor = Monitor(run)
+            run.monitor.tty || error("the child did not get a terminal")
+            printline(run, "OUTSIDE")
+            with_status_line_off(run.monitor) do
+                printline(run, "INSIDE")
+            end
+            println("SENTINEL")
+            """
+            # `pty.fork` and not `pty.spawn`: the latter copies the driver's own
+            # stdin to the child and blocks here waiting for an end of input that
+            # never comes.
+            driver = """
+            import os, pty, sys, select, errno
+            code = os.environ["CHILD_CODE"]
+            argv = ["julia", "--startup-file=no", "--project=" + os.environ["PROJ"], "-e", code, os.environ["FIXTURE"]]
+            pid, fd = pty.fork()
+            if pid == 0:
+                os.execvp(argv[0], argv)
+            chunks = []
+            while True:
+                try:
+                    r, _, _ = select.select([fd], [], [], 300)
+                    if not r:
+                        break
+                    data = os.read(fd, 65536)
+                except OSError as e:
+                    if e.errno == errno.EIO:
+                        break
+                    raise
+                if not data:
+                    break
+                chunks.append(data)
+            _, status = os.waitpid(pid, 0)
+            sys.stdout.buffer.write(b"".join(chunks))
+            sys.exit(0 if status == 0 else 1)
+            """
+            out = withenv(
+                "CHILD_CODE" => script,
+                "PROJ" => dirname(@__DIR__),
+                "FIXTURE" => fixture("Basic.jl"),
+                "CI" => nothing, "TERM" => "xterm",
+            ) do
+                read(`$pty -c $driver`, String)
+            end
+            @test occursin("SENTINEL", out)
+            @test occursin("OUTSIDE", out)
+            @test occursin("INSIDE", out)
+            # A line printed with the status line up carries it along; the same
+            # call inside the withdrawal writes the line and stops there.
+            after_outside = out[findfirst("OUTSIDE", out).stop:findfirst("INSIDE", out).start]
+            after_inside = out[findfirst("INSIDE", out).stop:end]
+            @test occursin(YATF.MARK_INFO, after_outside)
+            @test !occursin(YATF.MARK_INFO, after_inside)
         end
     end
 end

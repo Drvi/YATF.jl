@@ -17,6 +17,27 @@ using YATF: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED
         end
     end
 
+    @testset "building the environment is announced, hitting the cache is not" begin
+        # Resolving takes seconds and is the longest pause a run has before it
+        # prints anything else, so it says what it is waiting for. A cache hit is
+        # immediate, and at the REPL — where the cache is the point — a line about
+        # it would be noise on every call.
+        pkg = fixture("TestDeps.jl")
+        delete!(TEST_ENVS, abspath(joinpath(pkg, "Project.toml")))
+        _, cold = capture_run() do
+            p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
+            run = execute(p, target)
+            rm(run.logdir; force=true, recursive=true)
+        end
+        @test occursin("resolving the test environment", cold)
+        _, warm = capture_run() do
+            p, target = prepare((pkg,); workers=1, logs=:issues, monitor=false)
+            run = execute(p, target)
+            rm(run.logdir; force=true, recursive=true)
+        end
+        @test !occursin("resolving the test environment", warm)
+    end
+
     @testset "the environment is cached across runs in a session" begin
         pkg = fixture("Basic.jl")
         target = Target(pkg, joinpath(pkg, "Project.toml"), joinpath(pkg, "test"), String[], Int32(0))

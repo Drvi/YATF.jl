@@ -42,6 +42,7 @@ const TEST_FILES = [
     "test_gating.jl",
     "test_config.jl",
     "test_runner.jl",
+    "test_precompile.jl",
     "test_interactive.jl",
 ]
 

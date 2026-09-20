@@ -11,18 +11,18 @@
 using .Platform: process_rss, process_tree, machine_memory, cpu_load, cpu_count,
     ensure_checked!, PER_PROCESS_OK
 
+# The scan is over before the monitor exists, so the first stage a run reports is
+# the one it is actually in. Resolving the environment and precompiling the setups
+# are one stage and not two: the same single process does both, back to back, and
+# which of them a given megabyte belongs to is not a question anyone asks.
 @enum RunPhase::UInt8 begin
-    PHASE_START = 0
-    PHASE_PRECOMPILE = 1
-    PHASE_TEST = 2
-    PHASE_REPORT = 3
+    PHASE_SETUP = 0
+    PHASE_TEST = 1
+    PHASE_REPORT = 2
 end
 
-# The scan is over before the monitor exists, so the first phase a run reports is
-# the one it is actually in: resolving the environment and starting workers.
-phase_name(p::RunPhase) = p === PHASE_PRECOMPILE ? "precompiling" :
-    p === PHASE_TEST ? "testing" :
-    p === PHASE_START ? "starting" : "reporting"
+phase_name(p::RunPhase) =
+    p === PHASE_SETUP ? "setup" : p === PHASE_TEST ? "testing" : "reporting"
 
 struct Sample
     t::Float32     # seconds since the run started
@@ -36,29 +36,84 @@ struct Sample
     load1::Float32     # one-minute load average
 end
 
-Sample() = Sample(0.0f0, PHASE_START, 0, 0, 0, 0, 0, 0, -1.0f0)
+Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, -1.0f0)
+
+"""
+    PhaseStats
+
+What one stage of a run cost.
+
+Kept per stage because the stages are different machines: resolving an
+environment runs one process, precompiling runs a handful of short-lived ones,
+and testing runs as many workers as it was given. A single figure for the run
+answers "was it close to the edge" and nothing else — these answer which stage
+took it there.
+"""
+Base.@kwdef mutable struct PhaseStats
+    entered::Float64 = 0.0    # when the run entered this stage, 0 if it never did
+    peak_total::Int64 = 0      # summed resident size over our processes
+    peak_single::Int64 = 0
+    # How many processes were alive at the sample that set `peak_total`, not the
+    # most that were ever alive at once. The line reports it next to that peak, and
+    # three independent maxima taken at three different instants read as one moment
+    # and contradict each other: a stage can report two processes beside a tree max
+    # equal to its child max, which never happened.
+    nprocs_at_peak::Int = 0
+    # Processes started during this stage. A stage that replaces a worker per item
+    # churns through many more than are ever alive together.
+    starts::Int = 0
+end
 
 """
     MemStats
 
-The aggregates worth having after the fact. Summing resident sizes over
-processes over-counts pages they share — the Julia runtime and every package
-image are mapped into each worker — so `total` is an upper bound, and is
-reported as one.
+The aggregates worth having after the fact, per stage of the run and over all of
+it. Summing resident sizes over processes over-counts pages they share — the
+Julia runtime and every package image are mapped into each worker — so a total is
+an upper bound, and is reported as one.
 """
 Base.@kwdef mutable struct MemStats
+    # One per `RunPhase`, indexed by `Int(phase) + 1`.
+    phases::Vector{PhaseStats} = [PhaseStats() for _ in instances(RunPhase)]
     peak_total_bytes::Int64 = 0
     peak_total_at::Float64 = 0.0
-    peak_total_phase::RunPhase = PHASE_START
+    peak_total_phase::RunPhase = PHASE_SETUP
     peak_single_bytes::Int64 = 0
     peak_single_pid::Int32 = 0
     peak_single_item::String = ""
-    peak_precompile_bytes::Int64 = 0
-    peak_test_bytes::Int64 = 0
     nprocs_peak::Int = 0
     machine_peak_used::Int64 = 0
     machine_total::Int64 = 0
     guard_actions::Int = 0
+end
+
+phase_stats(st::MemStats, p::RunPhase) = st.phases[Int(p) + 1]
+
+"""
+    phase_peak(stats, phase) -> Int
+
+The peak summed resident size while the run was in `phase`, or 0 if it never was.
+"""
+phase_peak(st::MemStats, p::RunPhase) = phase_stats(st, p).peak_total
+
+"""
+    phase_seconds(stats, phase, finish) -> Float64
+
+How long the run spent in `phase`.
+
+A stage ends when the next one begins, and the last one ends at `finish`. There is
+no separate "left this stage" stamp because a run only ever moves forward through
+them, and one stamp that cannot disagree with another is worth more than two that
+can.
+"""
+function phase_seconds(st::MemStats, p::RunPhase, finish::Float64)
+    entered = phase_stats(st, p).entered
+    entered == 0 && return 0.0
+    ends = finish
+    for other in st.phases
+        other.entered > entered && other.entered < ends && (ends = other.entered)
+    end
+    return max(0.0, ends - entered)
 end
 
 const RING_SAMPLES = 300      # 60 s of history at 5 Hz, allocated once
@@ -74,6 +129,9 @@ mutable struct Monitor
     ring_head::Int
     task::Union{Nothing, Task}
     @atomic stop::Bool
+    # Something else owns the terminal for a moment; sampling carries on, drawing
+    # does not.
+    @atomic quiet::Bool
     @atomic phase::RunPhase
     @atomic enabled::Bool
     const interval::Float64
@@ -110,17 +168,36 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     tty = stdout isa Base.TTY && !haskey(ENV, "CI") && get(ENV, "TERM", "") != "dumb"
     color = get(stdout, :color, false)::Bool
     linebuf = IOBuffer()
+    # The run is already in its first stage by the time it has a monitor — nothing
+    # calls `set_phase!` to enter the one it starts in.
+    stats = MemStats()
+    phase_stats(stats, PHASE_SETUP).entered = time()
     return Monitor(
-        run, MemStats(), fill(Sample(), RING_SAMPLES), 0, nothing, false,
-        PHASE_START, true, interval, print_interval, tty,
+        run, stats, fill(Sample(), RING_SAMPLES), 0, nothing, false, false,
+        PHASE_SETUP, true, interval, print_interval, tty,
         sizehint!(String[], nslots(run.plan)), linebuf,
         IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0
     )
 end
 
-set_phase!(m::Union{Nothing, Monitor}, p::RunPhase) =
-    (m === nothing || (@atomic m.phase = p); nothing)
+# Stamped by the run's own task as it enters a stage, and read by the monitor when
+# it reports. The run moves through the stages one at a time, so there is one
+# writer per field and nothing to coordinate.
+# Counted here rather than sampled: a sandbox worker can live and die between two
+# samples, so the ring would miss it entirely.
+function count_worker_start!(m::Union{Nothing, Monitor})
+    m === nothing && return nothing
+    phase_stats(m.stats, @atomic m.phase).starts += 1
+    return nothing
+end
+
+function set_phase!(m::Union{Nothing, Monitor}, p::RunPhase)
+    m === nothing && return nothing
+    phase_stats(m.stats, p).entered = time()
+    @atomic m.phase = p
+    return nothing
+end
 
 function start_monitor!(m::Monitor)
     try
@@ -215,13 +292,14 @@ function update_stats!(m::Monitor, s::Sample)
         st.peak_single_item = item_on_pid(m, s.largest_pid)
         write_memory!(run_of(m).runstate, st)
     end
-    # Precompilation and testing are different memory regimes: averaging them
-    # together hides that precompilation is often the peak of the whole run.
-    if s.phase === PHASE_PRECOMPILE
-        s.total_rss > st.peak_precompile_bytes && (st.peak_precompile_bytes = s.total_rss)
-    elseif s.phase === PHASE_TEST
-        s.total_rss > st.peak_test_bytes && (st.peak_test_bytes = s.total_rss)
+    # The stages are different memory regimes, and a figure for the whole run
+    # hides which of them was the expensive one.
+    ps = phase_stats(st, s.phase)
+    if s.total_rss > ps.peak_total
+        ps.peak_total = s.total_rss
+        ps.nprocs_at_peak = Int(s.nprocs)
     end
+    s.largest_rss > ps.peak_single && (ps.peak_single = s.largest_rss)
     return nothing
 end
 
@@ -330,7 +408,10 @@ end
 # Every field is a fixed width and the one variable-length field comes last and is
 # clipped, so the line keeps its shape for the whole run instead of jumping about
 # as numbers gain and lose digits.
-const PHASE_WIDTH = 12    # "precompiling"
+const PHASE_WIDTH = 9     # "reporting"
+
+# How long the reporting stage has to take before it is worth a line of its own.
+const REPORT_WORTH_SAYING = 1.0
 # The run's own total is the one figure that is reliably single-digit gibibytes;
 # the peak and the largest child get a column wide enough for two.
 const TOTAL_WIDTH = 4     # "1.1G", "612M"
@@ -354,32 +435,43 @@ function print_status_line(io::IO, m::Monitor)
     # The same shape as every other line in the log — glyph, who, when, what —
     # because this is the run saying something, not furniture. `w0` is the
     # coordinator: the process the others hang off.
-    print_line_head(io, MARK_INFO, 0, clock_text(m))
+    solo = single_process(run.plan)
+    print_line_head(io, MARK_INFO, solo ? nothing : 0, clock_text(m))
     print_bold(io, "INFO")
     pad_to(io, WORKER_STATE_WIDTH, 4)
-    print(io, " (")
+    print(io, FIELD)
     print_int(io, done, ndigits(total))
     write(io, UInt8('/'))
     print_int(io, total)
-    print(io, ") · ")
+    print(io, FIELD)
     # What has gone wrong so far, counted from the states rather than tracked
     # alongside them: an item that fails and then passes on a retry is not a
     # failure, and only the states know that. Unpadded: on a healthy run this is
     # one character and the eye should not have to look for it.
     print_int(io, count(is_non_pass, run.statuses.state))
-    print(io, " failed · ")
-    nlive = count(sl -> sl.worker !== nothing, run.slots)
-    print_int(io, nlive)
-    write(io, UInt8('/'))
-    print_int(io, length(run.slots))
-    print(io, " workers")
+    print(io, " failed")
+    if !solo
+        print(io, FIELD)
+        print_int(io, count(sl -> sl.worker !== nothing, run.slots))
+        write(io, UInt8('/'))
+        print_int(io, length(run.slots))
+        print(io, " workers")
+    end
     if PER_PROCESS_OK[] && s.total_rss > 0
-        print(io, " · w0 ")
-        print_bytes(io, s.total_rss, TOTAL_WIDTH)
-        print(io, " · tree max ")
-        print_bytes(io, m.stats.peak_total_bytes, BYTES_WIDTH)
-        print(io, " · child max ")
-        print_bytes(io, s.largest_rss, BYTES_WIDTH)
+        if solo
+            # One process: its total, its peak, and nothing to compare them to.
+            print(io, " · rss ")
+            print_bytes(io, s.total_rss, TOTAL_WIDTH)
+            print(io, " · max ")
+            print_bytes(io, m.stats.peak_total_bytes, TOTAL_WIDTH)
+        else
+            print(io, " · w0 ")
+            print_bytes(io, s.total_rss, TOTAL_WIDTH)
+            print(io, " · tree max ")
+            print_bytes(io, m.stats.peak_total_bytes, BYTES_WIDTH)
+            print(io, " · child max ")
+            print_bytes(io, s.largest_rss, BYTES_WIDTH)
+        end
     end
     if s.machine_total > 0
         print(io, " · mem ")
@@ -510,8 +602,32 @@ function status_update!(m::Monitor, text::AbstractString)
     return buf
 end
 
+"""
+    with_status_line_off(f, m)
+
+Run `f` with the pinned status line withdrawn.
+
+`Pkg` resolving an environment narrates it with a progress display of its own, and
+it moves the cursor to do that. Two writers that both rewrite the last line
+produce neither one. Sampling continues throughout — the stage's memory is still
+measured — and only the drawing stops.
+"""
+function with_status_line_off(f, m::Union{Nothing, Monitor})
+    m === nothing && return f()
+    @atomic m.quiet = true
+    clear_status_line(m)
+    try
+        return f()
+    finally
+        @atomic m.quiet = false
+    end
+end
+
+# Whether the status line may be drawn at all right now.
+drawing(m::Monitor) = m.tty && !m.stop && !(@atomic m.quiet)
+
 function redraw_status(m::Union{Nothing, Monitor})
-    (m === nothing || !m.tty || m.stop) && return nothing
+    (m === nothing || !drawing(m)) && return nothing
     # Assembled in the monitor's own buffer and written once: this happens after
     # every line the run prints, and a line built out of temporary strings would
     # cost more than the line it draws. Safe to share — every caller holds the
@@ -528,31 +644,74 @@ end
 
 # Written as part of the run's closing block, so the numbers arrive with the
 # sentence that says the run is over rather than under a heading of their own.
+"""
+    print_memory_summary(io, m; indent)
+
+What each stage of the run cost, a line each.
+
+Per stage rather than per run because the stages are not comparable: one process
+resolving an environment, a handful of short-lived ones precompiling, and as many
+workers as the run was given testing. A single peak says the run came within so
+much of the edge; these say which stage took it there, which is the one a reader
+can act on.
+"""
 function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
     st = m.stats
-    st.peak_total_bytes == 0 && st.machine_peak_used == 0 && return nothing
+    finish = time()
+    solo = single_process(run_of(m).plan)
     if PER_PROCESS_OK[]
-        print(
-            io, indent, "memory: peak ", fmt_bytes(st.peak_total_bytes), " across all YATF processes",
-            " at ", fmt_seconds(st.peak_total_at), " while ", phase_name(st.peak_total_phase)
+        for phase in instances(RunPhase)
+            ps = phase_stats(st, phase)
+            # Every stage the run entered gets a line, whether or not a sample
+            # landed in it: a stage that went by faster than the sampler is still
+            # a stage the run went through, and a line that says so and nothing
+            # else is more honest than no line.
+            ps.entered == 0 && continue
+            seconds = phase_seconds(st, phase, finish)
+            # Except reporting, which is shutting the workers down and writing the
+            # run state — a tenth of a second, whose memory is whatever was left
+            # once the workers had gone. It earns a line only when it took long
+            # enough to mean something went wrong on the way out.
+            phase === PHASE_REPORT && seconds < REPORT_WORTH_SAYING && continue
+            print(io, indent, rpad(phase_name(phase), PHASE_WIDTH), FIELD)
+            print(io, lpad(fmt_seconds(seconds), 6))
+            if ps.peak_total > 0
+                print(io, FIELD, solo ? "rss " : "tree max ")
+                print_bytes(io, ps.peak_total, BYTES_WIDTH)
+                if !solo
+                    print(io, FIELD, "child max ")
+                    print_bytes(io, ps.peak_single, BYTES_WIDTH)
+                    print(io, FIELD, "over ", plural(ps.nprocs_at_peak, "process", "processes"))
+                end
+            end
+            # Only when workers were replaced rather than reused: otherwise this is
+            # the worker count again, said twice.
+            ps.starts > nslots(run_of(m).plan) &&
+                print(io, FIELD, plural(ps.starts, "worker start"))
+            phase === PHASE_TEST && print_compile_share(io, run_of(m))
+            println(io)
+        end
+        solo || println(
+            io, indent, "(summed resident sizes over-count pages the processes share)"
         )
-        println(io)
-        println(
-            io, indent, "        largest single process ", fmt_bytes(st.peak_single_bytes),
-            st.peak_single_item == "" ? "" : string(" (", repr(st.peak_single_item), ")"),
-            ", ", st.nprocs_peak, " processes at peak"
-        )
-        pieces = String[]
-        st.peak_precompile_bytes > 0 && push!(pieces, string("precompiling ", fmt_bytes(st.peak_precompile_bytes)))
-        st.peak_test_bytes > 0 && push!(pieces, string("testing ", fmt_bytes(st.peak_test_bytes)))
-        isempty(pieces) || println(io, indent, "        by phase: ", join(pieces, " · "))
-        println(io, indent, "        (summed resident sizes over-count pages the processes share)")
     end
     st.machine_total > 0 && println(
-        io, indent, "machine: ", fmt_bytes(st.machine_peak_used), " of ",
+        io, indent, "machine", FIELD, fmt_bytes(st.machine_peak_used), " of ",
         fmt_bytes(st.machine_total), " in use at peak"
     )
-    st.guard_actions > 0 && println(io, indent, "guard: acted ", st.guard_actions, " time(s)")
+    st.guard_actions > 0 &&
+        println(io, indent, "guard", FIELD, plural(st.guard_actions, "action"))
+    return nothing
+end
+
+# How much of the time the items spent was spent compiling. Summed over the items
+# rather than measured against the stage's wall time, which several workers share
+# and which would make the share depend on how many there were.
+function print_compile_share(io::IO, run)
+    elapsed = sum(run.statuses.elapsed; init = 0.0f0)
+    elapsed > 0 || return nothing
+    share = round(Int, 100 * sum(run.statuses.compile; init = 0.0f0) / elapsed)
+    print(io, FIELD, share, "% compile")
     return nothing
 end
 

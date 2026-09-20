@@ -10,13 +10,15 @@ using Base: SIGKILL
 
 mutable struct Slot
     const id::SlotIdx
-    # What every line relayed from this slot's worker starts with. Constant for
-    # the life of the slot, and a run relays two lines an item.
-    const prefix::String
+    # What a line relayed from this slot's worker starts with, one per glyph in
+    # `LINE_MARKS`. Constant for the life of the slot, and a run relays at least
+    # two lines an item, so the choice is an index rather than a concatenation.
+    const prefixes::NTuple{length(LINE_MARKS), String}
     pool::Int32
     profile::Profile
     worker::Union{Nothing, YATFWorkers.Worker}
     started_at::Float64      # when this slot's current process came up
+    worker_items::Int        # items the current process has run, for its EXIT line
     units_started::Int
     current::ItemIdx      # the item this slot is running, 0 when idle
 end
@@ -33,6 +35,10 @@ mutable struct Queues
     const head::Vector{UnitIdx}      # next unit this slot will take
     const tail::Vector{UnitIdx}      # last unit still available to this slot
     const pool::Vector{Int32}        # the pool each slot is currently serving
+    # The profile behind each pool, by pool index. Two pools can share one — an
+    # exclusive unit is pooled apart from the ordinary work of the same profile —
+    # and stealing is decided on the profile, not on which pool it came from.
+    const pool_profile::Vector{Int32}
     const pending::Vector{Int32}        # pools with no slot yet
     const pending_units::Vector{UnitRange{UnitIdx}}
     cancelled::Bool
@@ -44,6 +50,7 @@ function Queues(p::Plan)
     tail = UnitIdx[last(r) for r in p.slot_units]
     return Queues(
         ReentrantLock(), head, tail, copy(p.slot_pool),
+        Int32[pool.profile for pool in p.pools],
         copy(p.pending), copy(p.pending_units), false, false
     )
 end
@@ -66,11 +73,16 @@ function claim!(q::Queues, s::Integer)
             q.head[s] += UnitIdx(1)
             return Claim(:unit, u, Int32(0), UnitIdx(1):UnitIdx(0))
         end
-        # Steal from the tail of the busiest queue in this slot's own pool: the
+        # Steal from the tail of the busiest queue running the same profile: the
         # owner has not warmed that end up either, so it is the cheapest end to
-        # give away. Never across pools — a pool is a worker configuration, and an
-        # item run under another pool's julia flags was not the test that was
-        # declared, however green it comes out.
+        # give away. Never across profiles — a profile is a worker configuration,
+        # and an item run under another profile's julia flags was not the test that
+        # was declared, however green it comes out.
+        #
+        # Same profile is the whole condition, and a pool is narrower than that: a
+        # profile's exclusive units are pooled separately from its ordinary ones,
+        # so a slot serving one sandbox would otherwise go home for good with the
+        # rest of its own configuration still queued.
         #
         # A queue holding a single unit is worth stealing from: `remaining` counts
         # what has not been claimed, and the unit its owner is running was claimed
@@ -79,7 +91,7 @@ function claim!(q::Queues, s::Integer)
         # worker has gone home.
         victim, most = 0, 0
         for v in eachindex(q.head)
-            (v == s || q.pool[v] != q.pool[s]) && continue
+            (v == s || q.pool_profile[q.pool[v]] != q.pool_profile[q.pool[s]]) && continue
             r = remaining(q, v)
             r > most && ((victim, most) = (v, r))
         end
@@ -162,6 +174,8 @@ mutable struct Run
     const runid::String
     const logdir::String
     const logprefix::String   # `logdir` and the part of a log's name that never varies
+    # The name column, chosen once from every name the run will print.
+    const name_width::Int32
     const printer::ReentrantLock
     const t0::Float64
     runstate::Union{Nothing, RunStateFile}
@@ -178,22 +192,25 @@ so a caller that wants to inspect the outcome does not have to catch anything.
 """
 function execute(p::Plan, target)
     cfg = p.cfg
-    check_single_process(p)
+    warn_sandboxed_workers(p)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
     logdir = mktempdir(; prefix = "yatf_")
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
-        joinpath(logdir, "item_"), ReentrantLock(), time(), nothing, nothing, 0
+        joinpath(logdir, "item_"),
+        YATFWorkers.name_width(p.items.name; columns = YATFWorkers.terminal_columns()),
+        ReentrantLock(), time(), nothing, nothing, 0
     )
     run.runstate = open_runstate(p)
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
     for s in 1:nslots(p)
         push!(
             run.slots, Slot(
-                SlotIdx(s), string(MARK_INDENT, MARK_ITEM, " w", s, " | "),
+                SlotIdx(s),
+                ntuple(k -> string(MARK_INDENT, LINE_MARKS[k], " w", s, FIELD), length(LINE_MARKS)),
                 p.slot_pool[s], p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, ItemIdx(0)
+                nothing, 0.0, 0, 0, ItemIdx(0)
             )
         )
     end
@@ -202,10 +219,9 @@ function execute(p::Plan, target)
     # nothing can land in the middle of the status line or another writer's line.
     return with_logger(RunLogger(current_logger(), run)) do
         t_env = time()
-        with_test_env(target) do
+        with_test_env(target, run) do
             p.startup.env = time() - t_env
             with_load_path(setup_path) do
-                set_phase!(run.monitor, PHASE_PRECOMPILE)
                 t_pre = time()
                 precompile_phase(run, p, target)
                 p.startup.precompile = time() - t_pre
@@ -251,8 +267,15 @@ The environment is chosen in this order:
 The package's plain project is deliberately *not* used: it does not contain the
 test-only dependencies, so every item that needs one would fail to load it.
 """
-function with_test_env(f, target)
-    env = test_env_for(target)
+function with_test_env(f, target, run = nothing)
+    # Building it is `Pkg`'s to narrate, and it draws its own progress by moving
+    # the cursor. Ours comes down while it does.
+    monitor = run === nothing ? nothing : run.monitor
+    env = with_status_line_off(monitor) do
+        test_env_for(target, run === nothing ? nothing : () -> printline(
+            run, string(yatf_prefix(), "resolving the test environment")
+        ))
+    end
     env === nothing && return f()
     current = Base.active_project()
     Base.set_active_project(env)
@@ -272,14 +295,14 @@ the one already active is it.
 Split out because a run is not the only thing that needs the answer: `activate`
 puts the REPL in the same place, and the two must agree about where that is.
 """
-function test_env_for(target)
+function test_env_for(target, announce = nothing)
     current = Base.active_project()
     if current !== nothing
         running_from_runtests(target) && return nothing
         testproj = joinpath(target.testdir, "Project.toml")
         isfile(testproj) && abspath(current) == abspath(testproj) && return nothing
     end
-    env = test_env(target)
+    env = test_env(target, announce)
     (current !== nothing && abspath(current) == abspath(env)) && return nothing
     return env
 end
@@ -293,13 +316,17 @@ end
 const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Float64}}}()
 const TEST_ENVS_LOCK = ReentrantLock()
 
-function test_env(target)
+function test_env(target, announce = nothing)
     proj = abspath(target.project)
     return @lock TEST_ENVS_LOCK begin
         cached = get(TEST_ENVS, proj, nothing)
         if cached !== nothing && isfile(cached[1]) && cached[2] == env_stamp(target)
             return cached[1]
         end
+        # Only here: resolving takes seconds and is the longest unexplained pause a
+        # run has, while a cache hit is immediate and a line about it would be
+        # noise at the REPL, where that hit is the point.
+        announce === nothing || announce()
         original = Base.active_project()
         try
             Pkg.activate(proj; io = devnull)
@@ -343,9 +370,6 @@ function running_from_runtests(target)
     return abspath(String(source)) == abspath(joinpath(target.testdir, "runtests.jl"))
 end
 
-# `--check-bounds=yes` cannot be applied to a process that is already running, so
-# a sandboxed item cannot be honestly run in-process. Reporting a pass for
-# something that was never tested that way is the one outcome not on the table.
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
 function open_runstate(p::Plan)
@@ -357,27 +381,35 @@ function open_runstate(p::Plan)
     end
 end
 
-function check_single_process(p::Plan)
-    p.cfg.workers == 0 || return
-    offenders = String[]
-    for u in 1:length(p.units)
-        pool_profile = p.profiles[p.units.profile[u]]
-        if pool_profile.name !== DEFAULT_PROFILE || p.units.exclusive[u]
-            for i in p.units.span[u]
-                push!(offenders, p.items.name[i])
-            end
-        end
+"""
+    needs_worker(p, u) -> Bool
+
+Whether this unit has to run in a process of its own however the run is
+configured.
+
+`--check-bounds=yes` cannot be applied to a process that is already running, and
+nothing can give an item a process to itself when there is only one. An item that
+asked for either is testing something that depends on it, so it gets a worker even
+under `workers=0` — running it here and reporting a pass would be reporting a pass
+for a test that was never run the way it was written.
+"""
+needs_worker(p::Plan, u::UnitIdx) =
+    p.units.exclusive[u] || p.profiles[p.units.profile[u]].name !== DEFAULT_PROFILE
+
+# `workers=0` is a promise about the pool, not about never starting a process.
+# Starting one anyway is the right thing and a surprising thing, so it is said out
+# loud, once, with the items that caused it.
+function warn_sandboxed_workers(p::Plan)
+    single_process(p) || return nothing
+    names = String[]
+    for u in UnitIdx(1):UnitIdx(length(p.units))
+        needs_worker(p, u) && append!(names, (p.items.name[i] for i in p.units.span[u]))
     end
-    isempty(offenders) && return
-    throw(
-        ConfigError(
-            "workers=0 runs everything in this process, but these items ask for a sandbox " *
-                "that a running process cannot provide:\n" *
-                join(("  " * repr(n) for n in offenders), "\n") *
-                "\nRun them with workers>=1, filter them out, or use YATF.debug(name) to step " *
-                "through one of them here."
-        )
-    )
+    isempty(names) && return nothing
+    @warn "YATF: workers=0, but these items ask for a sandbox that this process cannot " *
+        "provide, so each one gets a worker of its own that is torn down afterwards:\n" *
+        join(("  " * repr(n) for n in names), "\n")
+    return nothing
 end
 
 function project_name_of(projectfile::AbstractString)
@@ -513,16 +545,16 @@ function run_slot(run::Run, slot::Slot, target)
     return nothing
 end
 
-function ensure_worker!(run::Run, slot::Slot, target)
+function ensure_worker!(run::Run, slot::Slot, target, exclusive::Bool)
     slot.worker === nothing || (slot.worker.terminated ? nothing : return slot.worker)
-    w = start_worker(run, slot, target)
+    w = start_worker(run, slot, target, exclusive)
     slot.worker = w
     return w
 end
 
 const WORKER_START_RETRIES = 2
 
-function start_worker(run::Run, slot::Slot, target)
+function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     prof = slot.profile
     last_err = nothing
     for attempt in 1:(WORKER_START_RETRIES + 1)
@@ -535,8 +567,13 @@ function start_worker(run::Run, slot::Slot, target)
                 project = Base.active_project(),
                 redirect_io = stdout,
                 # Everything a worker says while it is running items: its own
-                # START/DONE lines, and in `logs=:eager` whatever the items print.
-                redirect_fn = (io, pid, line) -> printline(run, string(slot.prefix, line))
+                # START/DONE lines, which arrive carrying the glyph for how the
+                # item went, and in `logs=:eager` whatever the items print, which
+                # does not.
+                redirect_fn = function (io, pid, line)
+                    mark, at = mark_index(line)
+                    printline(run, string(slot.prefixes[mark], SubString(line, at)))
+                end
             )
         catch e
             e isa InterruptException && rethrow()
@@ -547,9 +584,14 @@ function start_worker(run::Run, slot::Slot, target)
         try
             init_worker!(run, slot, w)
             slot.started_at = time()
+            slot.worker_items = 0
+            count_worker_start!(run.monitor)
             print_worker_line(
                 run, slot.id, "UP", string(
                     "pid ", w.pid, " · threads ", prof.threads,
+                    # Why this process exists: a pool worker runs whatever it is
+                    # handed, a sandbox runs one unit and goes away again.
+                    exclusive ? " · sandbox" : "",
                     prof.name === DEFAULT_PROFILE ? "" : string(" · profile ", prof.name),
                     isempty(prof.julia_args) ? "" : string(" · ", join(prof.julia_args, " "))
                 )
@@ -621,7 +663,7 @@ function stop_worker!(run::Run, slot::Slot)
     w = slot.worker
     w === nothing && return nothing
     slot.worker = nothing
-    ran = count(==(slot.id), run.statuses.slot)
+    ran = slot.worker_items
     alive = slot.started_at == 0.0 ? 0.0 : time() - slot.started_at
     try
         close(w)
@@ -629,7 +671,7 @@ function stop_worker!(run::Run, slot::Slot)
         @error "YATF: could not stop worker $(w.pid)" exception = (e, catch_backtrace())
     end
     print_worker_line(
-        run, slot.id, "DOWN", string(
+        run, slot.id, "EXIT", string(
             "pid ", w.pid, " · ",
             plural(ran, "item"), " · ", fmt_seconds(alive)
         )
@@ -714,10 +756,14 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
     p = run.plan
     span = p.units.span[u]
     exclusive = p.units.exclusive[u]
+    # A sandbox is a process to itself. The slot can arrive here holding a worker
+    # that has already run other items — its own queue drained and it stole this
+    # unit — and that process is not the one the unit asked for.
+    exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
     for i in span
         is_cancelled(run.queues) && (record_cancelled!(run, i); continue)
         w = try
-            ensure_worker!(run, slot, target)
+            ensure_worker!(run, slot, target, exclusive)
         catch e
             e isa InterruptException && rethrow()
             record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
@@ -740,6 +786,7 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
             continue   # an ordinary error on a live worker; `has_non_pass` decides what happens next
         end
         slot.current = ItemIdx(0)
+        slot.worker_items += 1
         record_result!(run, i, slot, attempt, result, max_attempts)
     end
     exclusive && stop_worker!(run, slot)
@@ -884,7 +931,7 @@ function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, attempts::In
         p.items.code[i], p.items.skip[i],
         p.items.failfast[i] == -1 ? p.cfg.item_failfast : p.items.failfast[i] == 1,
         run.project_name, slot.profile.name, attempt, Int8(clamp(attempts, 1, 127)),
-        p.cfg.full_stacktraces, logpath
+        p.cfg.full_stacktraces, logpath, run.name_width
     )
 end
 
@@ -1028,7 +1075,10 @@ function run_in_process(run::Run, target)
     Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
     # The items run here, so their own lines have to go through the printer like
     # everything else this process writes.
-    YATFWorkers.LOG_SINK[] = line -> printline(run, line)
+    YATFWorkers.LOG_SINK[] = function (line)
+        mark, at = mark_index(line)
+        printline(run, string(SOLO_PREFIXES[mark], SubString(line, at)))
+    end
     try
         run_in_process_items(run, target)
     finally
@@ -1040,16 +1090,30 @@ end
 function run_in_process_items(run::Run, target)
     p = run.plan
     slot = run.slots[1]
-    for u in p.slot_units[1]
+    # Every unit, not just the one slot's queue: a pool that would have had a
+    # worker of its own has none here, and its items still have to run.
+    for u in UnitIdx(1):UnitIdx(length(p.units))
         is_cancelled(run.queues) && break
-        # The same attempt policy as a worker run: an item's own `retries` wins
-        # over the run default, and a chain is retried from its first item.
-        max_attempts = attempts_for(p, u)
-        for attempt in 1:max_attempts
-            run_unit_in_process!(run, slot, u, Int8(attempt), max_attempts)
-            has_non_pass(run, u) || break
-            attempt == max_attempts && break
-            reset_unit!(run, u)
+        if needs_worker(p, u)
+            # A sandbox is a process, so this one gets a process — the same path a
+            # pooled run takes, with the worker started and stopped around it.
+            slot.pool = p.units.profile[u]
+            slot.profile = p.profiles[p.units.profile[u]]
+            try
+                run_unit!(run, slot, u, target)
+            finally
+                stop_worker!(run, slot)
+            end
+        else
+            # The same attempt policy as a worker run: an item's own `retries`
+            # wins over the run default, and a chain is retried from its first item.
+            max_attempts = attempts_for(p, u)
+            for attempt in 1:max_attempts
+                run_unit_in_process!(run, slot, u, Int8(attempt), max_attempts)
+                has_non_pass(run, u) || break
+                attempt == max_attempts && break
+                reset_unit!(run, u)
+            end
         end
         if p.cfg.failfast && has_non_pass(run, u)
             cancel!(run.queues) === false && print_failfast(run, first(p.units.span[u]))

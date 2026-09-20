@@ -26,6 +26,98 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         @test length(unique(r.pid for r in rows)) == 2
     end
 
+    @testset "a sandbox worker says it is one, and is put down when it hangs" begin
+        # A sandbox under the default profile is otherwise indistinguishable from a
+        # pool worker in the log: same flags, same threads. The line has to say why
+        # the process exists, because "one more worker came up" and "this item
+        # demanded a process of its own" are different things to read past.
+        dir = make_pkg("SandboxLog", "test/t_test.jl" => """
+        @testitem "pooled one" begin
+            @test true
+        end
+        @testitem "solo" sandbox=true begin
+            @test true
+        end
+        @testitem "solo hangs" sandbox=true timeout=2 begin
+            sleep(600)
+        end
+        @testitem "pooled two" begin
+            @test true
+        end
+        """)
+        _, out = capture_run() do
+            run_states(dir; workers=1, logs=:issues, monitor=false)
+        end
+        lines = collect(eachsplit(out, '\n'))
+        ups = filter(l -> occursin("· UP ", l), lines)
+        @test length(ups) == 3                      # one pool worker and two sandboxes
+        @test count(l -> occursin("· sandbox", l), ups) == 2
+        # The pool worker that ran the two ordinary items is not one of them.
+        @test count(l -> !occursin("· sandbox", l), ups) == 1
+        # The one that hung was killed; the one that passed was closed. Both words
+        # appear, and neither stands in for the other.
+        @test count(l -> occursin("· KILL", l), lines) == 1
+        @test any(l -> occursin("· KILL", l) && occursin("solo hangs", l), lines)
+        # A killed worker is already gone, so it is not also reported as exiting:
+        # one UP per teardown line, three and three.
+        @test count(l -> occursin("· EXIT", l), lines) == 2
+    end
+
+    @testset "a slot that has drained its sandboxes takes ordinary work" begin
+        # A profile's exclusive units are pooled apart from its ordinary ones, so a
+        # slot can be bound to a pool holding a single sandbox. Having run it, that
+        # slot has the same configuration as every other and must keep working;
+        # going home for good with the rest of the suite still queued is a worker
+        # the run paid for and did not use.
+        dir = make_pkg(
+            "SandboxThenSteal",
+            "test/a_test.jl" => """
+            @testitem "solo" sandbox=true begin
+                @test true
+            end
+            """,
+            ("test/b_$(i)_test.jl" => """
+            @testitem "ordinary $i" begin
+                sleep(0.4)
+                @test true
+            end
+            """ for i in 1:6)...,
+        )
+        states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
+        @test all(==(PASSED), values(states))
+        idx(name) = findfirst(==(name), p.items.name)
+        sandbox_slot = run.statuses.slot[idx("solo")]
+        ordinary = [run.statuses.slot[idx("ordinary $i")] for i in 1:6]
+        @test count(==(sandbox_slot), ordinary) > 0
+        # ...and the other slot did not sit idle either, so this is about sharing
+        # the work and not about one slot taking all of it.
+        @test length(unique(ordinary)) == 2
+    end
+
+    @testset "a stolen sandbox is still alone in its process" begin
+        # The reverse direction: a slot serving ordinary work drains first and
+        # steals from the tail of the sandbox pool, holding a worker that has
+        # already run other items. A sandbox that inherits that process is not the
+        # test that was declared, however green it comes out.
+        dir = make_pkg(
+            "StealSandbox",
+            "test/a_test.jl" => journal_item("ordinary"),
+            ("test/b_$(i)_test.jl" => journal_item(
+                "solo $i"; opts="sandbox=true", body="sleep(0.3)\n@test true"
+            ) for i in 1:4)...,
+        )
+        rows = with_journal() do path
+            states, _, _ = run_states(dir; workers=2, logs=:issues, monitor=false)
+            @test all(==(PASSED), values(states))
+            journal(path)
+        end
+        @test length(rows) == 5
+        for i in 1:4
+            solo = only(r for r in rows if r.name == "solo $i")
+            @test count(r -> r.pid == solo.pid, rows) == 1
+        end
+    end
+
     @testset "a sandboxed item is retried in a fresh process each time" begin
         with_marker_dir() do work
             marker = joinpath(work, "count")

@@ -1,5 +1,6 @@
 using YATF: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
             SKIPPED, BROKEN_CHAIN, CANCELLED, ConfigError, nitems, is_non_pass
+using Logging: Logging
 
 const FAULTY = fixture("Faulty.jl")
 const BASICPKG = fixture("Basic.jl")
@@ -163,19 +164,73 @@ const BASICPKG = fixture("Basic.jl")
         end
     end
 
-    @testset "workers=0 refuses a sandbox it cannot provide" begin
-        dir = mktempdir(); mkpath(joinpath(dir, "test"))
-        write(joinpath(dir, "Project.toml"), "name = \"Sandboxed\"\nuuid = \"1a2b3c4d-0000-4000-8000-000000000003\"\n")
-        mkpath(joinpath(dir, "src")); write(joinpath(dir, "src", "Sandboxed.jl"), "module Sandboxed end\n")
-        write(joinpath(dir, "test", "a_test.jl"),
-              """@testitem "bounded" sandbox=:bounds begin\n @test true\n end\n""")
-        write(joinpath(dir, "test", "TestItems.toml"),
-              "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n")
-        p, target = prepare((dir,); workers=0)
-        err = try; execute(p, target); catch e; e; end
-        @test err isa ConfigError
-        @test occursin("workers=0", sprint(showerror, err))
-        @test occursin("bounded", sprint(showerror, err))
+    @testset "workers=0 still gives a sandboxed item its process" begin
+        # `workers=0` is a promise about the pool, not about never starting a
+        # process. An item that asked for `--check-bounds=yes` is testing
+        # something that depends on it, so running it here and reporting a pass
+        # would report a pass for a test that never ran the way it was written.
+        dir = make_pkg(
+            "Sandboxed",
+            "test/a_test.jl" => """
+            @testitem "bounded" sandbox=:bounds begin
+                @test Base.JLOptions().check_bounds == 1          # what it asked for
+                @test Main.FROM_PROFILE_INIT == 7                 # and its profile's init
+                @test getpid() != parse(Int, ENV["YATF_SOLO_PID"])
+            end
+            @testitem "alone" sandbox=true begin
+                @test getpid() != parse(Int, ENV["YATF_SOLO_PID"])
+            end
+            @testitem "ordinary" begin
+                @test Base.JLOptions().check_bounds == 0
+                @test getpid() == parse(Int, ENV["YATF_SOLO_PID"])
+            end
+            """,
+            "test/TestItems.toml" =>
+                "[profiles.bounds]\njulia_args = [\"--check-bounds=yes\"]\n" *
+                "init = \"const FROM_PROFILE_INIT = 7\"\n",
+        )
+        before = live_worker_processes()
+        out = Ref("")
+        logs = Test.collect_test_logs() do
+            withenv("YATF_SOLO_PID" => string(getpid())) do
+                (states, _, _), printed = capture_run() do
+                    run_states(dir; workers=0, logs=:issues, monitor=false)
+                end
+                out[] = printed
+                # Every item runs, including the ones in a pool of their own —
+                # those are not in the single slot's queue.
+                @test length(states) == 3
+                @test all(==(PASSED), values(states))
+            end
+        end
+        # Each sandbox worker announces itself and its teardown, and each ran
+        # exactly the one item it was started for.
+        lifecycle = filter(l -> occursin("· UP ", l) || occursin("· EXIT", l),
+                           collect(eachsplit(out[], '\n')))
+        @test count(l -> occursin("· UP ", l), lifecycle) == 2
+        @test count(l -> occursin("· EXIT", l), lifecycle) == 2
+        @test all(l -> occursin("1 item ", l), filter(l -> occursin("· EXIT", l), lifecycle))
+        @test any(l -> occursin("--check-bounds=yes", l), lifecycle)
+
+        # ...and the processes it started are gone again.
+        sleep(0.5)
+        @test live_worker_processes() <= before
+
+        warnings = filter(r -> r.level == Logging.Warn, first(logs))
+        @test length(warnings) == 1
+        msg = first(warnings).message
+        @test occursin("workers=0", msg)
+        @test occursin("a worker of its own", msg)
+        @test occursin("\"bounded\"", msg)
+        @test occursin("\"alone\"", msg)
+        @test !occursin("\"ordinary\"", msg)   # it asked for nothing, so it ran here
+    end
+
+    @testset "workers=0 says nothing when nothing asked for a sandbox" begin
+        logs = Test.collect_test_logs() do
+            run_states(BASICPKG; workers=0, logs=:issues, monitor=false)
+        end
+        @test isempty(filter(r -> r.level == Logging.Warn, first(logs)))
     end
 
     @testset "a sandbox profile really changes the worker's julia flags" begin

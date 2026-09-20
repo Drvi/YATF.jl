@@ -51,6 +51,7 @@ struct ItemSpec
     attempts     :: Int8      # how many attempts this item gets in total
     full_stacktraces :: Bool  # keep the frames belonging to the framework itself
     logpath      :: String    # "" to write to the worker's stdout instead
+    name_width   :: Int32     # the run's name column, chosen from all of its names
 end
 
 struct ItemResult
@@ -198,34 +199,37 @@ function log_item(spec::ItemSpec, state::AbstractString, result=nothing)
     # escapes only when the coordinator is attached to a terminal.
     buf = IOBuffer()
     io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
+    print(io, result === nothing ? MARK_RUNNING : state_mark(result.state), " ")
     # `Libc.strftime` rather than Dates: every worker loads this package, so it
     # carries only what it cannot do without.
-    print(io, Libc.strftime("%H:%M:%S", time()), " | ")
+    print(io, Libc.strftime("%H:%M:%S", time()), FIELD)
     printstyled(io, state; bold=true)
-    pad_to(io, 5, textwidth(state))
+    pad_to(io, WORKER_STATE_WIDTH, textwidth(state))
+    print(io, FIELD)
     if spec.ntotal > 0
-        print(io, " (", lpad(spec.index, ndigits(spec.ntotal)), "/", spec.ntotal, ")")
+        print(io, lpad(spec.index, ndigits(spec.ntotal)), "/", spec.ntotal, FIELD)
     end
     # Padded so the columns after the name stay put for the whole run; a name
     # longer than the column pushes them out rather than being cut, because the
     # name is what identifies the item.
-    print(io, " ")
-    pad_to(io, NAME_WIDTH, print_quoted(io, spec.name))
-    # A retry is the same item again, so it gets the same line with a marker
-    # rather than an announcement of its own.
-    spec.attempt > 1 && print(io, " (retry ", spec.attempt - 1, " of ", max(spec.attempts - 1, 1), ")")
+    pad_to(io, spec.name_width, print_quoted(io, spec.name))
+    # A retry is the same item again, so it gets the same line with a field of its
+    # own rather than an announcement of its own.
+    spec.attempt > 1 &&
+        print(io, FIELD, "retry ", spec.attempt - 1, " of ", max(spec.attempts - 1, 1))
+    print(io, FIELD)
     if result === nothing
-        print(io, " at ")
+        print(io, "at ")
         printstyled(io, spec.location; bold=true)
     else
         pct = result.stats.elapsed_ns > 0 ?
             round(Int, 100 * result.stats.compile_ns / result.stats.elapsed_ns) : 0
-        printstyled(io, " ", rpad(short_state(result.state), STATE_WIDTH);
+        printstyled(io, rpad(short_state(result.state), STATE_WIDTH);
                     color=state_color(result.state))
         print(io,
-              " in ", lpad(fmt_secs(result.stats.elapsed_ns / 1e9), TIME_WIDTH),
+              FIELD, lpad(fmt_secs(result.stats.elapsed_ns / 1e9), TIME_WIDTH),
               " (", lpad(pct, 2), "% compile)",
-              ", maxrss ", fmt_gib(Sys.maxrss()))
+              FIELD, "maxrss ", fmt_gib(Sys.maxrss()))
     end
     println(io)
     emit_log(String(take!(buf)))
@@ -336,6 +340,36 @@ short_state(state::ItemState) =
     state === CANCELLED    ? "CANCELLED" : string(state)
 
 """
+    ITEM_MARKS
+
+The glyph a test item's line carries, by how the item went: blue while it runs,
+then the colour of its outcome.
+
+`log_item` writes this at the start of the line, before anything else, because at
+the moment the line is written only this process knows how the item went — the
+coordinator draws the rest of the line and has not been told yet. The line is
+self-describing: the coordinator strips the glyph and redraws the line around it,
+and a line that reaches a terminal without being redrawn still reads.
+"""
+const MARK_RUNNING = "🔵"
+const MARK_PASSED = "🟢"
+const MARK_FAILED = "🔴"
+const MARK_SET_ASIDE = "🟡"
+
+const ITEM_MARKS = (MARK_RUNNING, MARK_PASSED, MARK_FAILED, MARK_SET_ASIDE)
+
+"""
+    state_mark(state) -> String
+
+`state_color`'s palette as a glyph: green for a pass, red for anything that went
+wrong, yellow for what was set aside.
+"""
+state_mark(state::ItemState) =
+    state === PASSED ? MARK_PASSED :
+    (state === SKIPPED || state === CANCELLED) ? MARK_SET_ASIDE :
+    is_non_pass(state) ? MARK_FAILED : MARK_RUNNING
+
+"""
     state_color(state) -> Symbol
 
 `Test`'s palette, so an outcome looks the same here as it does in the summary
@@ -347,9 +381,103 @@ state_color(state::ItemState) =
     state === SKIPPED || state === CANCELLED ? Base.warn_color() :
     is_non_pass(state) ? Base.error_color() : :default
 
-const NAME_WIDTH  = 40
+"""
+    quoted_width(name) -> Int
+
+The number of columns [`print_quoted`](@ref) will take for `name`.
+
+Paired with it deliberately: the width of the name column is chosen from these,
+and a disagreement between the two would show up as a column that is off by one
+for exactly the names that needed escaping.
+"""
+quoted_width(name::AbstractString) =
+    needs_escaping(name) ? textwidth(repr(name)) : textwidth(name) + 2
+
+# Bounds on the name column. Narrower than the floor is not worth aligning; wider
+# than the ceiling is a column of blanks on a line nobody can read anyway.
+const MIN_NAME_WIDTH = 12
+const MAX_NAME_WIDTH = 60
+
+# One name in this many may be left to overflow when they cannot all be held. A
+# whole number rather than a fraction: `1 - 0.9` is not a tenth, and the rounding
+# it causes moves the answer by a name.
+const NAME_OUTLIER_SHARE = 10
+
+# ...and the number the column is always willing to leave out, however few names
+# there are. A tenth of five names is none, and one wild name among five should
+# still not set the width for the other four.
+const NAME_OUTLIER_ALLOWANCE = 2
+
+# Cover the whole tail rather than nine names in ten when the difference is this
+# small: a column a few characters wider that nothing overflows reads better than
+# one that is exactly wide enough for most.
+const NAME_TAIL_SLACK = 8
+
+# What the rest of a DONE line takes at its widest — glyph, worker, clock, state,
+# counter, and the timing and memory after the name.
+const LINE_RESERVED = 85
+
+"""
+    name_width(names; columns = 0) -> Int
+
+How wide the name column should be for a run of `names`.
+
+One width for the whole run, chosen from the names it will actually print, so the
+columns after it stay put. `columns` is the terminal's width when there is a
+terminal, and `0` when the output is going somewhere that has no width.
+
+The rule is in two steps. Start from the widest name the column could settle on
+after leaving out as many as it is allowed to — one in
+[`NAME_OUTLIER_SHARE`](@ref) of them, or [`NAME_OUTLIER_ALLOWANCE`](@ref),
+whichever is more. Then climb back up through
+the names above it for as long as each is within [`NAME_TAIL_SLACK`](@ref) of
+where we started, so a tail that is only a little longer is covered rather than
+left to overflow.
+
+What that buys: a suite of two thousand names, all about ten characters except
+two of sixty, gets a ten-wide column and two long lines — not sixty columns of
+blanks on the other 1998. A suite whose names are all within a few characters of
+each other gets a column that fits every one of them.
+"""
+function name_width(names; columns::Integer = 0)
+    isempty(names) && return MIN_NAME_WIDTH
+    widths = sort!([quoted_width(n) for n in names])
+    n = length(widths)
+    allowed = max(NAME_OUTLIER_ALLOWANCE, n ÷ NAME_OUTLIER_SHARE)
+    wanted = widths[max(1, n - allowed)]
+    for j in (max(1, n - allowed) + 1):n
+        widths[j] - wanted <= NAME_TAIL_SLACK || break
+        wanted = widths[j]
+    end
+    # The floor is on the budget, not on the answer: a suite whose names are all
+    # eight characters wide wants an eight-wide column, not a floor's worth of
+    # blanks after every one of them.
+    budget = columns > 0 ? clamp(columns - LINE_RESERVED, MIN_NAME_WIDTH, MAX_NAME_WIDTH) :
+        MAX_NAME_WIDTH
+    return min(wanted, budget)
+end
+
+"""
+    terminal_columns() -> Int
+
+How wide the output is, or `0` when it is not going to a terminal and so has no
+width to speak of.
+"""
+terminal_columns() = stdout isa Base.TTY ? displaysize(stdout)[2] : 0
+"""
+    FIELD
+
+What separates one field of a line from the next.
+
+A middle dot rather than a pipe: the line is a row of small facts about one item,
+and the same separator inside a field and between fields makes a run of them read
+as one table rather than as two nested ones.
+"""
+const FIELD = " · "
+
+const WORKER_STATE_WIDTH = 5   # "START"; the worker words ("UP", "EXIT", "KILL", "LOST") are shorter
 const STATE_WIDTH = 4     # "PASS"; the rarer outcomes are longer and may overflow
-const TIME_WIDTH  = 6     # "999.9s"; an item that runs longer than that pushes the column
+const TIME_WIDTH  = 5     # "99.9s"; an item that runs longer than that pushes the column
 
 # One unit each, always: a column that switches between ms and s, or MiB and GiB,
 # cannot be compared down the page at a glance.
