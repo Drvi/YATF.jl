@@ -225,6 +225,19 @@ function execute(p::Plan, target)
     setup_path = joinpath(target.testdir, TESTSETUPS_DIR)
     # Every log record raised while the run is going goes through the printer, so
     # nothing can land in the middle of the status line or another writer's line.
+    return try
+        run_phases(run, p, target, setup_path)
+    finally
+        # Wherever the run stopped. A throw before the first item — a setup that
+        # will not compile, an environment that will not resolve — leaves the
+        # monitor's task running and its line pinned, and the error prints on top
+        # of that line instead of under it.
+        stop_monitor!(run.monitor)
+    end
+end
+
+function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
+    cfg = p.cfg
     return with_logger(RunLogger(current_logger(), run)) do
         t_env = time()
         with_test_env(target, run) do
