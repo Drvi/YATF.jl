@@ -14,6 +14,7 @@ contain `@testitem` declarations and nothing else. Shared setup code goes in
 """
 module YATF
 
+using Base.ScopedValues: ScopedValue, with
 using Dates: Dates
 using Logging: Logging, with_logger, current_logger
 using Pkg: Pkg

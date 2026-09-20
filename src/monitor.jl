@@ -161,11 +161,34 @@ mutable struct Monitor
     last_restart::Float64
 end
 
+"""
+    TTY_OVERRIDE
+
+What [`is_tty`](@ref) should answer, when something has decided for it.
+
+The drawing path is the one part of the status line that only exists on a
+terminal, and a test suite's output is a pipe. Rather than arrange a pseudo
+terminal to reach it, a test says what the answer is.
+"""
+const TTY_OVERRIDE = ScopedValue{Union{Nothing, Bool}}(nothing)
+
+"""
+    is_tty() -> Bool
+
+Whether the run should draw a line that rewrites itself.
+
+That needs a terminal able to rewrite it and a reader watching it happen.
+Anything else — a pipe, a log file, a CI job — gets the same line printed
+periodically instead.
+"""
+function is_tty()
+    forced = TTY_OVERRIDE[]
+    forced === nothing || return forced
+    return stdout isa Base.TTY && !haskey(ENV, "CI") && get(ENV, "TERM", "") != "dumb"
+end
+
 function Monitor(run; interval = 0.2, print_interval = 30.0)
-    # A line that rewrites itself needs a terminal that can rewrite it, and a
-    # reader watching it happen. Anything else — a pipe, a log file, a CI job —
-    # gets the same line printed periodically instead.
-    tty = stdout isa Base.TTY && !haskey(ENV, "CI") && get(ENV, "TERM", "") != "dumb"
+    tty = is_tty()
     color = get(stdout, :color, false)::Bool
     linebuf = IOBuffer()
     # The run is already in its first stage by the time it has a monitor — nothing

@@ -4,6 +4,8 @@ using YATF: prepare, execute, report, Monitor, MemStats, start_monitor!, stop_mo
             status_line, print_status_line,
             status_update!, print_memory_summary, fmt_bytes, print_bytes, print_1dp,
             print_int, nitems
+using Base.ScopedValues: with
+using YATF: printline, with_status_line_off
 using YATF.Platform: process_rss, child_pids, process_tree, machine_memory,
                      platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
 
@@ -508,76 +510,65 @@ end
         end === :ran
     end
 
-    @testset "nothing is drawn on a terminal while the line is withdrawn" begin
-        # The only path on which the status line is drawn at all is a real
-        # terminal, so this is the only way to see it happen. Without one there is
-        # nothing to test: `drawing` is already false and every branch below is
-        # the one it would take anyway.
-        pty = Sys.which("python3")
-        if pty === nothing
-            @test_skip "a pty is needed to exercise the terminal path"
-        else
-            script = """
-            using YATF
-            using YATF: prepare, execute, printline, with_status_line_off, Monitor
-            p, target = prepare((ARGS[1],); workers=0, logs=:issues, monitor=false)
-            run = execute(p, target)
-            rm(run.logdir; force=true, recursive=true)
-            # Not started: the sampling task would draw on its own clock, and what
-            # is under test is what the printing path does.
-            run.monitor = Monitor(run)
-            run.monitor.tty || error("the child did not get a terminal")
-            printline(run, "OUTSIDE")
-            with_status_line_off(run.monitor) do
-                printline(run, "INSIDE")
-            end
-            println("SENTINEL")
-            """
-            # `pty.fork` and not `pty.spawn`: the latter copies the driver's own
-            # stdin to the child and blocks here waiting for an end of input that
-            # never comes.
-            driver = """
-            import os, pty, sys, select, errno
-            code = os.environ["CHILD_CODE"]
-            argv = ["julia", "--startup-file=no", "--project=" + os.environ["PROJ"], "-e", code, os.environ["FIXTURE"]]
-            pid, fd = pty.fork()
-            if pid == 0:
-                os.execvp(argv[0], argv)
-            chunks = []
-            while True:
-                try:
-                    r, _, _ = select.select([fd], [], [], 300)
-                    if not r:
-                        break
-                    data = os.read(fd, 65536)
-                except OSError as e:
-                    if e.errno == errno.EIO:
-                        break
-                    raise
-                if not data:
-                    break
-                chunks.append(data)
-            _, status = os.waitpid(pid, 0)
-            sys.stdout.buffer.write(b"".join(chunks))
-            sys.exit(0 if status == 0 else 1)
-            """
-            out = withenv(
-                "CHILD_CODE" => script,
-                "PROJ" => dirname(@__DIR__),
-                "FIXTURE" => fixture("Basic.jl"),
-                "CI" => nothing, "TERM" => "xterm",
-            ) do
-                read(`$pty -c $driver`, String)
-            end
-            @test occursin("SENTINEL", out)
-            @test occursin("OUTSIDE", out)
-            @test occursin("INSIDE", out)
-            # A line printed with the status line up carries it along; the same
-            # call inside the withdrawal writes the line and stops there.
-            after_outside = out[findfirst("OUTSIDE", out).stop:findfirst("INSIDE", out).start]
-            after_inside = out[findfirst("INSIDE", out).stop:end]
-            @test occursin(YATF.MARK_INFO, after_outside)
-            @test !occursin(YATF.MARK_INFO, after_inside)
+    @testset "a run that throws before its first item takes the line down" begin
+        # `stop_monitor!` used to be reached only on the way out of the test phase,
+        # so a run that fell over before that — a setup that will not compile, an
+        # environment that will not resolve — left the line pinned, and whatever
+        # printed the error wrote on top of it.
+        dir = make_pkg("SetupThrows")
+        setup = string("Boom", string(hash(dir); base=16))
+        mkpath(joinpath(dir, "test", "testsetups"))
+        write(joinpath(dir, "test", "testsetups", setup * ".jl"),
+              "module $setup\nerror(\"this setup refuses to compile\")\nend\n")
+        write(joinpath(dir, "test", "a_test.jl"), """
+        @testitem "uses it" begin
+            using $setup
+            @test true
         end
+        """)
+        thrown, out = capture_run() do
+            with(YATF.TTY_OVERRIDE => true) do
+                try
+                    p, target = prepare((dir,); workers=1, logs=:issues, monitor=true)
+                    execute(p, target)
+                    nothing
+                catch e
+                    e
+                end
+            end
+        end
+        @test thrown isa YATF.ConfigError
+        @test occursin("failed to precompile", sprint(showerror, thrown))
+        # Taking the monitor down erases what it had drawn, so the last thing on
+        # the terminal is the erase and not half a status line.
+        @test endswith(out, "\r\e[2K")
+    end
+
+    @testset "nothing is drawn while the line is withdrawn" begin
+        # The drawing path exists only on a terminal, and a test suite's output is
+        # a pipe; `TTY_OVERRIDE` is how it is reached without arranging one.
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        _, out = capture_run() do
+            with(YATF.TTY_OVERRIDE => true) do
+                # Not started: the sampling task would draw on its own clock, and
+                # what is under test is what the printing path does.
+                run.monitor = Monitor(run)
+                run.monitor.tty || error("the override did not reach the monitor")
+                printline(run, "OUTSIDE")
+                with_status_line_off(run.monitor) do
+                    printline(run, "INSIDE")
+                end
+            end
+        end
+        @test occursin("OUTSIDE", out)
+        @test occursin("INSIDE", out)
+        # A line printed with the status line up carries it along; the same call
+        # inside the withdrawal writes the line and stops there.
+        after_outside = out[findfirst("OUTSIDE", out).stop:findfirst("INSIDE", out).start]
+        after_inside = out[findfirst("INSIDE", out).stop:end]
+        @test occursin(YATF.MARK_INFO, after_outside)
+        @test !occursin(YATF.MARK_INFO, after_inside)
     end
 end
