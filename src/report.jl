@@ -150,8 +150,13 @@ const MARK_INDENT = "   "
 
 # A test item's own lines come in already carrying the glyph for how the item went
 # (`YATFWorkers.ITEM_MARKS`): blue while it runs, then the colour of its outcome.
-# Everything else a worker says is the item talking, and gets `MARK_ITEM`.
-const LINE_MARKS = (YATFWorkers.ITEM_MARKS..., MARK_ITEM)
+# Anything else is unlabelled output from the worker's stdout, and which of the
+# last two it gets depends on whether an item was running when it arrived: a print
+# from a test is the item talking, a signal backtrace from a process being taken
+# down is not.
+const LINE_MARKS = (YATFWorkers.ITEM_MARKS..., MARK_ITEM, MARK_WORKER)
+const MARK_IDX_ITEM = length(YATFWorkers.ITEM_MARKS) + 1
+const MARK_IDX_WORKER = length(YATFWorkers.ITEM_MARKS) + 2
 
 """
     mark_index(line) -> (index, at)
@@ -167,7 +172,7 @@ function mark_index(line::AbstractString)
     for (i, mark) in pairs(YATFWorkers.ITEM_MARKS)
         startswith(line, mark) && return i, ncodeunits(mark) + 2
     end
-    return length(LINE_MARKS), 1
+    return MARK_IDX_ITEM, 1
 end
 
 # `MARK_INDENT`, a glyph and a trailing space: what a line with no worker to name

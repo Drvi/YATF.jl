@@ -21,6 +21,11 @@ mutable struct Slot
     worker_items::Int        # items the current process has run, for its EXIT line
     units_started::Int
     current::ItemIdx      # the item this slot is running, 0 when idle
+    # Where to put what the worker prints while it is being taken down, or empty.
+    # A process killed for a timeout prints a signal and a backtrace after its item
+    # has stopped capturing, so that output arrives loose on the relay with nowhere
+    # obvious to go; it belongs with the item that was running.
+    dying_log::String
 end
 
 """
@@ -213,7 +218,7 @@ function execute(p::Plan, target)
                 SlotIdx(s),
                 ntuple(k -> string(MARK_INDENT, LINE_MARKS[k], " w", s, FIELD), length(LINE_MARKS)),
                 p.slot_pool[s], p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, 0, ItemIdx(0)
+                nothing, 0.0, 0, 0, ItemIdx(0), ""
             )
         )
     end
@@ -239,6 +244,9 @@ function execute(p::Plan, target)
                     else
                         run_on_workers(run, target)
                     end
+                catch e
+                    e isa InterruptException && kill_workers!(run)
+                    rethrow()
                 finally
                     set_phase!(run.monitor, PHASE_REPORT)
                     stop_monitor!(run.monitor)
@@ -333,8 +341,17 @@ function test_env(target, announce = nothing)
         announce === nothing || announce()
         original = Base.active_project()
         try
-            Pkg.activate(proj; io = devnull)
-            env = TestEnv.activate()
+            # `Pkg` precompiles an environment it has just resolved, for the flags
+            # this process happens to be running under. The run wants the same work
+            # done for every set of flags its pools will use, which is one pass over
+            # the environment rather than this one plus another; `precompile_env`
+            # does it, and this stays a resolve so the time reported against it is
+            # the resolve's.
+            withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
+                Pkg.activate(proj; io = devnull)
+                TestEnv.activate()
+            end
+            env = Base.active_project()
             # Stamped *after* generating it: resolving writes the package's manifest,
             # so a stamp taken beforehand never matches again and every call would
             # rebuild the environment it was supposed to cache.
@@ -485,8 +502,11 @@ function profile_projects!(run::Run, p::Plan)
 end
 
 function precompile_phase(run::Run, p::Plan, target)
+    # The environment first: a setup module is compiled against it, and compiling
+    # one before it is there makes that worker build the dependencies itself, one
+    # at a time, instead of reading what this pass wrote.
+    precompile_env(run, p)
     precompile_setups(run, p, target)
-    precompile_profiles(run, p)
     return nothing
 end
 
@@ -508,21 +528,27 @@ cache_flags_for(julia_args::Cmd) = parse(
 )
 
 """
-    precompile_profiles(run, p)
+    precompile_env(run, p)
 
-Precompile the test environment once for each set of cache flags the run's pools
-imply.
+Precompile the test environment once for every set of cache flags the run will
+use: this process's own, and one per pool that has julia arguments of its own.
 
 Every test item's module loads the package under test, and a package image built
 under other julia flags cannot be used, so the first worker of a pool with
-`julia_args` compiles that package and everything it depends on. Left alone that
-happens inside the worker: serially, with no output, while the run looks stalled
-on its first item. Here it is one parallel pass that says what it is doing, and
-what it writes serves every later worker and every later run.
+`julia_args` would otherwise compile that package and everything it depends on —
+inside the worker, serially, with no output, while the run looks stalled on its
+first item. One pass here covers every set of flags at once, and what it writes
+serves every later worker and every later run.
+
+This is also where the environment's ordinary precompilation happens. `Pkg` would
+do that as part of resolving, for this process's flags alone; `test_env` turns that
+off so the whole thing is one pass rather than that one and then another.
 """
-function precompile_profiles(run::Run, p::Plan)
+function precompile_env(run::Run, p::Plan)
     mine = Base.CacheFlags()
-    configs = Pair{Cmd, Base.CacheFlags}[]
+    # The flags this process runs under lead, because every pool without julia
+    # arguments of its own uses them and because `Pkg` is no longer doing it.
+    configs = Pair{Cmd, Base.CacheFlags}[`` => mine]
     names = String[]
     seen = Set{Base.CacheFlags}()
     for pool in p.pools
@@ -552,8 +578,10 @@ function precompile_profiles(run::Run, p::Plan)
         dir === nothing && continue
         precompile_profile_project(run, prof, dir)
     end
-    isempty(configs) && return nothing
-    printline(
+    # Named only when there is something to name. `Pkg` narrates the rest itself,
+    # and says nothing at all when there is nothing to do, which is what this line
+    # would have to work out for itself to avoid printing on every cached run.
+    isempty(names) || printline(
         run, string(
             yatf_prefix(), "precompiling the test environment for ",
             plural(length(names), "profile"), ": ", join(names, ", ")
@@ -684,12 +712,15 @@ function run_on_workers(run::Run, target)
     end
     try
         foreach(wait, tasks)
-    catch
+    catch e
         # Ctrl-C lands in whichever task was running, this one included. Stop
-        # dispatching, let every slot finish the item it has in flight, and only
-        # then let the exception out: `shutdown!` must not find a slot that is
-        # still starting workers.
+        # dispatching, and kill the processes rather than wait for them: an item
+        # that sleeps for two minutes would otherwise hold the interrupt for two
+        # minutes. The slot tasks are still waited for, because killing their
+        # workers is what lets them unwind and `shutdown!` must not find a slot
+        # still starting one.
         cancel!(run.queues)
+        e isa InterruptException && kill_workers!(run)
         foreach(
             t -> (
                 try
@@ -749,6 +780,18 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                 # does not.
                 redirect_fn = function (io, pid, line)
                     mark, at = mark_index(line)
+                    if slot.current == ItemIdx(0)
+                        # Nothing of this worker's is an item's any more. Its own
+                        # verdict for an item the run has already recorded as timed
+                        # out is a pass nobody accepted, and is dropped.
+                        mark == MARK_IDX_ITEM || return nothing
+                        log = slot.dying_log
+                        # A process on its way down: its last words go with the item
+                        # it was running, where the report will pick them up, rather
+                        # than across the middle of the run.
+                        isempty(log) || return append_line(log, line, at)
+                        mark = MARK_IDX_WORKER
+                    end
                     printline(run, string(slot.prefixes[mark], SubString(line, at)))
                 end
             )
@@ -806,6 +849,20 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     )
 end
 
+# Opened per line rather than held: this runs only while a worker is dying, a few
+# dozen lines at most, and a handle kept across that window would outlive the
+# item's own writer and have to be closed on every path out of the kill.
+function append_line(path::AbstractString, line::AbstractString, at::Integer)
+    try
+        open(io -> println(io, SubString(line, at)), path, "a")
+    catch e
+        e isa InterruptException && rethrow()
+        # The log is a convenience; losing a line of a dying process's backtrace is
+        # not a reason to disturb the run that is still going.
+    end
+    return nothing
+end
+
 function worker_env(run::Run, slot::Slot, target)
     pathsep = Sys.iswindows() ? ";" : ":"
     env = Pair{String, String}[
@@ -853,6 +910,31 @@ function stop_worker!(run::Run, slot::Slot)
             "pid ", w.pid, " · ",
             plural(ran, "item"), " · ", fmt_seconds(alive)
         )
+    )
+    return nothing
+end
+
+"""
+    kill_workers!(run)
+
+Kill every worker this run has, immediately.
+
+The orderly teardown gives each process seconds to leave on its own, which across
+a pool is most of a minute — a long time to hold a terminal someone has just asked
+for back. Nothing is reported for what they were running: the run is being
+abandoned, not finished.
+"""
+function kill_workers!(run::Run)
+    live = 0
+    for slot in run.slots
+        w = slot.worker
+        w === nothing && continue
+        slot.worker = nothing
+        live += 1
+        YATFWorkers.kill!(w)
+    end
+    live == 0 || printline(
+        run, string(yatf_prefix(), "interrupted; killed ", plural(live, "worker"))
     )
     return nothing
 end
@@ -1058,13 +1140,18 @@ function handle_dispatch_failure!(
                 )
             )
             YATFWorkers.inspect!(w)   # where was it: every thread's and task's backtrace, into the item's log
+            # `wait` below joins the task relaying this worker's output, so
+            # everything the process says on its way down has been filed by the
+            # time the item is reported.
+            slot.dying_log = item_log_path(run.logprefix, i, attempt)
             YATFWorkers.terminate!(w, :timeout)
             wait(w)   # a replacement must not overlap the process it replaces
+            slot.dying_log = ""
         end
         slot.worker = nothing
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
-            string(timeout_text(e), " · ", retry_note(attempt, max_attempts))
+            string(timeout_text(e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)))
         )
         return :broken
     elseif w !== nothing && !w.terminated
@@ -1089,7 +1176,7 @@ function handle_dispatch_failure!(
             string(
                 e isa YATFWorkers.WorkerTerminatedException ?
                     "the worker running this item died" : sprint(showerror, e),
-                " · ", retry_note(attempt, max_attempts)
+                " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues))
             )
         )
         return :broken
@@ -1120,7 +1207,10 @@ item_timeout(p::Plan, i::ItemIdx) =
 
 # What happens next, said where the failure is reported: a dead worker is only
 # half the story if the reader cannot tell whether the item gets another go.
-function retry_note(attempt::Integer, max_attempts::Integer)
+function retry_note(attempt::Integer, max_attempts::Integer, cancelled::Bool)
+    # A stopped run retries nothing, whatever the item asked for. Saying it will is
+    # a promise the next line of the log breaks.
+    cancelled && return "the run was stopped"
     retries = max_attempts - 1
     retries <= 0 && return "not retried (retries=0)"
     attempt <= retries && return string("retrying on a new worker (retry ", attempt, " of ", retries, ")")
@@ -1150,7 +1240,8 @@ function record_result!(
     n = count_done!(run, i)
     # Only worth saying when there is a policy to state: a plain failure with no
     # retries configured explains itself.
-    note = (is_non_pass(res.state) && max_attempts > 1) ? retry_note(attempt, max_attempts) : ""
+    note = (is_non_pass(res.state) && max_attempts > 1) ?
+        retry_note(attempt, max_attempts, is_cancelled(run.queues)) : ""
     report_item!(run, i, res.state, n, note)
     return nothing
 end
@@ -1320,7 +1411,8 @@ function run_unit_in_process!(run::Run, slot::Slot, u::UnitIdx, attempt::Int8, m
             e isa InterruptException && rethrow()
             record_error!(
                 run, i, slot, attempt, ERRORED,
-                string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts))
+                string(sprint(showerror, e), " · ",
+                       retry_note(attempt, max_attempts, is_cancelled(run.queues)))
             )
             continue
         end

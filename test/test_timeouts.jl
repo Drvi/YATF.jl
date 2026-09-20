@@ -154,3 +154,39 @@ using YATF: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
         end
     end
 end
+
+@testset "an item that finishes after it was given up on" begin
+    # The inspection that follows a timeout leaves the worker alive long enough to
+    # finish what it was doing, so its result and its own DONE line arrive after
+    # the run has recorded the item as timed out. Neither is welcome: one is a pass
+    # for a test nobody accepted, the other is a reply on a channel already closed.
+    dir = make_pkg("LateReply", "test/t_test.jl" => """
+    @testitem "overruns" timeout=2 retries=0 begin
+        sleep(6)
+        @test true
+    end
+    """)
+    states, _, _ = nothing, nothing, nothing
+    _, out = capture_run() do
+        states, _, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
+    end
+    @test states["overruns"] === TIMEDOUT
+    lines = collect(eachsplit(out, '\n'))
+    @test any(l -> occursin("· KILL", l), lines)
+    # The worker's own verdict for the abandoned item never reaches the log.
+    @test !any(l -> occursin("· DONE", l) && occursin("overruns", l), lines)
+    @test !any(l -> occursin("PASS", l) && occursin("overruns", l), lines)
+    # ...and a late reply is an expected end to a timeout, not a broken connection.
+    @test !occursin("protocol error", out)
+    # Whatever the process prints on its way down — a signal, a backtrace — is the
+    # worker's, not the item's. This item prints nothing of its own, so a line
+    # attributed to it would be a line attributed wrongly.
+    @test !occursin(YATF.MARK_ITEM, out)
+    @test any(l -> occursin(YATF.MARK_WORKER, l) && occursin("KILL", l), lines)
+    # It is filed with the item rather than printed across the run: the only worker
+    # lines left are the lifecycle words, and the rest went where the report for
+    # this item will find it.
+    lifecycle = l -> any(w -> occursin(w, l), ("UP", "EXIT", "KILL", "LOST"))
+    @test all(lifecycle, filter(l -> occursin(YATF.MARK_WORKER, l), lines))
+    @test occursin("Captured logs", out)
+end

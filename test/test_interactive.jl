@@ -190,9 +190,12 @@ const DEPS = fixture("TestDeps.jl")
             @test length(warnings) == 1
             msg = first(warnings).message
             # Every one of them named, and why.
-            for key in ("timeout", "retries", "chain", "tags")
+            for key in ("timeout", "retries", "chain")
                 @test occursin(key, msg)
             end
+            # `tags` is not among them: selecting nothing is what a single pasted
+            # item does, and saying so on every paste is noise.
+            @test !occursin("tags", msg)
             @test occursin("pasted knobs", msg)
         end
     end
@@ -255,5 +258,52 @@ const DEPS = fixture("TestDeps.jl")
         end
         sleep(0.5)
         @test live_worker_processes() <= before
+    end
+end
+
+@testset "a pasted sandbox has a process, so it keeps its keywords" begin
+    # Without `sandbox` there is nothing to stop and nothing to restart, so
+    # `timeout` and `retries` are ignored and said to be. With it the item runs in
+    # a worker, which is exactly what those two need.
+
+    @testset "the warning covers only what a sandbox cannot supply" begin
+        ignored(sandboxed) = [k for (k, _) in YATF.repl_ignored(sandboxed)]
+        @test :timeout in ignored(false)
+        @test :retries in ignored(false)
+        @test :timeout ∉ ignored(true)
+        @test :retries ∉ ignored(true)
+        # A chain has nothing to be sequenced with either way, and `tags` select
+        # nothing here — which was never worth a line.
+        @test :chain in ignored(true)
+        @test :tags ∉ ignored(false)
+    end
+
+    @testset "a timeout stops it, and retries start it again" begin
+        with_marker_dir() do work
+            marker = joinpath(work, "count")
+            withenv("YATF_CRASH_MARKER" => marker) do
+                ex = :(@testitem "paste retries" timeout=3 retries=1 sandbox=true begin
+                    k = let p = ENV["YATF_CRASH_MARKER"]
+                        n = isfile(p) ? parse(Int, read(p, String)) : 0
+                        write(p, string(n + 1))
+                        n
+                    end
+                    k < 1 && sleep(30)
+                    @test k == 1
+                end)
+                ts = Core.eval(Main, ex)
+                # The first attempt was stopped at the timeout; the second passed.
+                @test parse(Int, read(marker, String)) == 2
+                @test isempty(collect_failures(ts))
+            end
+        end
+    end
+
+    @testset "a sandbox that never finishes reports the timeout" begin
+        ex = :(@testitem "paste overruns" timeout=2 sandbox=true begin
+            sleep(30)
+            @test true
+        end)
+        @test_throws YATF.TimeoutException Core.eval(Main, ex)
     end
 end

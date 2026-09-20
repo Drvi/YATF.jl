@@ -108,3 +108,16 @@ end
         @test auto_workers("2", 100) <= 8
     end
 end
+
+@testset "the default logging style" begin
+    # One worker prints as it goes; several would interleave more than a reader can
+    # follow, so only the items with something wrong say anything. `:batched` is
+    # never chosen for you.
+    @test YATF.default_logs(1, true) === :eager
+    @test YATF.default_logs(0, true) === :eager
+    @test YATF.default_logs(2, true) === :issues
+    @test YATF.default_logs(8, true) === :issues
+    # Nothing is watching a non-interactive run as it goes.
+    @test YATF.default_logs(1, false) === :issues
+    @test YATF.default_logs(8, false) === :issues
+end

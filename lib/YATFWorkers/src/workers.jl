@@ -324,6 +324,35 @@ end
 
 # Closing the connection is the shutdown request; `terminate!` gives the worker a
 # few seconds to act on it before escalating to signals.
+"""
+    kill!(w)
+
+Stop the worker now, with none of the grace an orderly shutdown allows.
+
+An interrupt is someone asking for their terminal back. `terminate!` gives the
+process a window to exit on its own and then another to handle `SIGTERM`, which
+across a pool is most of a minute; here it is killed outright and whatever it was
+doing is abandoned. Safe to call on a worker already being torn down — that is the
+common case, since the interrupt lands while the run is in the middle of one.
+"""
+function kill!(w::Worker)
+    @atomic w.terminated = true
+    @lock w.lock begin
+        for (_, fut) in w.futures
+            close(fut.value, WorkerTerminatedException(w))
+        end
+        empty!(w.futures)
+    end
+    try
+        process_exited(w.process) || signal!(w.pid, w.process, Base.SIGKILL)
+    catch e
+        e isa InterruptException && rethrow()
+        # Already gone, or never ours to signal. Either way there is nothing left
+        # to stop, and an interrupt is not the moment to complain about it.
+    end
+    return nothing
+end
+
 function Base.close(w::Worker)
     @atomic w.closing = true
     close(w.socket)
@@ -518,7 +547,11 @@ function process_responses(w::Worker, ev::Threads.Event)
                 try
                     put!(fut.value, frame.payload)
                 catch e
-                    e isa InvalidStateException || rethrow()
+                    # Closing a channel carries the reason, and `put!` raises that
+                    # reason rather than an `InvalidStateException` — a timeout
+                    # would come back here as the timeout. Whatever it says, a
+                    # closed channel means the waiter has gone.
+                    isopen(fut.value) && rethrow()
                 end
             elseif frame.kind === KIND_ERROR
                 close(fut.value, RemoteException(w.pid, string(frame.payload)))

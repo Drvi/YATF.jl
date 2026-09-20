@@ -170,11 +170,14 @@ function build_config(
     )
 end
 
-# Interactively with one worker there is nothing to interleave, so logs go
-# straight out; with several they are batched per item to stay readable. A
-# non-interactive run prints them only for items that had something to say.
-default_logs(workers::Integer) =
-    isinteractive() ? (workers <= 1 ? :eager : :batched) : :issues
+# With one worker there is nothing to interleave, so logs go straight out. With
+# several, every item's output at once is more than a reader can follow, so only
+# the items that had something wrong say anything — which is also what a
+# non-interactive run does. `:batched` is left to be asked for.
+# `interactive` is a parameter so that both answers can be checked from a test
+# suite, which is never interactive and would otherwise only ever see one of them.
+default_logs(workers::Integer, interactive::Bool = isinteractive()) =
+    interactive && workers <= 1 ? :eager : :issues
 
 function read_profiles(path, toml, default_threads::String)
     profiles = Dict{Symbol, Profile}()

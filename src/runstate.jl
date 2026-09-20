@@ -11,7 +11,7 @@
 #   header      96 B, fixed, holds the section offsets
 #   strings     every string in the file, referenced by index
 #   meta        julia and YATF versions, project identity, host, git revision
-#   profiles    name, julia args, threads, env, init, test_end
+#   profiles    name, julia args, threads, env, init, test_end, preferences
 #   units       n_units x 16 B: item span, profile, exclusive, chain
 #   items       n_items x 16 B: name, file, line, unit
 #   statuses    n_items x 32 B, fixed stride, overwritten in place
@@ -25,7 +25,7 @@ using CRC32c: crc32c
 using Dates: Dates
 
 const RS_MAGIC = 0x59415446   # "YATF"
-const RS_VERSION = UInt32(4)
+const RS_VERSION = UInt32(5)
 # 40 bytes of counts and times, then eight section offsets; the rest is room to
 # add a field without moving every section.
 const RS_HEADER_BYTES = 96
@@ -175,6 +175,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false)
         end
         write(profiles, intern!(strings, expr_text(prof.init)))
         write(profiles, intern!(strings, expr_text(prof.test_end)))
+        write(profiles, intern!(strings, prof.preferences))
     end
 
     units = IOBuffer()
@@ -450,8 +451,15 @@ function read_run_state(path::AbstractString)
             items, statuses, truncated
         )
     catch e
-        # Any malformed section: report nothing rather than failing a test run over
-        # the remains of an older one. `JULIA_DEBUG=YATF` shows what went wrong.
+        e isa InterruptException && rethrow()
+        # A malformed section: report nothing rather than fail a test run over the
+        # remains of an older one. `JULIA_DEBUG=YATF` shows what went wrong.
+        #
+        # Only the errors bad bytes produce. Anything else went wrong in the reader
+        # itself, and swallowing that turns a format mistake into a feature that
+        # quietly stopped working — a field added to `Profile` and not added here
+        # reads as "no run state" rather than as the bug it is.
+        (e isa EOFError || e isa BoundsError || e isa InexactError) || rethrow()
         @debug "YATF: could not read run state $(path)" exception = (e, catch_backtrace())
         return nothing
     end
@@ -497,7 +505,8 @@ function read_profiles_section(io::IO, strings)
         end
         init = parse_block(lookup(strings, read(io, UInt32)))
         test_end = parse_block(lookup(strings, read(io, UInt32)))
-        profiles[name] = Profile(name, args, threads, env, init, test_end)
+        preferences = lookup(strings, read(io, UInt32))
+        profiles[name] = Profile(name, args, threads, env, init, test_end, preferences)
     end
     return profiles
 end

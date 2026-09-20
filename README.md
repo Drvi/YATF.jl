@@ -73,6 +73,7 @@ YATF.runtests("test/solver_test.jl")     # one file
 YATF.runtests("test/solver_test.jl:42")  # the item that line is inside
 YATF.runtests(name="adds numbers")       # one item (a Regex matches partially)
 YATF.runtests(tags=:fast)                # by tag
+YATF.runtests(tags="fast && !slow")      # by tag expression: `!`, `&&`, `||`
 YATF.runtests("test/db"; tags=:fast)     # they narrow together
 YATF.runtests(dry_run=true)              # print the plan, run nothing
 YATF.retry_failed()                      # re-run what did not pass last time
@@ -137,6 +138,10 @@ test_end = "GC.gc(true)"
 An unknown key, or a name in `[order]` that is not a test item, is an error: a
 misspelled option that silently does nothing is how a suite ends up not running
 the way its author believes it does.
+
+An `[order]` pin is relative to the items that run alongside it. Items under
+different profiles run concurrently, and a sandboxed item runs concurrently with
+the ordinary ones, so pinning across either boundary does not sequence them.
 
 A profile's `init` runs once per worker before any item, and `test_end` runs after
 every item — on the same worker, but timed against limits of their own. They are

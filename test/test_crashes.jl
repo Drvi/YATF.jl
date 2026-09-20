@@ -173,3 +173,66 @@ end
         end
     end
 end
+
+# The checkout, for a child process that has to find the same one.
+const REPO_ROOT = dirname(@__DIR__)
+
+@testset "an interrupt takes the workers with it, at once" begin
+    # Ctrl-C is someone asking for their terminal back. The run used to let every
+    # slot finish the item it had in flight first, so an item with a long sleep in
+    # it held the interrupt for as long as it liked.
+    ready = joinpath(mktempdir(), "ready")
+    script = """
+    # A script exits on SIGINT unless told otherwise; a REPL raises it, and the
+    # second of those is what is under test.
+    Base.exit_on_sigint(false)
+    using YATF
+    include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
+    const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "packages")
+    fixture(name) = joinpath(FIXTURES, name)
+    dir = make_pkg("Interrupted", "test/t_test.jl" => join(
+        [\"\"\"
+        @testitem "slow \$i" begin
+            touch(joinpath($(repr(dirname(ready))), string("ready", \$i)))
+            sleep(600)
+            @test true
+        end
+        \"\"\" for i in 1:4], "\\n"))
+    try
+        run_states(dir; workers=4, logs=:issues, monitor=false)
+    catch e
+        println(stderr, "CAUGHT \$(typeof(e))")
+    end
+    sleep(0.5)
+    alive = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
+    println(stderr, "ALIVE \$alive")
+    """
+    path, io = mktemp()
+    write(io, script)
+    close(io)
+    err = Base.BufferStream()
+    proc = run(pipeline(
+        setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
+               "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
+        stdout = devnull, stderr = err,
+    ); wait = false)
+    # The items say when they are running, so the interrupt lands mid-item rather
+    # than during an environment build that can take minutes.
+    deadline = time() + 300
+    while time() < deadline && process_running(proc) && !isfile(ready * "1")
+        sleep(0.5)
+    end
+    @test isfile(ready * "1")
+    t0 = time()
+    kill(proc, Base.SIGINT)
+    wait(proc)
+    elapsed = time() - t0
+    close(err)
+    out = read(err, String)
+    rm(path; force=true)
+    @test occursin("CAUGHT InterruptException", out)
+    @test occursin("ALIVE 0", out)
+    # Generously above the second it takes, and far below the ten minutes an item
+    # here sleeps for: what is checked is that it does not wait for them.
+    @test elapsed < 30
+end

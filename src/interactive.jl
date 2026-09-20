@@ -89,8 +89,12 @@ const REPL_IGNORED = (
     :timeout => "there is no second process to stop",
     :retries => "a failure you are looking at is not one to paper over",
     :chain => "there is nothing for it to run in sequence with",
-    :tags => "nothing is being selected",
 )
+
+# `sandbox` puts the item in a process of its own, and the first two of those
+# reasons stop being true once there is one: a timeout has something to stop and a
+# retry has something to start. `chain` still has nothing to be sequenced with.
+repl_ignored(sandboxed::Bool) = sandboxed ? REPL_IGNORED[3:3] : REPL_IGNORED
 
 """
     run_interactive(ex, source) -> Test.AbstractTestSet
@@ -111,7 +115,7 @@ function run_interactive(ex::Expr, source::LineNumberNode)
     errors = ScanError[]
     item = parse_testitem(ex, path, Int32(source.line), errors, setups)
     isempty(errors) || throw(ScanFailure(errors))
-    warn_ignored(item)
+    warn_ignored(item, item.exclusive || item.profile !== DEFAULT_PROFILE)
     return with_interactive_env(target) do
         # The item's own lines carry the glyph for how it went; here there is no
         # coordinator relaying them, so the sink does what the relay would.
@@ -145,12 +149,12 @@ function interactive_target()
     end
 end
 
-function warn_ignored(item::RawItem)
+function warn_ignored(item::RawItem, sandboxed::Bool)
     given = String[]
-    for (key, why) in REPL_IGNORED
+    for (key, why) in repl_ignored(sandboxed)
         set = key === :timeout ? item.timeout_s != USE_RUN_DEFAULT :
             key === :retries ? item.retries != USE_RUN_DEFAULT :
-            key === :chain ? item.chain !== NO_CHAIN : !isempty(item.tags)
+            item.chain !== NO_CHAIN
         set && push!(given, string("`", key, "` (", why, ")"))
     end
     isempty(given) && return nothing
@@ -189,9 +193,7 @@ end
 # `sandbox` asks for a process of its own, and a REPL cannot become one. The item
 # gets a worker configured the way the run would have configured it, and the
 # worker is gone by the time this returns.
-function run_sandboxed(item::RawItem, target)
-    prof = interactive_profile(item, target)
-    w = YATFWorkers.Worker(;
+sandbox_worker(prof, target) = YATFWorkers.Worker(;
         julia_args = prof.julia_args, threads = prof.threads,
         extra_env = ["YATF_RUN_ID" => "repl", "YATF_WORKER" => "1",
             "JULIA_LOAD_PATH" => join(LOAD_PATH, Sys.iswindows() ? ";" : ":"),
@@ -199,20 +201,44 @@ function run_sandboxed(item::RawItem, target)
         dir = target === nothing ? pwd() : target.root,
         project = Base.active_project(), redirect_io = stdout
     )
-    try
-        isempty(prof.init.args) ||
-            fetch(YATFWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
-        result = fetch(YATFWorkers.remote_run(w, interactive_spec(item, target)))::ItemResult
-        isempty(prof.test_end.args) || fetch(
-            YATFWorkers.remote_end(w, interactive_spec(item, target), prof.test_end)
-        )
-        # Printed here: the worker was told not to, because in a run the
-        # coordinator does the printing, and here that is this process.
-        print_interactive_result(result)
-        return result
-    finally
-        close(w)
+
+function run_sandboxed(item::RawItem, target)
+    prof = interactive_profile(item, target)
+    # There is a second process now, so `timeout` and `retries` mean here what they
+    # mean in a run.
+    timeout = item.timeout_s == USE_RUN_DEFAULT ? nothing : Int(item.timeout_s)
+    attempts = item.retries == USE_RUN_DEFAULT ? 1 : Int(item.retries) + 1
+    local result::ItemResult
+    for attempt in 1:attempts
+        w = sandbox_worker(prof, target)
+        try
+            isempty(prof.init.args) ||
+                fetch(YATFWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
+            spec = interactive_spec(item, target)
+            fut = YATFWorkers.remote_run(w, spec)
+            result = (
+                timeout === nothing ? fetch(fut) :
+                fetch_within(fut, timeout, TimeoutException(timeout, "test item", item.name))
+            )::ItemResult
+            isempty(prof.test_end.args) ||
+                fetch(YATFWorkers.remote_end(w, spec, prof.test_end))
+            # A retry is for a result nobody wants to keep; the last attempt is
+            # kept whatever it says.
+            (result.state === YATFWorkers.PASSED || attempt == attempts) && break
+        catch e
+            e isa TimeoutException || rethrow()
+            # The process it was told to stop is stopped; out of attempts, the
+            # timeout is the answer.
+            YATFWorkers.terminate!(w, :timeout)
+            attempt == attempts && rethrow()
+        finally
+            close(w)
+        end
     end
+    # Printed here: the worker was told not to, because in a run the coordinator
+    # does the printing, and here that is this process.
+    print_interactive_result(result)
+    return result
 end
 
 function interactive_profile(item::RawItem, target)
