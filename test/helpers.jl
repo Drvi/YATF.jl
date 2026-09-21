@@ -162,3 +162,16 @@ function with_journal(f)
         rm(dir; force=true, recursive=true)
     end
 end
+
+"""
+    plain_julia(args...) -> Cmd
+
+A julia command whose output carries no colour.
+
+`Base.julia_cmd()` reproduces this process's flags, `--color` among them, so a
+child of a suite run in a terminal writes SGR codes into the log it is spawned to
+produce. A test that reads a child's output as text builds the child with this;
+the trailing `--color=no` is what decides, because julia takes the last `--color`
+on the line.
+"""
+plain_julia(args...) = `$(Base.julia_cmd()) --startup-file=no --color=no $args`

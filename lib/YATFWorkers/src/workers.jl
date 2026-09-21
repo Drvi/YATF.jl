@@ -671,6 +671,18 @@ end
 # In a deadlock the blocked tasks are what matters and no thread is running them,
 # so their backtraces go first. Best effort: a worker without the hook is still a
 # worker.
+"""
+    wide_display(f)
+
+Run `f` with a display size no terminal has.
+
+A worker's output is a pipe, and `displaysize` calls a pipe eighty columns wide.
+A profile report is a table of file, line and function laid out to that width, so
+eighty columns is exactly where the part naming what ran gets cut off — which is
+the only part worth having.
+"""
+wide_display(f) = withenv(f, "COLUMNS" => "10000", "LINES" => "10000")
+
 function install_inspection_hook()
     INSPECT_SIGNAL === nothing && return nothing
     try
@@ -678,7 +690,7 @@ function install_inspection_hook()
         report = Profile.peek_report[]
         Profile.peek_report[] = function ()
             ccall(:jl_print_task_backtraces, Cvoid, (Cint,), 0)
-            report()
+            wide_display(report)
         end
     catch e
         println(stdout, "YATF worker: task backtraces on timeout are unavailable: ", sprint(showerror, e))

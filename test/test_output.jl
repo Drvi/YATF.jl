@@ -15,7 +15,7 @@ using YATFWorkers: YATFWorkers
     YATF.runtests($(repr(fixture("Basic.jl"))); workers=3, logs=:eager,
                   monitor=true, monitor_interval=0)
     """)
-    ok = success(pipeline(ignorestatus(addenv(`$(Base.julia_cmd()) --startup-file=no $script`,
+    ok = success(pipeline(ignorestatus(addenv(plain_julia(script),
                                               "YATF_RUNSTATE_DIR" => joinpath(work, "runs")));
                           stdout=out, stderr=out))
     log = read(out, String)
@@ -217,7 +217,7 @@ using YATFWorkers: YATFWorkers
         catch
         end
         """)
-        run(pipeline(ignorestatus(addenv(`$(Base.julia_cmd()) --startup-file=no $script2`,
+        run(pipeline(ignorestatus(addenv(plain_julia(script2),
                                          "YATF_RUNSTATE_DIR" => joinpath(work2, "runs"),
                                          "YATF_FAULTY_DIR" => work2));
                      stdout=out2, stderr=out2))
@@ -260,5 +260,18 @@ using YATFWorkers: YATFWorkers
     @testset "no terminal control sequences when there is no terminal" begin
         @test !occursin("\e[2K", log)
         @test !occursin("\e[", log)
+    end
+
+    @testset "the child that wrote that log was never asked for colour" begin
+        # Every assertion above reads the log as plain text, so the child that
+        # writes it must not colour it — and whether it does is decided by the
+        # suite, not by this file: `Base.julia_cmd()` carries the `--color` of
+        # whoever ran the tests. `plain_julia` appends `--color=no`, which holds
+        # because julia takes the last `--color` on the line.
+        ask = "print(get(stdout, :color, false))"
+        @test read(`$(Base.julia_cmd()) --startup-file=no --color=yes -e $ask`, String) == "true"
+        @test read(`$(Base.julia_cmd()) --startup-file=no --color=yes --color=no -e $ask`,
+                   String) == "false"
+        @test read(plain_julia("-e", ask), String) == "false"
     end
 end

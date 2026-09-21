@@ -186,3 +186,18 @@ end
         @test @lock(YATFWorkers.LIVE_LOCK, count(Base.process_running, YATFWorkers.LIVE_PROCESSES)) == 0
     end
 end
+
+@testset "the profile report is not laid out for a pipe" begin
+    # A worker's output is a pipe, and `displaysize` calls a pipe eighty columns.
+    # The report the inspection prints is a table of file, line and function fitted
+    # to that width, so eighty columns is where the part naming what ran is cut.
+    before = get(ENV, "COLUMNS", nothing)
+    inside = YATFWorkers.wide_display() do
+        (something(tryparse(Int, get(ENV, "COLUMNS", "")), 0), displaysize(stdout))
+    end
+    @test inside[1] >= 1000
+    # What the report actually consults, and the reason for setting the variable.
+    @test inside[2][1] >= 1000 && inside[2][2] >= 1000
+    # Scoped to the report: the rest of the worker formats for whatever it had.
+    @test get(ENV, "COLUMNS", nothing) == before
+end

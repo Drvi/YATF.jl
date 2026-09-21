@@ -137,6 +137,12 @@ mutable struct Monitor
     const interval::Float64
     const print_interval::Float64
     const tty::Bool
+    # How wide the terminal is, or 0 when the answer does not apply. The status
+    # line is erased with a sequence that clears one line, so a line long enough to
+    # wrap leaves everything but its last row on the screen. Refreshed with the
+    # clock, which is often enough to follow a resize and rare enough not to ask
+    # the terminal on every redraw.
+    columns::Int
     # Scratch for the status line's list of running items, refilled rather than
     # rebuilt: on a terminal the line is redrawn after every line the run prints.
     # Only ever touched under `run.printer`, which is held for every redraw.
@@ -181,6 +187,10 @@ That needs a terminal able to rewrite it and a reader watching it happen.
 Anything else — a pipe, a log file, a CI job — gets the same line printed
 periodically instead.
 """
+# `displaysize` falls back to `COLUMNS` when the stream is not a terminal, which
+# is how a test says how wide to pretend the screen is.
+terminal_columns(tty::Bool) = tty ? displaysize(stdout)[2] : 0
+
 function is_tty()
     forced = TTY_OVERRIDE[]
     forced === nothing || return forced
@@ -197,7 +207,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     phase_stats(stats, PHASE_SETUP).entered = time()
     return Monitor(
         run, stats, fill(Sample(), RING_SAMPLES), 0, nothing, false, false,
-        PHASE_SETUP, true, interval, print_interval, tty,
+        PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
         sizehint!(String[], nslots(run.plan)), linebuf,
         IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0
@@ -573,6 +583,68 @@ function print_int2(io::IO, n::Integer)
     return nothing
 end
 
+"""
+    clip_status!(m, from)
+
+Cut the status line the buffer holds from `from` onward to what fits on one row.
+
+A line wider than the terminal wraps, and `\\r\\e[2K` erases the row the cursor is
+on and no other — so the next redraw leaves every row but the last of the old line
+sitting on the screen. Cutting it is what keeps one line one row.
+"""
+function clip_status!(m::Monitor, from::Integer)
+    m.columns > 0 || return nothing
+    buf = m.linebuf
+    to = position(buf)
+    fits = from + bytes_within(buf.data, from + 1, to, m.columns)
+    fits < to && truncate(buf, fits)
+    return nothing
+end
+
+"""
+    bytes_within(data, from, to, columns) -> Int
+
+How many of the bytes `data[from:to]` fit in `columns` columns of screen.
+
+Escape sequences change the colour the cursor writes in, not where it is, so they
+are skipped and cost nothing. Decoded here a byte at a time rather than through a
+`String`, because this runs on every redraw and a `String` would be an allocation
+per line printed.
+"""
+function bytes_within(data::AbstractVector{UInt8}, from::Int, to::Int, columns::Int)
+    col = 0
+    i = from
+    while i <= to
+        b = data[i]
+        if b == 0x1b
+            j = i + 1
+            while j <= to && !(0x40 <= data[j] <= 0x7e)
+                j += 1
+            end
+            i = j + 1
+            continue
+        end
+        n = b < 0x80 ? 1 : b < 0xe0 ? 2 : b < 0xf0 ? 3 : 4
+        i + n - 1 > to && break
+        cp = if n == 1
+            UInt32(b)
+        elseif n == 2
+            (UInt32(b & 0x1f) << 6) | UInt32(data[i + 1] & 0x3f)
+        elseif n == 3
+            (UInt32(b & 0x0f) << 12) | (UInt32(data[i + 1] & 0x3f) << 6) |
+                UInt32(data[i + 2] & 0x3f)
+        else
+            (UInt32(b & 0x07) << 18) | (UInt32(data[i + 1] & 0x3f) << 12) |
+                (UInt32(data[i + 2] & 0x3f) << 6) | UInt32(data[i + 3] & 0x3f)
+        end
+        w = textwidth(Char(cp))
+        col + w > columns && return i - from
+        col += w
+        i += n
+    end
+    return i - from
+end
+
 status_line(m::Monitor) =
     sprint(io -> print_status_line(IOContext(io, :color => m.color), m))
 
@@ -582,6 +654,7 @@ function clock_text(m::Monitor)
     if sec != m.clock_at
         m.clock_at = sec
         m.clock_text = Libc.strftime("%H:%M:%S", sec)
+        m.columns = terminal_columns(m.tty)
     end
     return m.clock_text
 end
@@ -676,7 +749,9 @@ function status_update!(m::Monitor, text::AbstractString)
     print(m.lineio, "\r\e[2K", text)
     endswith(text, "\n") || print(m.lineio, "\n")
     print(m.lineio, "\r\e[2K")
+    at = position(buf)
     print_status_line(m.lineio, m)
+    clip_status!(m, at)
     seekstart(buf)
     return buf
 end
@@ -714,7 +789,9 @@ function redraw_status(m::Union{Nothing, Monitor})
     buf = m.linebuf
     truncate(buf, 0)
     print(m.lineio, "\r\e[2K")
+    at = position(buf)
     print_status_line(m.lineio, m)
+    clip_status!(m, at)
     seekstart(buf)
     write(stdout, buf)
     flush(stdout)

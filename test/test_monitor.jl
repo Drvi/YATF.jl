@@ -510,6 +510,33 @@ end
         end === :ran
     end
 
+    @testset "the status line never outgrows one row" begin
+        # `\r\e[2K` erases the row the cursor is on. A line wider than the terminal
+        # wraps onto several, so the next redraw would leave all but its last row
+        # behind.
+        p, target = prepare((fixture("Basic.jl"),); workers=2, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        plain(s) = replace(s, r"\e\[[0-9;?]*[a-zA-Z]" => "")
+        drawn(cols) = withenv("COLUMNS" => string(cols)) do
+            with(YATF.TTY_OVERRIDE => true) do
+                run.monitor = Monitor(run)
+                @test run.monitor.columns == cols
+                out = String(take!(copy(status_update!(run.monitor, "x"))))
+                out[findlast("\r\e[2K", out).stop + 1:end]
+            end
+        end
+        for cols in (200, 100, 60, 30, 12)
+            line = drawn(cols)
+            @test textwidth(plain(line)) <= cols
+            # Cut between characters, not through one: a half-written glyph is
+            # what a byte-count truncation would leave.
+            @test isvalid(line)
+        end
+        # Wide enough for the whole line, and it is not cut at all.
+        @test textwidth(plain(drawn(400))) == textwidth(plain(drawn(0)))
+    end
+
     @testset "a run that throws before its first item takes the line down" begin
         # `stop_monitor!` used to be reached only on the way out of the test phase,
         # so a run that fell over before that — a setup that will not compile, an

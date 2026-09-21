@@ -279,6 +279,10 @@ end
     end
 
     @testset "a timeout stops it, and retries start it again" begin
+        # Pinned to a fixture rather than left on whatever project the session is
+        # in: under `Pkg.test` that is an unnamed generated environment, and a
+        # sandbox asks for a test environment to be built from it.
+        with_activated(DEPS) do _
         with_marker_dir() do work
             marker = joinpath(work, "count")
             withenv("YATF_CRASH_MARKER" => marker) do
@@ -297,13 +301,16 @@ end
                 @test isempty(collect_failures(ts))
             end
         end
+        end
     end
 
     @testset "a sandbox that never finishes reports the timeout" begin
-        ex = :(@testitem "paste overruns" timeout=2 sandbox=true begin
-            sleep(30)
-            @test true
-        end)
-        @test_throws YATF.TimeoutException Core.eval(Main, ex)
+        with_activated(DEPS) do _
+            ex = :(@testitem "paste overruns" timeout=2 sandbox=true begin
+                sleep(30)
+                @test true
+            end)
+            @test_throws YATF.TimeoutException Core.eval(Main, ex)
+        end
     end
 end
