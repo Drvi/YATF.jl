@@ -497,10 +497,7 @@ function profile_projects!(run::Run, p::Plan)
         isempty(prof.preferences) && continue
         dir = joinpath(root, string("yatf_profile_", prof.name))
         mkpath(dir)
-        for file in ("Project.toml", "Manifest.toml")
-            src = joinpath(root, file)
-            isfile(src) && cp(src, joinpath(dir, file); force = true)
-        end
+        copy_env_files(dir, root)
         own = joinpath(root, "LocalPreferences.toml")
         merged = isfile(own) ? TOML.parsefile(own) : Dict{String, Any}()
         for (pkg, table) in TOML.parsefile(prof.preferences)
@@ -512,6 +509,56 @@ function profile_projects!(run::Run, p::Plan)
         run.profile_projects[prof.name] = dir
     end
     return nothing
+end
+
+"""
+    copy_env_files(dir, root)
+
+Write `root`'s `Project.toml` and `Manifest.toml` into `dir`, with every path they
+hold made absolute.
+
+`dir` is below `root`, so a relative path copied across resolves somewhere else
+than it did — one directory too deep. Pkg writes one whenever a package is reached
+through another package's checkout, which is how a package developed from a
+checkout is normally reached, and a worker whose project cannot find that package
+dies before it is ready.
+"""
+function copy_env_files(dir::AbstractString, root::AbstractString)
+    for file in ("Project.toml", "Manifest.toml")
+        src = joinpath(root, file)
+        isfile(src) || continue
+        open(io -> TOML.print(io, absolute_paths!(TOML.parsefile(src), root); sorted = true),
+             joinpath(dir, file), "w")
+    end
+    return nothing
+end
+
+"""
+    absolute_paths!(data, root) -> data
+
+Rewrite every `path` in a parsed project or manifest to an absolute one, reading
+the relative ones from `root`.
+
+The whole table is walked rather than the two places a path is written today: in
+these two files a `path` is a filesystem path wherever it appears, and one missed
+is a package that cannot be found.
+"""
+function absolute_paths!(data::AbstractDict, root::AbstractString)
+    for (key, value) in data
+        if key == "path" && value isa AbstractString
+            # A package tracked at the environment's own directory is written `.`,
+            # which `abspath` turns into a path with a separator on the end.
+            p = abspath(root, value)
+            data[key] = isdirpath(p) ? dirname(p) : p
+        elseif value isa AbstractDict
+            absolute_paths!(value, root)
+        elseif value isa AbstractVector
+            for entry in value
+                entry isa AbstractDict && absolute_paths!(entry, root)
+            end
+        end
+    end
+    return data
 end
 
 function precompile_phase(run::Run, p::Plan, target)

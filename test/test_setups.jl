@@ -159,6 +159,81 @@ end
         proj = run.profile_projects[:tuned]
         @test isfile(joinpath(proj, "Manifest.toml"))
         @test occursin("fast", read(joinpath(proj, "LocalPreferences.toml"), String))
+        # Every package that manifest names is findable from where it now sits.
+        for entries in values(YATF.TOML.parsefile(joinpath(proj, "Manifest.toml"))["deps"])
+            for entry in entries
+                haskey(entry, "path") && @test isdir(joinpath(proj, entry["path"]))
+            end
+        end
+    end
+
+    @testset "a profile's project finds every package the environment found" begin
+        # The copy sits a directory below the environment it is taken from, so a
+        # path written relative to the environment names the wrong place from
+        # there — and Pkg writes a relative one for any package it reached through
+        # another package's checkout, which is how a developed package is reached.
+        base = mktempdir()
+        env = joinpath(base, "env")
+        outside = joinpath(base, "Outside")
+        inside = joinpath(env, "Inside")
+        foreach(mkpath, (env, outside, inside))
+        write(joinpath(env, "Project.toml"), """
+        [deps]
+        Outside = "11111111-0000-4000-8000-000000000001"
+
+        [sources]
+        Outside = {path = "../Outside"}
+        """)
+        write(joinpath(env, "Manifest.toml"), """
+        julia_version = "1.13.0"
+        manifest_format = "2.0"
+        project_hash = "6aba1e0a1b0ee9b0cb2b0b0e2d0e7e9f0a0b0c0d"
+
+        [[deps.Outside]]
+        uuid = "11111111-0000-4000-8000-000000000001"
+        path = "../Outside"
+        version = "0.1.0"
+
+        [[deps.Inside]]
+        uuid = "11111111-0000-4000-8000-000000000002"
+        path = "Inside"
+        version = "0.2.0"
+
+        [[deps.Fixed]]
+        uuid = "11111111-0000-4000-8000-000000000003"
+        path = "$(base)"
+        version = "0.3.0"
+
+        [[deps.Itself]]
+        uuid = "11111111-0000-4000-8000-000000000004"
+        path = "."
+        version = "0.4.0"
+        """)
+        dir = joinpath(env, "yatf_profile_tuned")
+        mkpath(dir)
+        YATF.copy_env_files(dir, env)
+
+        manifest = YATF.TOML.parsefile(joinpath(dir, "Manifest.toml"))
+        paths = Dict(name => only(entries)["path"] for (name, entries) in manifest["deps"])
+        @test realpath(paths["Outside"]) == realpath(outside)
+        @test realpath(paths["Inside"]) == realpath(inside)
+        @test realpath(paths["Fixed"]) == realpath(base)
+        @test realpath(paths["Itself"]) == realpath(env)
+        # Read from the copy's own directory, which is what a worker does.
+        @test all(p -> isdir(joinpath(dir, p)), values(paths))
+        # An environment's own package is written `.`; the copy names a directory,
+        # not a directory with a separator after it.
+        @test !isdirpath(paths["Itself"])
+        # Everything else crosses as it was, versions and the manifest's own keys.
+        @test manifest["manifest_format"] == "2.0"
+        @test manifest["julia_version"] == "1.13.0"
+        @test manifest["project_hash"] == "6aba1e0a1b0ee9b0cb2b0b0e2d0e7e9f0a0b0c0d"
+        @test only(manifest["deps"]["Inside"])["version"] == "0.2.0"
+        @test only(manifest["deps"]["Inside"])["uuid"] ==
+            "11111111-0000-4000-8000-000000000002"
+        # A `[sources]` path is read relative to the project file, so it moves too.
+        sources = YATF.TOML.parsefile(joinpath(dir, "Project.toml"))["sources"]
+        @test realpath(sources["Outside"]["path"]) == realpath(outside)
     end
 
     @testset "a preferences file that is missing or broken is a config error" begin
