@@ -49,9 +49,8 @@ end
 end
 ```
 
-`using Test` and the package under test are in scope already: YATF re-exports
-`Test`, so `@test` and `@testset` work without your test environment having to
-declare `Test` itself.
+`using Test` and the package under test are in scope already, so `@test` and
+`@testset` work without your test environment having to declare `Test` itself.
 
 | Keyword | Meaning |
 |:--------|:--------|
