@@ -144,6 +144,11 @@ end
         @test !isempty(files)
         rs = read_run_state(last(sort!(files)))
         @test rs !== nothing
+        # Killed that way, the coordinator never stopped its worker, which is asleep
+        # in "hangs" and would outlive this test by ten minutes.
+        rs === nothing || foreach(rs.events) do e
+            e.kind === :worker_up && ccall(:uv_kill, Cint, (Cint, Cint), e.pid, Base.SIGKILL)
+        end
         @test !rs.complete                              # the run never finished
         @test any(s -> s.state === PASSED, rs.statuses) # but what did finish is recorded
         @test any(s -> s.state === RUNNING, rs.statuses) # and what was in flight says so

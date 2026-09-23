@@ -244,9 +244,10 @@ end
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString)
     stats = Ref(PerfStats())
     body = Expr(:block)
-    # Through YATF, so `@test` works whether or not the test environment declares
-    # `Test`.
-    push!(body.args, :(using YATF.Test))
+    # The `Test` this package already has, bound in the module rather than found by
+    # name: `@test` works whether or not the test environment declares `Test`, and a
+    # worker does not load YATF, the whole coordinator, to reach it.
+    push!(body.args, Expr(:const, Expr(:(=), :Test, Test)), :(using .Test))
     isempty(spec.project_name) || push!(body.args, :(using $(Symbol(spec.project_name))))
     append!(body.args, code.args)
     softscope_all!(body)

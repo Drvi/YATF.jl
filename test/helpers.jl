@@ -177,6 +177,31 @@ function with_journal(f)
 end
 
 """
+    started_elsewhere(names; seconds=60) -> String
+
+Code for a journalled item's body: hold the worker until one of the items `names`
+has started in another process. A test about work moving between slots holds the
+slot the work should move away from, so the move happens on every run rather than
+only when one worker happens to start before the other.
+
+When the move never comes, the first item to give up leaves a marker that
+releases the rest, so a broken run costs `seconds` once rather than once per item.
+"""
+started_elsewhere(names; seconds::Real=60) = """
+    let dir = ENV["YATF_JOURNAL"], names = $(repr(collect(String, names))), deadline = time() + $seconds
+        gave_up = joinpath(dir, "gave-up")
+        moved() = any(readdir(dir; join=true)) do f
+            r = split(strip(read(f, String)), '\\t')
+            length(r) == 3 && r[1] in names && parse(Int, r[2]) != getpid()
+        end
+        while !isfile(gave_up) && !moved()
+            time() > deadline && (touch(gave_up); break)
+            sleep(0.05)
+        end
+    end
+    """
+
+"""
     plain_julia(args...) -> Cmd
 
 A julia command whose output carries no colour.

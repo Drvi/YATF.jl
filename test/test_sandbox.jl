@@ -69,6 +69,7 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         # slot has the same configuration as every other and must keep working;
         # going home for good with the rest of the suite still queued is a worker
         # the run paid for and did not use.
+        ordinary_names = ["ordinary $i" for i in 1:6]
         dir = make_pkg(
             "SandboxThenSteal",
             "test/a_test.jl" => """
@@ -76,18 +77,19 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
                 @test true
             end
             """,
-            ("test/b_$(i)_test.jl" => """
-            @testitem "ordinary $i" begin
-                sleep(0.4)
-                @test true
-            end
-            """ for i in 1:6)...,
+            # Each holds its worker until another process has started one of them,
+            # so the ordinary pool's own slot cannot get through them alone.
+            ("test/b_$(i)_test.jl" => journal_item(
+                ordinary_names[i]; body=started_elsewhere(ordinary_names) * "@test true"
+            ) for i in 1:6)...,
         )
-        states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
+        states, run, p = with_journal() do _
+            run_states(dir; workers=2, logs=:issues, monitor=false)
+        end
         @test all(==(PASSED), values(states))
         idx(name) = findfirst(==(name), p.items.name)
         sandbox_slot = run.statuses.slot[idx("solo")]
-        ordinary = [run.statuses.slot[idx("ordinary $i")] for i in 1:6]
+        ordinary = [run.statuses.slot[idx(name)] for name in ordinary_names]
         @test count(==(sandbox_slot), ordinary) > 0
         # ...and the other slot did not sit idle either, so this is about sharing
         # the work and not about one slot taking all of it.
@@ -251,24 +253,21 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         # slow item followed by a quick one; the other holds a single quick item
         # and is done almost at once. The item left over must not sit behind the
         # slow one waiting for a worker that is busy, while a free worker goes home.
+        #
+        # "slow one" holds its worker until "left over" has started elsewhere, and
+        # "quick" holds the other worker until "slow one" is running: the free slot
+        # goes looking for work while the other is busy, whichever starts first.
         dir = make_pkg(
             "LastUnit",
-            "test/a_test.jl" => """
-            @testitem "slow one" begin
-                sleep(2)
-                @test true
-            end
-            @testitem "left over" begin
-                @test true
-            end
-            """,
-            "test/b_test.jl" => """
-            @testitem "quick" begin
-                @test true
-            end
-            """,
+            "test/a_test.jl" => string(
+                journal_item("slow one"; body=started_elsewhere(["left over"]) * "@test true"),
+                journal_item("left over"),
+            ),
+            "test/b_test.jl" => journal_item("quick"; body=started_elsewhere(["slow one"]) * "@test true"),
         )
-        states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
+        states, run, p = with_journal() do _
+            run_states(dir; workers=2, logs=:issues, monitor=false)
+        end
         @test all(==(PASSED), values(states))
         # The slot the coordinator recorded: these two items now run at the same
         # time, which is the whole point, so a shared marker file would race.
@@ -282,16 +281,21 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         # the other queue, which is where the chain is. What it must take is the
         # whole chain: the members may not run at the same time as each other, and
         # two workers holding two halves is exactly that.
+        #
+        # "filler one" holds its worker until the other slot has taken some of the
+        # queue behind it, and "solo" holds that slot until "filler one" is running,
+        # so there is always a queue to take from, whichever worker starts first.
+        behind = ["filler two", "filler three", "tail chain one", "tail chain two", "tail chain three"]
         dir = make_pkg(
             "StolenChain",
-            "test/a_test.jl" => journal_item("solo"),
+            "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["filler one"]) * "@test true"),
             "test/b_test.jl" => string(
-                journal_item("filler one"; body="sleep(0.3)\n@test true"),
-                journal_item("filler two"; body="sleep(0.3)\n@test true"),
-                journal_item("filler three"; body="sleep(0.3)\n@test true"),
-                journal_item("tail chain one"; opts="chain=:t", body="sleep(0.3)\n@test true"),
-                journal_item("tail chain two"; opts="chain=:t", body="sleep(0.3)\n@test true"),
-                journal_item("tail chain three"; opts="chain=:t", body="sleep(0.3)\n@test true"),
+                journal_item("filler one"; body=started_elsewhere(behind) * "@test true"),
+                journal_item("filler two"),
+                journal_item("filler three"),
+                journal_item("tail chain one"; opts="chain=:t"),
+                journal_item("tail chain two"; opts="chain=:t"),
+                journal_item("tail chain three"; opts="chain=:t"),
             ),
         )
         rows, run, p = with_journal() do path

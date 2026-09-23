@@ -280,13 +280,15 @@ Sys.iswindows() ||
                "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
         stdout = log, stderr = err,
     ); wait = false)
-    # The items say when they are running, so the interrupt lands mid-item rather
-    # than during an environment build that can take minutes.
+    # The items say when they are running, so the interrupt lands with all four of
+    # them mid-item: not during an environment build that can take minutes, and not
+    # while a worker is still starting and has yet to print the pid looked for below.
+    running() = all(i -> isfile(ready * string(i)), 1:4)
     deadline = time() + 300
-    while time() < deadline && process_running(proc) && !isfile(ready * "1")
+    while time() < deadline && process_running(proc) && !running()
         sleep(0.5)
     end
-    @test isfile(ready * "1")
+    @test running()
     t0 = time()
     kill(proc, Base.SIGINT)
     wait(proc)

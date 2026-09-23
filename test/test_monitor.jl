@@ -66,18 +66,28 @@ using YATF.Platform: process_rss, child_pids, process_tree, machine_memory,
             # it is an independent answer. What macOS itself calls memory in use is
             # what is wired, what the compressor holds, and what processes have
             # anonymous; the rest — free, purgeable, file cache — is available.
-            pages = Dict{String, Int64}()
-            for line in eachline(`vm_stat`)
-                m = match(r"^(.+?):\s+(\d+)\.$", line)
-                m === nothing || (pages[m.captures[1]] = parse(Int64, m.captures[2]))
+            function sample()
+                pages = Dict{String, Int64}()
+                for line in eachline(`vm_stat`)
+                    m = match(r"^(.+?):\s+(\d+)\.$", line)
+                    m === nothing || (pages[m.captures[1]] = parse(Int64, m.captures[2]))
+                end
+                in_use = (pages["Pages wired down"] + pages["Pages occupied by compressor"] +
+                          pages["Anonymous pages"]) * Int64(ccall(:getpagesize, Cint, ()))
+                used, total = machine_memory()
+                return used / total, in_use / total
             end
-            in_use = (pages["Pages wired down"] + pages["Pages occupied by compressor"] +
-                      pages["Anonymous pages"]) * Int64(ccall(:getpagesize, Cint, ()))
-            used, total = machine_memory()
-            # Wide enough for the drift between two samples and for the pages that
-            # belong to neither side of the split, narrow enough to catch a figure
-            # that is answering a different question.
-            @test isapprox(used / total, in_use / total; atol = 0.05)
+            # Wide enough for the pages that belong to neither side of the split,
+            # narrow enough to catch a figure that is answering a different question.
+            # The two are read a moment apart while other processes come and go, and
+            # on a 7 GiB CI runner two workers exiting in between are more than the
+            # margin, so a disagreement counts only if it holds on three tries.
+            ours, theirs = sample()
+            for _ in 2:3
+                isapprox(ours, theirs; atol = 0.05) && break
+                ours, theirs = sample()
+            end
+            @test isapprox(ours, theirs; atol = 0.05)
         end
     end
 

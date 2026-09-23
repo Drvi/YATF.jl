@@ -1,7 +1,7 @@
 # The documented entry point, end to end: a package whose `test/runtests.jl` is
 # `using YATF; YATF.runtests()`, run the way a user runs it and the way `Pkg.test`
 # runs it. The test environment deliberately declares only YATF — not `Test` —
-# because YATF re-exports `Test`, so a test item's `@test` works without it.
+# because a test item's `@test` has to work without it.
 using Pkg: Pkg
 
 @testset "Pkg.test entry point" begin

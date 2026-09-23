@@ -32,8 +32,8 @@ using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRO
 
 export @testitem
 
-# Re-exported, so a test item's body has `@test` and the rest without the test
-# environment declaring `Test`.
+# Re-exported, so `using YATF` alone gives a script or the REPL `@test` and the
+# rest. A test item's body does not need it: it is handed `Test` directly.
 export Test, runtests
 for name in names(Test)
     name === :Test && continue

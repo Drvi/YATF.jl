@@ -35,6 +35,21 @@ end
         end
     end
 
+    @testset "an item on a worker has `Test` without the worker loading YATF" begin
+        # Whatever a worker loads beyond YATFWorkers is paid for by the first item
+        # it runs, and YATF brings `Pkg` and `TestEnv` with it.
+        pkg = make_pkg("Lean", "test/l_test.jl" => """
+        @testitem "lean" begin
+            @test Test isa Module
+            loaded(uuid, name) = Base.root_module_exists(Base.PkgId(Base.UUID(uuid), name))
+            @test !loaded("632efd68-cd41-4e05-bd25-b86dc2150078", "YATF")
+            @test !loaded("44cfe95a-1eb2-52ea-b672-e2afdf69b78f", "Pkg")
+        end
+        """)
+        states, _, _ = run_states(pkg; workers=1, logs=:issues)
+        @test states["lean"] === PASSED
+    end
+
     @testset "results are reported as a Test summary and failures throw" begin
         p, target = prepare((BASICPKG,); workers=1, logs=:issues)
         run = execute(p, target)
