@@ -8,19 +8,6 @@ using YATF: activate, deactivate, is_activated, ScanFailure, ConfigError,
 using YATFWorkers: state_of
 using Logging: Logging
 
-# Always leaves the session as it found it: these change the active project and
-# LOAD_PATH, and a test that leaked either would take the rest of the file with it.
-function with_activated(f, pkg)
-    project, load_path = Base.active_project(), copy(LOAD_PATH)
-    try
-        f(activate(pkg))
-    finally
-        is_activated() && deactivate()
-        Base.set_active_project(project)
-        copy!(LOAD_PATH, load_path)
-    end
-end
-
 const DEPS = fixture("TestDeps.jl")
 
 @testset "interactive" begin

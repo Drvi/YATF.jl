@@ -154,11 +154,11 @@ item_location(item::RawItem, target) = string(
     isabspath(item.file) && target !== nothing ? relpath_or_path(item.file, target.root) : item.file, ":", item.line
 )
 
-function interactive_spec(item::RawItem, target)
+function interactive_spec(item::RawItem, target, seed::UInt64 = rand(RandomDevice(), UInt64))
     project = target === nothing ? "" : something(project_name_of(target.project), "")
     return ItemSpec(
         Int32(1), item.name, item.file, item.line, item.code, item.skip, item.failfast == 1,
-        project, item.profile, Int8(1), false, "", rand(RandomDevice(), UInt64)
+        project, item.profile, Int8(1), false, "", seed
     )
 end
 

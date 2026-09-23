@@ -41,7 +41,7 @@ for name in names(Test)
 end
 
 public retry_failed, current_testitem, in_testitem, in_yatf_run,
-    activate, deactivate, is_activated
+    activate, deactivate, is_activated, debug
 
 include("types.jl")
 include("macros.jl")
@@ -54,6 +54,7 @@ include("platform.jl")
 include("monitor.jl")
 include("execute.jl")
 include("interactive.jl")
+include("debug.jl")
 
 """
     runtests([paths...]; kwargs...)

@@ -115,6 +115,29 @@ honoured; `sandbox` by starting a worker, because that is the only way to honour
 it. `timeout`, `retries`, `chain` and `tags` only mean something to a scheduler,
 so they are ignored and the run says which, once.
 
+With [Debugger.jl](https://github.com/JuliaDebug/Debugger.jl) loaded, `YATF.debug`
+steps into one test item, here in this process:
+
+```julia
+julia> using Debugger
+
+julia> YATF.debug()                 # the last run's most recent failure
+
+julia> YATF.debug("adds numbers")   # seed = … to draw the random numbers a run drew
+```
+
+Without a name it steps into the failure the last run recorded most recently, with
+that run's seed, and names the run's other failures; if the last run passed, there
+is nothing to step into and it says so. The item gets what a run gives it: its
+module and imports, the test environment and setups, and its profile's `env`,
+`init` and `test_end`. Its body is a function the debugger enters at the first
+call, in the test file. What cannot be part of a function (`using`, `struct`,
+`const`, a method on `Base.show` and the like) has run by then. Only that item
+runs, not the items before it in a chain. What one process cannot give the item,
+such as a profile's `julia_args` or `sandbox=true`, is listed before it starts. An
+item you leave the debugger in before it has finished is recorded as an error, not
+a pass.
+
 ## `test/TestItems.toml`
 
 ```toml

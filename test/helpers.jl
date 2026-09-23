@@ -35,6 +35,20 @@ function make_pkg(name::AbstractString, files::Pair{<:AbstractString,<:AbstractS
     return dir
 end
 
+# `YATF.activate(pkg)` for the length of `f`, leaving the session as it found it:
+# activating changes the active project and LOAD_PATH, and a test that leaked
+# either would take the rest of the file with it.
+function with_activated(f, pkg)
+    project, load_path = Base.active_project(), copy(LOAD_PATH)
+    try
+        f(YATF.activate(pkg))
+    finally
+        YATF.is_activated() && YATF.deactivate()
+        Base.set_active_project(project)
+        copy!(LOAD_PATH, load_path)
+    end
+end
+
 # Run a suite and hand back the per-item states by name. Never throws for a
 # failing test item: the point is to assert on what was recorded.
 function run_states(pkg; kwargs...)

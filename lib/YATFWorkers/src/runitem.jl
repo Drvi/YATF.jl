@@ -141,12 +141,17 @@ end
 softscope_all!(@nospecialize ex) = (map!(softscope, ex.args, ex.args); ex)
 
 """
-    run_item(spec) -> ItemResult
+    run_item(spec; printing=false, enter=nothing) -> ItemResult
 
 Evaluate one test item in a fresh module and return its results. Never throws for
 a failing test: a failure is a result, not an error.
+
+With `enter`, the item's body becomes a function of no arguments that is handed to
+`enter(body)` to call, which is how a debugger steps into it (see
+[`enter_item`](@ref)).
 """
-run_item(spec::ItemSpec; printing::Bool=false) = in_item(() -> _run_item(spec), spec; printing)
+run_item(spec::ItemSpec; printing::Bool=false, enter=nothing) =
+    in_item(() -> _run_item(spec, enter), spec; printing)
 
 # The lines a worker writes to its stdout as an item starts and finishes: data for
 # the coordinator, which draws the RUN and DONE lines from them. On stdout rather
@@ -221,7 +226,7 @@ function trim_backtrace(bt)
     return bt
 end
 
-function _run_item(spec::ItemSpec)
+function _run_item(spec::ItemSpec, enter=nothing)
     if should_skip(spec)
         ts = Test.DefaultTestSet(spec.name)
         Test.record(ts, Test.Broken(:skipped, spec.name))
@@ -230,7 +235,7 @@ function _run_item(spec::ItemSpec)
     ts = Test.DefaultTestSet(spec.name; failfast=spec.failfast)
     stats = PerfStats()
     try
-        stats = eval_block!(ts, spec, spec.code, spec.name)
+        stats = eval_block!(ts, spec, spec.code, spec.name, enter)
     finally
         finish_testset!(ts)
     end
@@ -241,23 +246,26 @@ end
 # `ts` and capturing its output into the item's log. Never throws except on an
 # interrupt: an exception that escapes the block is an `Error` record, which is
 # what makes a crashing test item a result rather than a failure of the run.
-function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString)
+function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString,
+                     enter=nothing)
     stats = Ref(PerfStats())
-    body = Expr(:block)
     # The `Test` this package already has, bound in the module rather than found by
     # name: `@test` works whether or not the test environment declares `Test`, and a
     # worker does not load YATF, the whole coordinator, to reach it.
-    push!(body.args, Expr(:const, Expr(:(=), :Test, Test)), :(using .Test))
-    isempty(spec.project_name) || push!(body.args, :(using $(Symbol(spec.project_name))))
-    append!(body.args, code.args)
-    softscope_all!(body)
-    mod_expr = Expr(:module, true, gensym(modname), body)
+    prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
+    isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
+    evaluate = if enter === nothing
+        body = softscope_all!(Expr(:block, prelude..., code.args...))
+        () -> Core.eval(Main, Expr(:module, true, gensym(modname), body))
+    else
+        () -> enter_item(enter, prelude, code, modname, spec)
+    end
     try
         with_testset(ts) do
             timed!(stats) do
                 capture_output(spec.logpath) do
                     with_seed(spec.seed) do
-                        with_source_path(() -> Core.eval(Main, mod_expr), spec.file)
+                        with_source_path(evaluate, spec.file)
                     end
                 end
             end
@@ -276,6 +284,77 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
         end
     end
     return stats[]
+end
+
+"""
+    enter_item(enter, prelude, code, modname, spec)
+
+Hand the item's body to `enter` as a function of no arguments, for it to call: how
+a debugger steps into an item, a line of the test file at a time. A function body
+cannot hold everything a module can, so what has to stay at top level (`using`,
+`struct`, `const`, a method added to a function or type the module already has, and
+whatever a macro expands to that is one of those) is evaluated in the item's module
+first, in the order written. The function holds the rest.
+"""
+function enter_item(enter, prelude::Vector{Any}, code::Expr, modname::AbstractString, spec::ItemSpec)
+    at = LineNumberNode(Int(spec.line), Symbol(spec.file))
+    mod = Core.eval(Main, Expr(:module, true, gensym(modname), Expr(:block, prelude...)))
+    defined = Set{Symbol}(Base.invokelatest(names, mod; all = true))
+    line = at
+    body = Any[at]   # the method is the item's, so it is where the item is declared
+    for ex in code.args
+        if ex isa LineNumberNode
+            line = ex
+        elseif Base.invokelatest(needs_top_level, mod, ex, defined)
+            Core.eval(mod, Expr(:block, line, ex))
+            union!(defined, Base.invokelatest(names, mod; all = true))
+        else
+            push!(body, line, ex)
+        end
+    end
+    # What the body returns once it has run to its end. A debugger that is quit
+    # returns something else, and an item cut short has no verdict to give.
+    push!(body, ITEM_FINISHED)
+    f = Core.eval(mod, Expr(:block, at, Expr(:function, Expr(:call, :testitem), Expr(:block, body...))))
+    Base.invokelatest(enter, f) === ITEM_FINISHED || error(
+        "the test item was left before it finished; what ran until then is recorded, and the rest did not run"
+    )
+    return nothing
+end
+
+struct ItemFinished end
+const ITEM_FINISHED = ItemFinished()
+
+# Heads that mean something only at top level; `:toplevel` is what `@enum` expands to.
+const TOP_LEVEL_HEADS = (:using, :import, :export, :public, :struct, :abstract, :primitive,
+                         :macro, :module, :const, :toplevel)
+
+# Whether a statement of the body has to be evaluated at the item module's top level
+# rather than inside a function. Asked of the module as it is by then, so a macro can
+# come from a `using` above it, and `defined` holds the names the module owns so far.
+function needs_top_level(mod::Module, @nospecialize(ex), defined::Set{Symbol})
+    ex isa Expr || return false
+    ex.head in TOP_LEVEL_HEADS && return true
+    ex.head === :macrocall && return needs_top_level(mod, macroexpand(mod, ex), defined)
+    ex.head in (:block, :if, :elseif) && return any(a -> needs_top_level(mod, a, defined), ex.args)
+    return adds_method_to_global(ex, defined)
+end
+
+# `Base.show(io::IO, p::Point) = ...`, `(p::Point)(x) = ...`, or `Point() = Point(0)`
+# once `Point` is the module's: a method on a function or type that lives in a
+# module, which only a top-level definition can add. A definition under a name the
+# module does not own is a local function, and may close over the body's variables.
+function adds_method_to_global(ex::Expr, defined::Set{Symbol})
+    ex.head === :function || ex.head === :(=) || return false
+    sig = ex.args[1]
+    while sig isa Expr && (sig.head === :where || sig.head === :(::))
+        sig = sig.args[1]
+    end
+    sig isa Expr || return false
+    ex.head === :function && sig.head === :. && return true   # `function Base.f end`
+    sig.head === :call || return false
+    callee = sig.args[1]
+    return callee isa Symbol ? callee in defined : true
 end
 
 function finish_testset!(ts::Test.AbstractTestSet)

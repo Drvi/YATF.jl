@@ -4,15 +4,25 @@
 # pool — a bug in the transport would stop the suite from running instead of
 # telling you which test it broke.
 #
-#     julia --project test/runtests.jl                 every file, in parallel
-#     julia --project test/runtests.jl test_scan.jl    one file, in this process
-#     YATF_TEST_JOBS=1 julia --project test/runtests.jl   every file, in this process
+#     julia --project=test test/runtests.jl                    every file, in parallel
+#     julia --project=test test/runtests.jl test_scan.jl       one file, in this process
+#     YATF_TEST_JOBS=1 julia --project=test test/runtests.jl   every file, in this process
+#
+# `test/` is a project in the package's workspace, with the test-only dependencies,
+# and `Pkg.test()` runs in it too.
 #
 # Each file is independent: it builds the fixtures it needs and asserts only on
 # what it built.
 
 using Test
 using YATF
+
+# A worker finds YATFWorkers through the load path it is given, and `@` there means
+# the worker's own project, which is a fixture's. `Pkg.test` puts this environment
+# on the path by name; a run started with `--project=test` has to do it here.
+let env = dirname(Base.active_project())
+    env in LOAD_PATH || push!(LOAD_PATH, env)
+end
 
 const FIXTURES = joinpath(@__DIR__, "packages")
 fixture(name) = joinpath(FIXTURES, name)
@@ -43,6 +53,7 @@ const TEST_FILES = [
     "test_gating.jl",
     "test_config.jl",
     "test_precompile.jl",
+    "test_debug.jl",
     "test_interactive.jl",
 ]
 
