@@ -1,12 +1,7 @@
-# Process and memory introspection, vendored.
-#
-# YATF takes no packages for this: each platform gets one small set of `ccall`s
-# or file reads behind the same two functions, `process_rss` and `child_pids`.
-# These read C structs at hard-coded offsets, which is exactly the kind of code
-# that fails quietly or takes the process down with it, so `platform_selfcheck!`
-# checks them against an independent source at load time and switches the whole
-# thing off if they disagree. A platform with no working binding degrades to
-# machine-level numbers; it never guesses and never segfaults in someone's CI.
+# Process and memory introspection, vendored: one small set of `ccall`s or file
+# reads per platform. They read C structs at hard-coded offsets, so
+# `platform_selfcheck!` checks them against an independent source before they are
+# trusted, and on disagreement the monitor reports machine-level numbers only.
 
 module Platform
 
@@ -39,9 +34,8 @@ function rss_macos(pid::Integer)
     return Int64(only(reinterpret(UInt64, @view buf[(RESIDENT_OFFSET + 1):(RESIDENT_OFFSET + 8)])))
 end
 
-# proc_listchildpids returns the NUMBER of children and fills the buffer with
-# their pids. (It is not a byte count; reading it as one silently yields an empty
-# child list, which is why the self-check spawns a process and looks for it.)
+# Returns the number of children, not a byte count. Misread, it yields an empty
+# list, which the self-check catches by looking for a process it started.
 function children_macos(pid::Integer)
     buf = zeros(Int32, 256)
     n = ccall(:proc_listchildpids, Cint, (Cint, Ptr{Int32}, Cint), pid, buf, Cint(sizeof(buf)))
@@ -109,8 +103,7 @@ function rss_windows(pid::Integer)
     end
 end
 
-# Enumerating a process tree on Windows needs a toolhelp snapshot, which is more
-# machinery than the numbers are worth here; workers are tracked by pid anyway,
+# A process tree on Windows needs a toolhelp snapshot. Workers are tracked by pid,
 # so only their children are missed.
 children_windows(::Integer) = Int32[]
 
@@ -132,32 +125,50 @@ end
 
 ### Memory pressure ########################################################
 
-# `1 - Sys.free_memory()/Sys.total_memory()` is not memory pressure, and using it
-# makes the guard fire on a machine that is perfectly healthy. `Sys.free_memory`
-# counts only free pages, while most of what an OS holds — file cache, inactive
-# and purgeable pages — is handed back the moment someone asks for it. Measured on
-# a 64 GiB machine that was not under any pressure: the naive figure said 70% used
-# while the kernel reported 65% still available.
+# `Sys.free_memory()` counts only free pages, while file cache, inactive and
+# purgeable pages are handed back on demand, so `1 - free/total` makes the guard
+# fire on a healthy machine. Each platform is asked what it actually knows:
 #
-# So each platform is asked the question it actually answers:
-#
-#   macOS    kern.memorystatus_level, the percentage the kernel itself uses to
-#            decide when to start killing processes
-#   Linux    MemAvailable from /proc/meminfo, and the cgroup's own limit and usage
-#            when there is one, whichever is tighter
+#   macOS    free, purgeable and file-backed pages: what Activity Monitor leaves
+#            out of "Memory Used"
+#   Linux    MemAvailable, and the cgroup's limit and usage when that is tighter
 #   Windows  dwMemoryLoad from GlobalMemoryStatusEx
 #
 # with `Sys.free_memory()` as the last resort.
 
-function available_fraction_macos()
-    val = Ref{Cint}(0)
-    sz = Ref{Csize_t}(sizeof(Cint))
+# One of the kernel's page counters. They are `unsigned int` sysctls, but the width
+# is taken from the call: the buffer is zeroed and little-endian, so either width
+# reads back whole.
+function sysctl_pages(name::String)
+    val = Ref{UInt64}(0)
+    sz = Ref{Csize_t}(sizeof(UInt64))
     r = ccall(
         :sysctlbyname, Cint, (Cstring, Ptr{Cvoid}, Ptr{Csize_t}, Ptr{Cvoid}, Csize_t),
-        "kern.memorystatus_level", val, sz, C_NULL, 0
+        name, val, sz, C_NULL, 0
     )
-    (r == 0 && 0 <= val[] <= 100) || return -1.0
-    return Float64(val[]) / 100
+    (r == 0 && (sz[] == 4 || sz[] == 8)) || return Int64(-1)
+    return Int64(val[])
+end
+
+# Pages macOS can hand out without taking them from anyone: free, purgeable and
+# file cache. `kern.memorystatus_level` looks like this and is not: it counts every
+# page neither wired nor compressed as free, so a machine deep in swap reports
+# itself half free. Speculative pages are file-backed and already inside
+# `vm_page_external_count`.
+const MACOS_AVAILABLE_PAGES = (
+    "vm.page_free_count", "vm.page_purgeable_count", "vm.vm_page_external_count",
+)
+
+function available_fraction_macos()
+    total = Int64(Sys.total_memory())
+    total > 0 || return -1.0
+    pages = Int64(0)
+    for name in MACOS_AVAILABLE_PAGES
+        n = sysctl_pages(name)
+        n < 0 && return -1.0
+        pages += n
+    end
+    return clamp(pages * Int64(ccall(:getpagesize, Cint, ())) / total, 0.0, 1.0)
 end
 
 function meminfo_available()
@@ -272,10 +283,9 @@ cpu_count() = Sys.CPU_THREADS
 """
     machine_memory() -> (used, total)
 
-Bytes that are really committed, and the total this process may use.
-`Sys.total_memory` already respects cgroup limits, so inside CI this is the
-container's view and not the host's. `used` is derived from
-[`available_fraction`](@ref), so it does not count reclaimable pages as in use.
+Bytes really committed, and the total this process may use. `Sys.total_memory`
+respects cgroup limits, so under CI this is the container's view. `used` comes
+from [`available_fraction`](@ref) and does not count reclaimable pages.
 """
 function machine_memory()
     total = Int64(Sys.total_memory())
@@ -286,9 +296,8 @@ end
 """
     process_tree(roots; maxdepth=4) -> Vector{Int32}
 
-Every process descended from `roots`, including them. Precompilation spawns
-Julia processes that belong to the run's memory footprint just as much as the
-workers do, and so does anything a test item starts.
+Every process descended from `roots`, including them: precompilation and anything
+a test item starts belong to the run's memory as much as the workers do.
 """
 function process_tree(roots; maxdepth::Int = 4)
     seen = Set{Int32}()

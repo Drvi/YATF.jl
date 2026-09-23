@@ -24,6 +24,13 @@ end
 const DEPS = fixture("TestDeps.jl")
 
 @testset "interactive" begin
+    @testset "every exported name has help at the REPL" begin
+        # A comment between a docstring and its definition detaches the docstring.
+        for name in names(YATF)
+            @test Base.Docs.hasdoc(YATF, name)
+        end
+    end
+
     @testset "activate puts the session where a worker would be" begin
         before_project, before_path = Base.active_project(), copy(LOAD_PATH)
         with_activated(DEPS) do env

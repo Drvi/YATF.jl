@@ -25,6 +25,12 @@ using YATF.Platform: process_rss, child_pids, process_tree, machine_memory,
             @test rss < 100 * Sys.maxrss()
             @test rss > Sys.maxrss() ÷ 100
             @test process_rss(999999) <= 0          # a pid that is not ours
+            # The bounds above only catch a binding that is wildly wrong; `ps`
+            # reads the same figure through an interface of its own, in KiB.
+            if !Sys.iswindows()
+                ps = 1024 * parse(Int, strip(read(`ps -o rss= -p $(getpid())`, String)))
+                @test isapprox(process_rss(getpid()), ps; rtol = 0.1)
+            end
         end
     end
 
@@ -52,6 +58,27 @@ using YATF.Platform: process_rss, child_pids, process_tree, machine_memory,
         @test total > 0
         @test 0 <= used <= total
         @test total == Int64(Sys.total_memory())   # already respects cgroup limits
+    end
+
+    if Sys.isapple()
+        @testset "the machine's memory figure is the one the machine reports" begin
+            # `vm_stat` reads the same counters through a different interface, so
+            # it is an independent answer. What macOS itself calls memory in use is
+            # what is wired, what the compressor holds, and what processes have
+            # anonymous; the rest — free, purgeable, file cache — is available.
+            pages = Dict{String, Int64}()
+            for line in eachline(`vm_stat`)
+                m = match(r"^(.+?):\s+(\d+)\.$", line)
+                m === nothing || (pages[m.captures[1]] = parse(Int64, m.captures[2]))
+            end
+            in_use = (pages["Pages wired down"] + pages["Pages occupied by compressor"] +
+                      pages["Anonymous pages"]) * Int64(ccall(:getpagesize, Cint, ()))
+            used, total = machine_memory()
+            # Wide enough for the drift between two samples and for the pages that
+            # belong to neither side of the split, narrow enough to catch a figure
+            # that is answering a different question.
+            @test isapprox(used / total, in_use / total; atol = 0.05)
+        end
     end
 
     @testset "byte formatting" begin
@@ -107,7 +134,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         line = status_line(run.monitor)
-        @test startswith(line, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATFWorkers.FIELD)
+        @test startswith(line, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATF.FIELD)
         @test occursin("INFO", line)
         @test occursin("/", line)             # done/total
         @test occursin("failed", line)
@@ -259,6 +286,42 @@ end
         @test length(m.mark_said) == length(YATF.MEMORY_MARKS)
     end
 
+    @testset "the memory guard holds work back, then collects, then restarts, then lets go" begin
+        # Fed readings rather than a machine short of memory: what it does depends
+        # only on what the readings say and for how long they have said it.
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        m = Monitor(run)
+        limit = p.cfg.memory_threshold
+        function reading(pressure)
+            m.samples[1] = YATF.Sample(
+                1.0f0, PHASE_TEST, Int16(1), 0, 0, Int32(0),
+                round(Int64, pressure * 2^30), Int64(2^30), 0.0f0
+            )
+            m.ring_head = 1
+        end
+        reading(limit / 2)
+        YATF.guard!(m)
+        @test !YATF.is_paused(run.queues)
+        reading(min(1.0, limit + 0.02))
+        @test_logs (:warn, r"holding off") YATF.guard!(m)
+        @test YATF.is_paused(run.queues)
+        # Still over once holding back has had its chance: collect.
+        m.over_since = time() - YATF.GUARD_BACKPRESSURE_SECONDS - 1
+        YATF.guard!(m)
+        @test m.stats.guard_actions == 2
+        # Still over after that: restart a worker, and not again within the minute.
+        m.over_since = time() - YATF.GUARD_GC_SECONDS - 1
+        YATF.guard!(m)
+        @test m.stats.guard_actions == 3
+        YATF.guard!(m)
+        @test m.stats.guard_actions == 3
+        reading(limit / 2)
+        YATF.guard!(m)
+        @test !YATF.is_paused(run.queues)
+    end
+
     @testset "a run with no workers does not talk about workers" begin
         (_, run, _), out = capture_run() do
             run_states(fixture("Basic.jl"); workers=0, logs=:issues, monitor=true,
@@ -270,7 +333,7 @@ end
         # The glyph is still there — it is how a line is read at a glance — but
         # there is no worker to number.
         @test all(item_lines) do l
-            any(m -> startswith(l, YATF.MARK_INDENT * m * " "), YATF.LINE_MARKS)
+            any(m -> startswith(l, YATF.MARK_INDENT * m * " "), (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER))
         end
         @test !any(l -> occursin(r" w\d+ · ", l), item_lines)
 

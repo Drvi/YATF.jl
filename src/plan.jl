@@ -1,16 +1,11 @@
-# Turning scanned items into a plan.
-#
-# The plan is computed once, before anything is started, and is the single source
-# of truth for what runs where and in what order. `--dry-run` prints this and
-# stops; a real run executes exactly it. They are the same code path, which is
-# what makes the dry run worth trusting.
+# Turning scanned items into a plan: what runs where and in what order, decided
+# once before anything starts. `--dry-run` prints it; a run executes exactly it.
 
 """
     Items
 
-Per-item data in plan order, laid out as arrays rather than objects: the
-scheduler only ever touches indices, and the bulky fields (`code`, `skip`) are
-never touched on a hot path at all.
+Per-item data in plan order, as parallel arrays: the scheduler works with indices
+and never touches the bulky `code` and `skip`.
 """
 struct Items
     name::Vector{String}
@@ -45,62 +40,64 @@ struct Units
     exclusive::Vector{Bool}
     chain::Vector{Symbol}
     est_s::Vector{Float64}
-    group::Vector{Int32}
 end
 
 Base.length(u::Units) = length(u.span)
 
+"""
+    Pool
+
+One profile's units in the order they are handed out, as three runs of
+consecutive unit indices:
+
+- `head` goes first, in order, to whichever of the pool's workers asks next;
+- `body` is in file order, cut into one stretch per worker: each walks its own,
+  running neighbouring items that share compiled code;
+- `tail` goes last, in order.
+
+What goes where is decided by [`order_pool!`](@ref).
+"""
 struct Pool
     profile::ProfileIdx
-    exclusive::Bool
-    slots::Vector{SlotIdx}
-    units::Vector{UnitIdx}
-    est_s::Float64
+    head::UnitRange{UnitIdx}
+    body::UnitRange{UnitIdx}
+    tail::UnitRange{UnitIdx}
 end
 
 """
     Startup
 
-Where the time before the first test item went. Reported in the run's header,
-because on a large suite this is the part people wait through and it is otherwise
-invisible.
+Where the time before the first test item went, for the run's header.
 """
 mutable struct Startup
     files::Float64   # finding and reading the test files
     plan::Float64   # ordering them and assigning them to workers
-    env::Float64   # building or finding the test environment
-    precompile::Float64   # precompiling setups the plan needs
+    setup::Float64   # the test environment, and precompiling it and the setups
 end
-Startup() = Startup(0.0, 0.0, 0.0, 0.0)
+Startup() = Startup(0.0, 0.0, 0.0)
 
 struct Plan
     items::Items
     units::Units
     files::Vector{String}
-    # The same paths relative to the project, computed once here. Every item's
-    # report, spec and run state entry needs one, and `relpath` is a split-and-
-    # rejoin over two paths: thousands of items against tens of files.
-    relfiles::Vector{String}
-    # `file:line` per item, built here rather than once per dispatch. An item that
-    # is retried is dispatched more than once and this never changes.
-    locations::Vector{String}
+    relfiles::Vector{String}    # `files` relative to the project
+    locations::Vector{String}   # `file:line` per item
     profiles::Vector{Profile}
     pools::Vector{Pool}
-    slot_pool::Vector{Int32}                # slot -> pool index
-    slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its queue, contiguous
-    pending::Vector{Int32}                # pools with no slot yet, in pickup order
-    pending_units::Vector{UnitRange{UnitIdx}} # their queues, aligned with `pending`
+    slot_pool::Vector{Int32}                 # slot -> pool
+    slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its stretch of its pool's body
+    pending::Vector{Int32}                   # pools with no slot yet, in pickup order
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
     root::String
     startup::Startup
+    selection::String   # how the items were chosen, as the run says it; empty for all of them
 end
 
 nslots(p::Plan) = length(p.slot_pool)
 nitems(p::Plan) = length(p.items)
 
-# No workers: everything happens here, so there is no worker to name, no pool to
-# count and no second process to compare memory against.
+# No workers: everything happens in this process.
 single_process(p::Plan) = p.cfg.workers == 0
 
 # Where an item is, as the run reports it.
@@ -110,23 +107,27 @@ itemlocation(p::Plan, i::Integer) = p.locations[i]
 """
     History
 
-What earlier runs measured, keyed by item name. Empty on a first run, in which
-case every estimate is zero and grouping falls back to declaration order.
+What earlier runs measured, keyed by item name: how long each item took and how
+many runs ago it last did not pass (0 for the newest run); and when the newest
+run started (0 without one). Empty on a first run: nothing has an estimate, and
+the body is cut by count.
 """
 struct History
     seconds::Dict{String, Float64}
-    failed::Set{String}
+    failed::Dict{String, Int}
+    since::Float64
 end
-History() = History(Dict{String, Float64}(), Set{String}())
+History() = History(Dict{String, Float64}(), Dict{String, Int}(), 0.0)
 
 """
-    plan(raw, cfg, profiles; history, root) -> Plan
+    plan(raw, cfg; history, root, strict_order) -> Plan
 
-Validate, group into units, order, and assign to slots.
+Validate, group into units, put each profile's units in the order they are handed
+out, and cut each pool's body into one stretch per slot.
 """
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(),
-        root::AbstractString = "", strict_order::Bool = true
+        root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = ""
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
     validate_profiles(raw, cfg)
@@ -135,11 +136,14 @@ function plan(
     strict_order && validate_order(raw, cfg)
 
     profiles, profile_idx = profile_table(cfg)
-    units_raw = build_units(raw, profile_idx)          # Vector{Vector{RawItem}} + metadata
-    order_units!(units_raw, cfg, history)
-    pools = build_pools(units_raw, history)
-    assign_slots!(pools, cfg, units_raw, history)
-    return materialize(units_raw, pools, profiles, cfg, root)
+    units = build_units(raw, profile_idx, history)
+    pools = [findall(d -> d.profile == k, units) for k in sort!(unique(d.profile for d in units))]
+    slots = count_slots(pools, units, cfg)
+    changed = changed_files(units, history.since)
+    for (k, pool) in enumerate(pools)
+        order_pool!(pool, units, slots[k], cfg, history, changed)
+    end
+    return materialize(units, pools, slots, profiles, cfg, root, selection)
 end
 
 function validate_profiles(raw, cfg)
@@ -149,15 +153,14 @@ function validate_profiles(raw, cfg)
         haskey(cfg.profiles, it.profile) || push!(get!(bad, it.profile, RawItem[]), it)
     end
     isempty(bad) && return
-    io = IOBuffer()
     known = sort!(string.(collect(keys(cfg.profiles))))
-    for (name, items) in sort!(collect(bad); by = first)
-        println(io, "  `sandbox=:$name` has no [profiles.$name] in TestItems.toml, used by:")
-        for it in items
-            println(io, "    ", repr(it.name), " at ", relpath_or_path(it.file), ":", it.line)
+    throw(ConfigError(sprint() do io
+        println(io, "unknown sandbox profiles (known: ", join(known, ", "), "):")
+        for (name, items) in sort!(collect(bad); by = first)
+            println(io, "  `sandbox=:$name` has no [profiles.$name] in TestItems.toml, used by:")
+            foreach(it -> println(io, "    ", repr(it.name), " at ", relpath_or_path(it.file), ":", it.line), items)
         end
-    end
-    throw(ConfigError("unknown sandbox profiles (known: $(join(known, ", "))):\n" * String(take!(io))))
+    end))
 end
 
 function validate_order(raw, cfg)
@@ -167,13 +170,13 @@ function validate_order(raw, cfg)
         n in names || push!(missing_, n)
     end
     isempty(missing_) && return
-    io = IOBuffer()
-    println(io, "[order] of TestItems.toml names test items that do not exist:")
-    for n in missing_
-        near = nearest(n, names)
-        println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
-    end
-    throw(ConfigError(String(take!(io))))
+    throw(ConfigError(sprint() do io
+        println(io, "[order] of TestItems.toml names test items that do not exist:")
+        for n in missing_
+            near = nearest(n, names)
+            println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
+        end
+    end))
 end
 
 # Cheap edit-distance-ish suggestion: a typo'd name should not send anyone hunting.
@@ -204,30 +207,26 @@ function profile_table(cfg::RunConfig)
     return profiles, idx
 end
 
-# A unit under construction: its items, and the properties the scheduler needs.
+# A unit under construction: its items, and what the scheduler decides with.
 mutable struct UnitDraft
-    items::Vector{RawItem}
-    profile::ProfileIdx
-    exclusive::Bool
-    chain::Symbol
-    est_s::Float64
-    group::Int32
-    pin::Int32                 # <0 pinned to the front, >0 to the back, 0 unpinned
-    failed::Bool                  # failed the last recorded run
-    key::Tuple{String, Int32}   # first item's (file, line): the tiebreak that makes order deterministic
+    const items::Vector{RawItem}
+    const profile::ProfileIdx
+    const exclusive::Bool
+    const chain::Symbol
+    const est_s::Float64
+    key::Tuple{Int, Int, Float64, String, Int32}   # its place in its pool; see `order_pool!`
 end
 
-function build_units(raw::Vector{RawItem}, profile_idx)
+function build_units(raw::Vector{RawItem}, profile_idx, history::History)
+    draft(its, exclusive, chain) = UnitDraft(
+        its, profile_idx[its[1].profile], exclusive, chain,
+        sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0))
+    )
     chains = Dict{Symbol, Vector{RawItem}}()
     units = UnitDraft[]
     for it in raw
         if it.chain === NO_CHAIN
-            push!(
-                units, UnitDraft(
-                    [it], profile_idx[it.profile], it.exclusive, NO_CHAIN,
-                    0.0, Int32(0), Int32(0), false, (it.file, it.line)
-                )
-            )
+            push!(units, draft([it], it.exclusive, NO_CHAIN))
         else
             push!(get!(chains, it.chain, RawItem[]), it)
         end
@@ -248,185 +247,119 @@ function build_units(raw::Vector{RawItem}, profile_idx)
                 )
             end
         end
-        push!(
-            units, UnitDraft(
-                its, profile_idx[first_.profile], false, name, 0.0, Int32(0),
-                Int32(0), false, (first_.file, first_.line)
-            )
-        )
+        push!(units, draft(its, false, name))
     end
     isempty(errors) || throw(ScanFailure(sort!(errors; by = e -> (e.file, e.line))))
-    sort!(units; by = u -> u.key)
     return units
-end
-
-# Affinity: items that `using` the same setups, and items from the same file,
-# share compiled code. Putting them on one worker is the cheapest way to stop
-# paying for the same compilation on several workers at once.
-function affinity_key(u::UnitDraft)
-    setups = sort!(unique!(reduce(vcat, (it.setups for it in u.items); init = Symbol[])))
-    return (setups, u.items[1].file)
-end
-
-function order_units!(units::Vector{UnitDraft}, cfg::RunConfig, history::History)
-    for u in units
-        u.est_s = sum(it -> get(history.seconds, it.name, 0.0), u.items; init = 0.0)
-    end
-    groups = Dict{Tuple{Vector{Symbol}, String}, Int32}()
-    for u in units
-        u.group = get!(groups, affinity_key(u), Int32(length(groups) + 1))
-    end
-    # Failures first: a unit that failed last time is likely still broken, and
-    # finding that out early is worth more than any packing gain.
-    rank = Dict{String, Int}()
-    for (i, n) in enumerate(cfg.order_first)
-        rank[n] = -1_000_000 + i
-    end
-    for (i, n) in enumerate(cfg.order_last)
-        rank[n] = 1_000_000 + i
-    end
-    pos = Dict{UnitDraft, Int}(u => i for (i, u) in enumerate(units))
-    for u in units
-        u.pin = Int32(clamp(minimum(it -> get(rank, it.name, 0), u.items), -typemax(Int32), typemax(Int32)))
-        u.failed = any(it -> it.name in history.failed, u.items)
-    end
-    sort!(units; by = u -> (u.pin, u.failed ? -1 : 0, pos[u]))
-    return units
-end
-
-function build_pools(units::Vector{UnitDraft}, history::History)
-    byprofile = Dict{Tuple{ProfileIdx, Bool}, Vector{UnitIdx}}()
-    for (i, u) in enumerate(units)
-        push!(get!(byprofile, (u.profile, u.exclusive), UnitIdx[]), UnitIdx(i))
-    end
-    keys_ = sort!(collect(keys(byprofile)))
-    return [
-        Pool(
-            p, excl, SlotIdx[], byprofile[(p, excl)],
-            sum(i -> units[i].est_s, byprofile[(p, excl)]; init = 0.0)
-        )
-            for (p, excl) in keys_
-    ]
 end
 
 # `workers` is a hard cap on live processes, because that cap is what bounds
-# memory and duplicated compilation. When there are more pools than slots, a slot
-# rebinds to another profile once its own pool drains rather than the cap being
-# exceeded.
-function assign_slots!(pools::Vector{Pool}, cfg::RunConfig, units, history::History)
+# memory and duplicated compilation. Every pool gets a slot while there are slots
+# to give, the most work first; the rest go where the most work per slot is, never
+# more slots than a pool has units. A pool left without a slot is taken by the
+# first slot whose own pool runs out of work.
+function count_slots(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, cfg::RunConfig)
+    work = map(pools) do pool
+        w = sum(u -> units[u].est_s, pool; init = 0.0)
+        w > 0 ? w : Float64(length(pool))
+    end
+    n = zeros(Int, length(pools))
     budget = max(cfg.workers, 1)
-    order = sortperm(pools; by = p -> (-p.est_s, -length(p.units)))
-    slot = SlotIdx(0)
-    for k in order
-        p = pools[k]
-        slot >= budget && break
-        push!(p.slots, (slot += SlotIdx(1)))
+    for k in sortperm(work; rev = true)
+        budget == 0 && break
+        n[k] = 1
+        budget -= 1
     end
-    # Anything left over goes to the pools with the most work, never beyond the
-    # number of units they actually have.
-    while slot < budget
-        best, bestload = 0, -Inf
-        for k in order
-            p = pools[k]
-            isempty(p.slots) && continue
-            length(p.slots) >= length(p.units) && continue
-            load = (p.est_s > 0 ? p.est_s : Float64(length(p.units))) / length(p.slots)
-            load > bestload || continue  # the pool with the most work per slot gets the next one
-            best, bestload = k, load
-        end
-        best == 0 && break
-        push!(pools[best].slots, (slot += SlotIdx(1)))
+    while budget > 0
+        k = argmax(k -> 0 < n[k] < length(pools[k]) ? work[k] / n[k] : -Inf, eachindex(pools))
+        0 < n[k] < length(pools[k]) || break
+        n[k] += 1
+        budget -= 1
     end
-    return pools
+    return n
 end
 
-# Greedy longest-processing-time-first over the affinity groups: whole groups go
-# to the least-loaded slot, so a worker sees related items back to back.
-function assign_groups(pool::Pool, units::Vector{UnitDraft})
-    nslot = length(pool.slots)
-    queues = [UnitIdx[] for _ in 1:max(nslot, 1)]
-    nslot == 0 && (append!(queues[1], pool.units); return queues)  # pool waiting for a rebind
-    # `[order]` is a hard constraint, so pinned units are placed directly and are
-    # never handed to the packer, which would reorder them for cache affinity.
-    pinned_first = [u for u in pool.units if units[u].pin < 0]
-    pinned_last = [u for u in pool.units if units[u].pin > 0]
-    # A unit that failed last time is dispatched before anything the packer would
-    # choose: finding out that it is still broken is worth more than a packing win.
-    failed_first = [u for u in pool.units if units[u].pin == 0 && units[u].failed]
-    groups = Dict{Int32, Vector{UnitIdx}}()
-    gorder = Int32[]
-    for u in pool.units
-        (units[u].pin == 0 && !units[u].failed) || continue
-        g = units[u].group
-        haskey(groups, g) || push!(gorder, g)
-        push!(get!(groups, g, UnitIdx[]), u)
-    end
-    weight(g) = sum(u -> max(units[u].est_s, 0.0), groups[g]; init = 0.0)
-    sort!(gorder; by = g -> (-weight(g), -length(groups[g]), g))
-    # Round-robin in listed order: with more than one worker the pinned items are
-    # *dispatched* in this order, which is what ordering can mean when several
-    # processes run at once. Sequential execution is what `chain` is for.
-    for (j, u) in enumerate(pinned_first)
-        push!(queues[mod1(j, nslot)], u)
-    end
-    for (j, u) in enumerate(failed_first)
-        push!(queues[mod1(j, nslot)], u)
-    end
-    load = zeros(Float64, nslot)
-    for g in gorder
-        s = argmin(load)
-        append!(queues[s], groups[g])
-        load[s] += max(weight(g), Float64(length(groups[g])))
-    end
-    for (j, u) in enumerate(pinned_last)
-        push!(queues[mod1(j, nslot)], u)
-    end
-    rebalance_empty!(queues)
-    return queues
+# Files written since the newest recorded run started: what is being worked on,
+# and so the likeliest to have something to say.
+function changed_files(units::Vector{UnitDraft}, since::Float64)
+    since > 0 || return Set{String}()
+    return Set(f for f in unique(it.file for d in units for it in d.items) if mtime(f) > since)
 end
 
-# A group is kept whole for cache affinity, but an idle worker beats affinity we
-# cannot yet prove pays for itself: hand the tail of the longest queue to any slot
-# that would otherwise have nothing to do. The tail is the right end to give away
-# because it is the part the owner has not warmed up either.
-function rebalance_empty!(queues::Vector{Vector{UnitIdx}})
-    while true
-        empty_i = findfirst(isempty, queues)
-        empty_i === nothing && return queues
-        donor = argmax(map(length, queues))
-        length(queues[donor]) >= 2 || return queues
-        push!(queues[empty_i], pop!(queues[donor]))
+const HEAD_CLASSES = 0:3
+const TAIL_CLASS = 5
+
+"""
+    order_pool!(pool, units, nslots, cfg, history, changed)
+
+Sort a pool's units into the order they are handed out, by class and then within
+it:
+
+0. `[order] first`, in the order listed;
+1. sandboxed units, in file order: each needs a fresh process, and at the start
+   every process is fresh, so running them first discards no compiled code;
+2. units that failed recently, or whose file changed since the last run: the
+   answer most likely to matter, as early as it can be had. A failure in the
+   newest run and a changed file come first, then older failures, the more recent
+   first; file order within each;
+3. units long enough to decide how long the run takes — more than a quarter of
+   one slot's share of the pool's work — longest first;
+4. everything else, in file order, where neighbours share compiled code;
+5. `[order] last`, in the order listed.
+
+Classes 0–3 are the pool's head, 4 its body and 5 its tail. A chain goes where
+its most urgent member would.
+"""
+function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, cfg, history::History, changed)
+    pin = Dict{String, Int}()
+    for (i, n) in enumerate(cfg.order_first)
+        pin[n] = i - length(cfg.order_first) - 1
     end
-    return
+    for (i, n) in enumerate(cfg.order_last)
+        pin[n] = i
+    end
+    share = sum(u -> units[u].est_s, pool; init = 0.0) / max(nslots, 1)
+    for u in pool
+        d = units[u]
+        p = minimum(it -> get(pin, it.name, 0), d.items)
+        at = (d.items[1].file, d.items[1].line)
+        urgency = minimum(it -> it.file in changed ? 0 : get(history.failed, it.name, typemax(Int)), d.items)
+        d.key = p < 0 ? (0, p, 0.0, at...) :
+            p > 0 ? (TAIL_CLASS, p, 0.0, at...) :
+            d.exclusive ? (1, 0, 0.0, at...) :
+            urgency < typemax(Int) ? (2, urgency, 0.0, at...) :
+            d.est_s > share / 4 ? (3, 0, -d.est_s, at...) : (4, 0, 0.0, at...)
+    end
+    return sort!(pool; by = u -> units[u].key)
+end
+
+"""
+    stretches(body, est, file, n) -> Vector{UnitRange}
+
+`body` cut into `n` stretches holding about the same estimated work — the same
+number of units when nothing is estimated — each cut made at the file boundary
+nearest its ideal place, so that one worker walks a whole file. A unit with no
+estimate counts as a typical one.
+"""
+function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{Int32}, n::Int)
+    m = length(body)
+    known = sort!(filter(>(0), est[body]))
+    guess = isempty(known) ? 1.0 : known[(end + 1) ÷ 2]
+    cum = cumsum([e > 0 ? e : guess for e in est[body]])
+    at = [j for j in 1:(m - 1) if file[body[j]] != file[body[j + 1]]]
+    isempty(at) && (at = collect(1:(m - 1)))
+    cuts = [isempty(at) ? m : at[argmin(abs.(cum[at] .- k * cum[end] / n))] for k in 1:(n - 1)]
+    edges = [0; cuts; m]
+    return [body[(edges[k] + 1):edges[k + 1]] for k in 1:n]
 end
 
 function materialize(
-        units::Vector{UnitDraft}, pools::Vector{Pool},
-        profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString
+        units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
+        profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString
     )
-    # Linearize: slot by slot, queue order, items in unit order. Item index order
-    # is therefore the order items run if the slots were concatenated, which is
-    # what the dry run prints and what the run state is indexed by.
-    slot_pool = Int32[]
-    slot_queue = Vector{UnitIdx}[]
-    for (k, p) in enumerate(pools)
-        qs = assign_groups(p, units)
-        for (j, s) in enumerate(p.slots)
-            push!(slot_pool, Int32(k)); push!(slot_queue, qs[j])
-        end
-        isempty(p.slots) || continue
-        # A pool with no slot yet still needs its queue kept for the slot that
-        # will rebind to it later.
-        push!(slot_pool, Int32(k)); push!(slot_queue, qs[1])
-    end
-    pending = Int32[]
-    keep = trues(length(slot_pool))
-    for (i, k) in enumerate(slot_pool)
-        if isempty(pools[k].slots)
-            push!(pending, k); keep[i] = false
-        end
-    end
-
+    # Pool by pool, in the order each hands out its units: item index order is the
+    # order of the plan, which is what the dry run prints and what the run state
+    # is indexed by.
     name = String[]; fileidx = Int32[]; line = Int32[]
     tags = Symbol[]; tag_span = UnitRange{Int32}[]
     setups = Symbol[]; setup_span = UnitRange{Int32}[]
@@ -434,19 +367,12 @@ function materialize(
     failfast = Int8[]; item_unit = UnitIdx[]
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
-    uchain = Symbol[]; uest = Float64[]; ugroup = Int32[]
-    slot_units = UnitRange{UnitIdx}[]
+    uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
     all_setups = Symbol[]
-
-    # Slots that have work first, then the queues waiting for a rebind, so that
-    # unit indices stay ascending within a slot.
-    emit_order = vcat(
-        [(i, slot_queue[i]) for i in eachindex(slot_queue) if keep[i]],
-        [(i, slot_queue[i]) for i in eachindex(slot_queue) if !keep[i]]
-    )
-    for (_, q) in emit_order
-        ufirst = UnitIdx(length(uspan) + 1)
-        for u in q
+    ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
+    for (k, pool) in enumerate(pools)
+        start = length(uspan)
+        for u in pool
             d = units[u]
             ifirst = ItemIdx(length(name) + 1)
             for it in d.items
@@ -465,26 +391,30 @@ function materialize(
             end
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
-            push!(uchain, d.chain); push!(uest, d.est_s); push!(ugroup, d.group)
+            push!(uchain, d.chain); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
         end
-        push!(slot_units, ufirst:UnitIdx(length(uspan)))
+        nhead = count(u -> units[u].key[1] in HEAD_CLASSES, pool)
+        ntail = count(u -> units[u].key[1] == TAIL_CLASS, pool)
+        stop = length(uspan)
+        between(a, b) = UnitIdx(a):UnitIdx(b)
+        body = between(start + nhead + 1, stop - ntail)
+        push!(ps, Pool(units[pool[1]].profile, between(start + 1, start + nhead), body, between(stop - ntail + 1, stop)))
+        slots[k] == 0 && push!(pending, Int32(k))
+        for r in stretches(body, uest, ufile, slots[k])
+            push!(slot_pool, Int32(k)); push!(slot_units, r)
+        end
     end
 
     items = Items(
         name, fileidx, line, tags, tag_span, setups, setup_span,
         code, skip, timeout, retries, failfast, item_unit
     )
-    us = Units(uspan, uprofile, uexcl, uchain, uest, ugroup)
-    # Queues for slots come first in `emit_order`, so the trailing entries are the
-    # queues waiting for a slot to rebind to them.
-    nreal = count(keep)
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, us, files, relfiles,
+        items, Units(uspan, uprofile, uexcl, uchain, uest), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
-        profiles, pools, slot_pool[keep], slot_units[1:nreal],
-        pending, slot_units[(nreal + 1):end], sort!(unique!(all_setups)), cfg, String(root),
-        Startup()
+        profiles, ps, slot_pool, slot_units, pending, sort!(unique!(all_setups)), cfg,
+        String(root), Startup(), String(selection)
     )
 end
 

@@ -1,39 +1,22 @@
 using YATF: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
-            is_test_file, scanner_mode, NO_CHAIN, DEFAULT_PROFILE,
+            is_test_file, NO_CHAIN, DEFAULT_PROFILE,
             USE_RUN_DEFAULT, select_by_line
 
 const BASIC = fixture("Basic.jl")
 
-# Scan a source string in a temporary file, in both scanner modes, and assert the
-# two agree: the streaming scanner reads Base internals, and the day it drifts,
-# this is what catches it.
+# Scan a source string in a temporary file: the items, or the exception the scan
+# threw, and the path.
 function scan_source(src::AbstractString; filter=Filter(), setups=Dict{Symbol,String}(), name="t_test.jl")
     dir = mktempdir()
     path = joinpath(dir, name)
     write(path, src)
-    results = Dict{Symbol,Any}()
-    for mode in (:stream, :parseall)
-        results[mode] = try
-            scan([path], filter, setups; mode)
-        catch e
-            e
-        end
+    result = try
+        scan([path], filter, setups)
+    catch e
+        e
     end
-    return results[:stream], results[:parseall], path
+    return result, path
 end
-
-function same_items(a, b)
-    a isa Vector && b isa Vector || return false
-    length(a) == length(b) || return false
-    return all(eachindex(a)) do i
-        x, y = a[i], b[i]
-        x.name == y.name && x.line == y.line && x.tags == y.tags && x.setups == y.setups &&
-            x.timeout_s == y.timeout_s && x.retries == y.retries && x.failfast == y.failfast &&
-            x.chain === y.chain && x.profile === y.profile && x.exclusive == y.exclusive &&
-            x.code == y.code && x.skip == y.skip
-    end
-end
-
 @testset "scan" begin
     @testset "file naming" begin
         @test is_test_file("a_test.jl")
@@ -58,7 +41,7 @@ end
         @test setup_modules("/nonexistent") == Dict{Symbol,String}()
     end
 
-    @testset "both scanners agree" begin
+    @testset "an item's keywords are read" begin
         src = """
         @testitem "one" tags=[:a, :b] timeout=2*60 retries=3 failfast=true begin
             using MySetup
@@ -73,9 +56,8 @@ end
             x = 1
         end
         """
-        a, b, _ = scan_source(src; setups=Dict(:MySetup => "x.jl"))
+        a, _ = scan_source(src; setups=Dict(:MySetup => "x.jl"))
         @test a isa Vector && length(a) == 3
-        @test same_items(a, b)
         @test a[1].tags == [:a, :b]
         @test a[1].timeout_s == 120              # literal arithmetic is folded
         @test a[1].retries == 3
@@ -89,8 +71,7 @@ end
     end
 
     @testset "defaults" begin
-        a, b, _ = scan_source("""@testitem "x" begin\n end""")
-        @test same_items(a, b)
+        a, _ = scan_source("""@testitem "x" begin\n end""")
         @test a[1].timeout_s == USE_RUN_DEFAULT
         @test a[1].retries == USE_RUN_DEFAULT
         @test a[1].failfast == -1
@@ -107,9 +88,8 @@ end
             error("this must never run during a scan")
         end
         """
-        a, b, _ = scan_source(src)
+        a, _ = scan_source(src)
         @test a isa Vector && length(a) == 1
-        @test same_items(a, b)
         @test !isdefined(Main, :__yatf_scan_side_effect__)
     end
 
@@ -129,11 +109,9 @@ end
             ("""@testitem "a" sandbox=true chain=:c begin\n end\n""", "cannot be combined"),
             ("""@testitem "a" timeout=CONST begin\n end\n""", "positive number"),
         )
-            a, b, _ = scan_source(src)
+            a, _ = scan_source(src)
             @test a isa ScanFailure
-            @test b isa ScanFailure
             @test occursin(needle, sprint(showerror, a))
-            @test occursin(needle, sprint(showerror, b))
         end
     end
 
@@ -151,9 +129,11 @@ end
     end
 
     @testset "syntax errors are located" begin
-        a, b, path = scan_source("""@testitem "a" begin\n   x = (1 +\nend\n""")
+        a, path = scan_source("""@testitem "a" begin\n   x = (1 +\nend\n""")
         @test a isa ScanFailure
-        @test b isa ScanFailure
+        # The parser's own report, at the line where it stopped.
+        @test only(a.errors).line == 3
+        @test occursin("ParseError", only(a.errors).msg)
     end
 
     @testset "filters" begin
@@ -210,12 +190,5 @@ end
         """)
         out = read(ignorestatus(`$(Base.julia_cmd()) --startup-file=no -t4 $script`), String)
         @test strip(out) == "1000"      # one count, and it is all of them
-    end
-
-    @testset "the streaming scanner is chosen only when it agrees with itself" begin
-        # The mode is never one that has not been verified against a known input,
-        # and it is decided once per process rather than on every scan.
-        @test scanner_mode() in (:stream, :parseall)
-        @test scanner_mode() === scanner_mode()
     end
 end

@@ -5,7 +5,6 @@ const SlotIdx = Int16
 
 const NO_CHAIN = Symbol("")
 const DEFAULT_PROFILE = :default
-const EXCLUSIVE_SUFFIX = "__exclusive"
 
 const USE_RUN_DEFAULT = Int32(-1)
 
@@ -13,8 +12,7 @@ const USE_RUN_DEFAULT = Int32(-1)
     RawItem
 
 One `@testitem` as the scanner read it: a pure function of the file's bytes.
-Nothing here was evaluated; `code` and `skip` are unevaluated expressions that
-only ever run on the process that runs the test item.
+`code` and `skip` are unevaluated; they only ever run where the item runs.
 """
 struct RawItem
     name::String
@@ -32,12 +30,8 @@ struct RawItem
     exclusive::Bool             # sandbox=true: alone in a process, torn down after
 end
 
-"""
-    ScanError
-
-A problem in a test file, located. Scanning collects every one of these before
-failing, so a user with five broken files sees five errors, not one.
-"""
+# A problem in a test file, located. Scanning collects all of them before failing,
+# so five broken files are five errors, not one.
 struct ScanError
     file::String
     line::Int32
@@ -72,11 +66,9 @@ Base.showerror(io::IO, e::ConfigError) = print(io, "YATF: ", e.msg)
 """
     TagExpr
 
-A tag selection written as a string in Julia's own syntax — `"fast"`, `"!slow"`,
-`"fast && !slow"`, `"juliac || serializer"` — for what a vector of tags cannot say:
-that an item must *not* carry a tag, or may carry one of several. `&&` binds
-tighter than `||`, and there are no parentheses. Held in disjunctive normal form,
-so matching an item is one pass over a small flat table.
+A tag selection written in Julia's own syntax — `"!slow"`, `"fast && !slow"`,
+`"juliac || serializer"` — for what a vector of tags cannot say. `&&` binds
+tighter than `||`; there are no parentheses. Held in disjunctive normal form.
 """
 struct TagExpr
     text::String
@@ -118,17 +110,13 @@ end
 """
     Filter
 
-The whole of a run's selection, applied while scanning. `name` and `tags` are
-matched against every item, `paths` against the file it is in (empty means every
-file), and `line` selects the single item defined at or above that line. `tags` is
-a vector an item must carry every one of, or a [`TagExpr`](@ref).
-
-Every test file is read whether or not the selection can reach it: a suite that
-does not parse, or that declares one name twice, is a broken suite and not a
-smaller one. What the filter decides is which items *run*.
+A run's selection: `name` (exact, a `Regex`, or a set of exact names) and `tags`
+(a vector an item must carry all of, or a [`TagExpr`](@ref)) are matched against items, `paths` against their files (empty
+means all), and `line` picks the item defined at or above it. Every test file is
+read whatever the selection: a suite that does not parse is broken, not smaller.
 """
 struct Filter
-    name::Union{Nothing, String, Regex}
+    name::Union{Nothing, String, Regex, Set{String}}
     tags::Union{Nothing, Vector{Symbol}, TagExpr}
     paths::Vector{String}
     line::Int32
@@ -149,8 +137,8 @@ end
 
 _astag(t::Symbol) = t
 function _astag(t::AbstractString)
-    # An operator inside an element is a tag expression that was handed over one
-    # element at a time. Read as a name it would match nothing and say nothing.
+    # An operator inside an element is a tag expression handed over one element at
+    # a time; read as a name it would match nothing and say nothing.
     occursin(TAG_NAME, t) || throw(ArgumentError(
         "`tags`: $(repr(String(t))) is not a tag name; write a tag expression as one " *
             "string rather than as an element, as in `tags = $(repr(String(t)))` on its own"
@@ -164,10 +152,7 @@ _astag(t) = throw(ArgumentError(
 matches_name(::Nothing, ::AbstractString) = true
 matches_name(f::AbstractString, name::AbstractString) = f == name
 matches_name(f::Regex, name::AbstractString) = occursin(f, name)
-# `bytes` overload: avoids materializing a String for the common exact-match case
-matches_name(::Nothing, ::AbstractVector{UInt8}) = true
-matches_name(f::AbstractString, name::AbstractVector{UInt8}) = codeunits(f) == name
-matches_name(f::Regex, name::AbstractVector{UInt8}) = occursin(f, String(copy(name)))
+matches_name(f::Set{String}, name::AbstractString) = name in f
 
 matches_tags(::Nothing, ::Vector{Symbol}) = true
 matches_tags(want::Vector{Symbol}, have::Vector{Symbol}) = all(in(have), want)
@@ -178,13 +163,8 @@ matches_tags(e::TagExpr, have::Vector{Symbol}) =
 matches_path(paths::Vector{String}, file::AbstractString) =
     isempty(paths) || any(p -> file == p || startswith(file, endswith(p, '/') ? p : p * "/"), paths)
 
-"""
-    ItemName
-
-The name and place of a test item the filter did not select. Kept because name
-uniqueness is a property of the suite, not of one run's selection: without these,
-two items could share a name for as long as no single run saw both.
-"""
+# A test item the filter did not select. Names must be unique across the suite,
+# not just across one run's selection.
 struct ItemName
     name::String
     file::String

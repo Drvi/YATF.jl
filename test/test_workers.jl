@@ -25,7 +25,7 @@ end
 # field added to `ItemSpec` does not break these tests.
 function probe_spec(code::Expr; name="probe")
     given = (; name, code, file=@__FILE__, location=string(@__FILE__, ":1"), skip=false)
-    default(T) = T === Int32 ? Int32(1) : T === Int8 ? Int8(1) : T === String ? "" :
+    default(T) = T === Int32 ? Int32(1) : T === Int8 ? Int8(1) : T === String ? "" : T === UInt64 ? UInt64(1) :
                  T === Bool ? false : T === Symbol ? :default : T === Expr ? Expr(:block) : nothing
     return ItemSpec((haskey(given, f) ? given[f] : default(fieldtype(ItemSpec, f))
                      for f in fieldnames(ItemSpec))...)

@@ -1,117 +1,100 @@
-# Running a plan.
-#
-# One task per slot. A slot takes work from its own queue, steals from the tail of
-# the longest queue when its own drains, and rebinds to another profile's queue
-# when there is nothing left to steal. `workers` is a hard cap on live processes
-# throughout: the framework takes longer rather than starting a process the caller
-# did not authorize.
+# Running a plan: one task per slot. A slot takes its pool's head first, then walks
+# its own stretch of the pool's body, takes half of the largest stretch left when
+# its own is done, then the pool's tail, and rebinds to a pool no slot serves when
+# its own has nothing left. `workers` caps live processes throughout: the run takes
+# longer rather than start a process the caller did not authorize.
 
 using Base: SIGKILL
 
 mutable struct Slot
     const id::SlotIdx
-    # What a line relayed from this slot's worker starts with, one per glyph in
-    # `LINE_MARKS`. Constant for the life of the slot, and a run relays at least
-    # two lines an item, so the choice is an index rather than a concatenation.
-    const prefixes::NTuple{length(LINE_MARKS), String}
-    pool::Int32
     profile::Profile
     worker::Union{Nothing, YATFWorkers.Worker}
     started_at::Float64      # when this slot's current process came up
     worker_items::Int        # items the current process has run, for its EXIT line
-    units_started::Int
     current::ItemIdx      # the item this slot is running, 0 when idle
-    # Where to put what the worker prints while it is being taken down, or empty.
-    # A process killed for a timeout prints a signal and a backtrace after its item
-    # has stopped capturing, so that output arrives loose on the relay with nowhere
-    # obvious to go; it belongs with the item that was running.
+    # A process killed for a timeout prints its signal and backtrace after its item
+    # has stopped capturing. Those lines belong in `dying_log`, the log of the item
+    # that was running (empty otherwise), and wait in `dying_lines` until the
+    # process is gone.
     dying_log::String
+    const dying_lines::Vector{String}
 end
 
 """
     Queues
 
-Every cursor a run has, behind one lock. Claiming happens a few thousand times in
-a run, so an uncontended lock costs nothing measurable and removes a whole class
-of racy-cursor bugs that would be very hard to reproduce in a test framework.
+Every cursor a run has, behind one lock: each pool's head and tail, and each slot's
+stretch of its pool's body. A run claims a few thousand times, so an uncontended
+lock costs nothing, and one lock rules out racing cursors.
 """
 mutable struct Queues
     const lock::ReentrantLock
-    const head::Vector{UnitIdx}      # next unit this slot will take
-    const tail::Vector{UnitIdx}      # last unit still available to this slot
-    const pool::Vector{Int32}        # the pool each slot is currently serving
-    # The profile behind each pool, by pool index. Two pools can share one — an
-    # exclusive unit is pooled apart from the ordinary work of the same profile —
-    # and stealing is decided on the profile, not on which pool it came from.
-    const pool_profile::Vector{Int32}
-    const pending::Vector{Int32}        # pools with no slot yet
-    const pending_units::Vector{UnitRange{UnitIdx}}
+    const pools::Vector{Pool}
+    const head::Vector{UnitIdx}      # per pool: its next head unit
+    const tail::Vector{UnitIdx}      # per pool: its next tail unit
+    const from::Vector{UnitIdx}      # per slot: the next unit of its stretch
+    const to::Vector{UnitIdx}        # per slot: the last unit of its stretch
+    const pool::Vector{Int32}        # per slot: the pool it serves
+    const pending::Vector{Int32}     # pools no slot serves yet, in pickup order
+    const claimed::BitVector         # per unit: handed out already
     cancelled::Bool
     paused::Bool        # the memory guard is holding new work back
 end
 
-function Queues(p::Plan)
-    head = UnitIdx[first(r) for r in p.slot_units]
-    tail = UnitIdx[last(r) for r in p.slot_units]
-    return Queues(
-        ReentrantLock(), head, tail, copy(p.slot_pool),
-        Int32[pool.profile for pool in p.pools],
-        copy(p.pending), copy(p.pending_units), false, false
-    )
-end
+Queues(p::Plan) = Queues(
+    ReentrantLock(), p.pools,
+    UnitIdx[first(k.head) for k in p.pools], UnitIdx[first(k.tail) for k in p.pools],
+    UnitIdx[first(r) for r in p.slot_units], UnitIdx[last(r) for r in p.slot_units],
+    copy(p.slot_pool), copy(p.pending), falses(length(p.units)), false, false
+)
 
 struct Claim
     kind::Symbol        # :unit, :rebind, :done
     unit::UnitIdx
     pool::Int32
-    units::UnitRange{UnitIdx}
 end
-Claim(kind::Symbol) = Claim(kind, UnitIdx(0), Int32(0), UnitIdx(1):UnitIdx(0))
+Claim(kind::Symbol) = Claim(kind, UnitIdx(0), Int32(0))
 
-remaining(q::Queues, s::Integer) = Int(q.tail[s]) - Int(q.head[s]) + 1
+# The unit a cursor points at, moving the cursor past it. Every unit is handed out
+# exactly once; a second time is a scheduling bug, stopped here rather than run twice.
+function next!(q::Queues, cursor::Vector{UnitIdx}, i::Integer)
+    u = cursor[i]
+    cursor[i] += UnitIdx(1)
+    q.claimed[u] && error("YATF internal error: unit $u was handed out twice")
+    q.claimed[u] = true
+    return Claim(:unit, u, Int32(0))
+end
 
 function claim!(q::Queues, s::Integer)
     @lock q.lock begin
         q.cancelled && return Claim(:done)
-        if remaining(q, s) > 0
-            u = q.head[s]
-            q.head[s] += UnitIdx(1)
-            return Claim(:unit, u, Int32(0), UnitIdx(1):UnitIdx(0))
-        end
-        # Steal from the tail of the busiest queue running the same profile: the
-        # owner has not warmed that end up either, so it is the cheapest end to
-        # give away. Never across profiles — a profile is a worker configuration,
-        # and an item run under another profile's julia flags was not the test that
-        # was declared, however green it comes out.
-        #
-        # Same profile is the whole condition, and a pool is narrower than that: a
-        # profile's exclusive units are pooled separately from its ordinary ones,
-        # so a slot serving one sandbox would otherwise go home for good with the
-        # rest of its own configuration still queued.
-        #
-        # A queue holding a single unit is worth stealing from: `remaining` counts
-        # what has not been claimed, and the unit its owner is running was claimed
-        # when it started. Leaving that one behind is how the last item of a slow
-        # worker's queue waits out an item that takes a minute while every other
-        # worker has gone home.
+        k = q.pool[s]
+        q.head[k] <= last(q.pools[k].head) && return next!(q, q.head, k)
+        q.from[s] <= q.to[s] && return next!(q, q.from, s)
+        # Its own stretch is done: take the second half of the largest stretch left
+        # in the pool, so both slots go on walking neighbouring units. A stretch of
+        # one gives it up too, so a slow slot's last unit does not wait behind the
+        # one it is running. Never across pools: a unit run under another profile's
+        # flags is not the test that was declared.
         victim, most = 0, 0
-        for v in eachindex(q.head)
-            (v == s || q.pool_profile[q.pool[v]] != q.pool_profile[q.pool[s]]) && continue
-            r = remaining(q, v)
+        for v in eachindex(q.pool)
+            q.pool[v] == k || continue
+            r = q.to[v] - q.from[v] + 1
             r > most && ((victim, most) = (v, r))
         end
         if victim != 0
-            u = q.tail[victim]
-            q.tail[victim] -= UnitIdx(1)
-            return Claim(:unit, u, Int32(0), UnitIdx(1):UnitIdx(0))
+            q.from[s] = q.from[victim] + UnitIdx(most ÷ 2)
+            q.to[s] = q.to[victim]
+            q.to[victim] = q.from[s] - UnitIdx(1)
+            return next!(q, q.from, s)
         end
+        q.tail[k] <= last(q.pools[k].tail) && return next!(q, q.tail, k)
         if !isempty(q.pending)
-            pool = popfirst!(q.pending)
-            units = popfirst!(q.pending_units)
-            q.head[s] = first(units)
-            q.tail[s] = last(units)
-            q.pool[s] = pool
-            return Claim(:rebind, UnitIdx(0), pool, units)
+            k = popfirst!(q.pending)
+            q.pool[s] = k
+            q.from[s], q.to[s] = first(q.pools[k].body), last(q.pools[k].body)
+            return Claim(:rebind, UnitIdx(0), k)
         end
         return Claim(:done)
     end
@@ -122,13 +105,10 @@ is_cancelled(q::Queues) = @lock q.lock q.cancelled
 set_paused!(q::Queues, v::Bool) = @lock q.lock (q.paused = v; nothing)
 is_paused(q::Queues) = @lock q.lock q.paused
 
-# Backpressure: hold new work rather than add another item's allocations to a
-# machine that is already short of memory.
-#
-# The hold is bounded. Memory pressure is often caused by something other than
-# this run, and a test framework that quietly stops making progress is worse than
-# one that runs its tests on a busy machine — so after `MAX_BACKPRESSURE_SECONDS`
-# the run continues and says so. Cancellation always gets through.
+# Backpressure: hold new work while the machine is short of memory. Bounded,
+# because the pressure is often someone else's, and a run that quietly stops making
+# progress is worse than one that runs on a busy machine. Cancellation always gets
+# through.
 const MAX_BACKPRESSURE_SECONDS = 30.0
 
 function wait_while_paused(q::Queues)
@@ -158,16 +138,16 @@ struct Statuses
     start::Vector{Float32}   # seconds from the start of the run to the item's dispatch
     attempt::Vector{Int8}
     slot::Vector{SlotIdx}
+    pid::Vector{Int32}       # the process its last attempt ran in, 0 for none
     elapsed::Vector{Float32}
     compile::Vector{Float32}
     testsets::Vector{Any}
-    logpaths::Vector{String}
 end
 
 Statuses(n::Integer) = Statuses(
     falses(n), falses(n), fill(UNSEEN, n), zeros(Float32, n), zeros(Int8, n), fill(SlotIdx(0), n),
-    zeros(Float32, n), zeros(Float32, n),
-    Vector{Any}(nothing, n), fill("", n)
+    zeros(Int32, n), zeros(Float32, n), zeros(Float32, n),
+    Vector{Any}(nothing, n)
 )
 
 mutable struct Run
@@ -207,31 +187,24 @@ function execute(p::Plan, target)
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"),
-        YATFWorkers.name_width(p.items.name; columns = YATFWorkers.terminal_columns()),
+        name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)),
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0
     )
-    run.runstate = open_runstate(p)
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
     for s in 1:nslots(p)
         push!(
             run.slots, Slot(
-                SlotIdx(s),
-                ntuple(k -> string(MARK_INDENT, LINE_MARKS[k], " w", s, FIELD), length(LINE_MARKS)),
-                p.slot_pool[s], p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, 0, ItemIdx(0), ""
+                SlotIdx(s), p.profiles[p.pools[p.slot_pool[s]].profile],
+                nothing, 0.0, 0, ItemIdx(0), "", String[]
             )
         )
     end
     setup_path = joinpath(target.testdir, TESTSETUPS_DIR)
-    # Every log record raised while the run is going goes through the printer, so
-    # nothing can land in the middle of the status line or another writer's line.
     return try
         run_phases(run, p, target, setup_path)
     finally
-        # Wherever the run stopped. A throw before the first item — a setup that
-        # will not compile, an environment that will not resolve — leaves the
-        # monitor's task running and its line pinned, and the error prints on top
-        # of that line instead of under it.
+        # Wherever the run stopped: a throw before the first item would otherwise
+        # leave the monitor running and the error printed over its line.
         stop_monitor!(run.monitor)
     end
 end
@@ -239,18 +212,23 @@ end
 function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
     cfg = p.cfg
     return with_logger(RunLogger(current_logger(), run)) do
-        t_env = time()
         with_test_env(target, run) do
-            p.startup.env = time() - t_env
+            # Opened once the test environment is active: its manifest is part of
+            # what the file records.
+            run.runstate = open_runstate(p)
+            check_replayed_environment(run)
             with_load_path(setup_path) do
-                t_pre = time()
                 profile_projects!(run, p)
                 precompile_phase(run, p, target)
-                p.startup.precompile = time() - t_pre
-                # Printed once everything before the tests is done, so it can say what
-                # that cost.
+                # From the start of the run, as the monitor's setup stage is, so the
+                # header and the closing block give the same figure.
+                p.startup.setup = time() - run.t0
+                # Printed once setup is done, so it can say what setup cost.
                 print_run_header(run)
                 set_phase!(run.monitor, PHASE_TEST)
+                interrupted = false
+                ensure_exit_report()
+                LIVE_RUN[] = run
                 try
                     if cfg.workers == 0
                         run_in_process(run, target)
@@ -258,15 +236,24 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                         run_on_workers(run, target)
                     end
                 catch e
-                    e isa InterruptException && kill_workers!(run)
+                    if e isa InterruptException
+                        interrupted = true
+                        kill_workers!(run)
+                    end
                     rethrow()
                 finally
+                    # Reaching here at all means the run unwound, so the exit hook
+                    # has nothing left to close.
+                    LIVE_RUN[] = nothing
                     set_phase!(run.monitor, PHASE_REPORT)
                     stop_monitor!(run.monitor)
                     shutdown!(run)
                     run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
                     finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
                     prune_runstates(p.root)
+                    # The exception on its way out stops the report from being
+                    # made, so what the run got through is said here or nowhere.
+                    interrupted && print_conclusion(run, true)
                 end
                 run
             end
@@ -278,28 +265,22 @@ end
     with_test_env(f, target)
 
 Run `f` with the package's test environment active, and restore whatever was
-active afterwards: `runtests` at the REPL must not leave the caller somewhere else.
+active afterwards. The environment is:
 
-The environment is chosen in this order:
+1. the active one, when the call came from `<root>/test/runtests.jl`: that is
+   `Pkg.test`, which has built an environment with the test dependencies;
+2. the active one, when it is the package's own `test/Project.toml`, because
+   activating that is a deliberate choice;
+3. otherwise a test environment built by `TestEnv`, cached for the session.
 
-1. the one already active, when the call came from `<root>/test/runtests.jl` —
-   that is `Pkg.test`, which has already built an environment holding the package
-   and its test dependencies, and switching away would lose them;
-2. the one already active, when it is the package's own `test/Project.toml`,
-   because activating that is a deliberate choice;
-3. a test environment built by `TestEnv`, cached for the session.
-
-The package's plain project is deliberately *not* used: it does not contain the
-test-only dependencies, so every item that needs one would fail to load it.
+Never the package's plain project, which lacks the test-only dependencies.
 """
 function with_test_env(f, target, run = nothing)
     # Building it is `Pkg`'s to narrate, and it draws its own progress by moving
     # the cursor. Ours comes down while it does.
     monitor = run === nothing ? nothing : run.monitor
     env = with_status_line_off(monitor) do
-        test_env_for(target, run === nothing ? nothing : () -> printline(
-            run, string(yatf_prefix(), "resolving the test environment")
-        ))
+        test_env_for(target, run === nothing ? nothing : () -> say(run, "resolving the test environment"))
     end
     env === nothing && return f()
     current = Base.active_project()
@@ -314,11 +295,8 @@ end
 """
     test_env_for(target) -> Union{Nothing,String}
 
-The environment the target's test items should resolve against, or `nothing` when
-the one already active is it.
-
-Split out because a run is not the only thing that needs the answer: `activate`
-puts the REPL in the same place, and the two must agree about where that is.
+The environment the target's items resolve against, or `nothing` when the active
+one is it. `activate` asks too, and must agree with a run.
 """
 function test_env_for(target, announce = nothing)
     current = Base.active_project()
@@ -332,12 +310,10 @@ function test_env_for(target, announce = nothing)
     return env
 end
 
-# Generated test environments are kept for the lifetime of the session, keyed by
-# project file. Building one costs a resolve, and the new environment makes Julia
-# believe the code it holds has changed, so it precompiles again — at the REPL,
-# where `runtests` is called over and over, that is the difference between a
-# second and a minute. The stamp is what the environment was generated from, so
-# adding a test dependency mid-session rebuilds it instead of being ignored.
+# Generated test environments, kept for the session and keyed by project file:
+# building one costs a resolve, and a new environment makes Julia precompile again,
+# which at the REPL is the difference between a second and a minute. The stamp is
+# what it was generated from, so a test dependency added mid-session rebuilds it.
 const TEST_ENVS = Dict{String, Tuple{String, NTuple{4, Float64}}}()
 const TEST_ENVS_LOCK = ReentrantLock()
 
@@ -348,18 +324,14 @@ function test_env(target, announce = nothing)
         if cached !== nothing && isfile(cached[1]) && cached[2] == env_stamp(target)
             return cached[1]
         end
-        # Only here: resolving takes seconds and is the longest unexplained pause a
-        # run has, while a cache hit is immediate and a line about it would be
-        # noise at the REPL, where that hit is the point.
+        # Announced only when building: a cache hit is immediate, and at the REPL
+        # the hit is the point.
         announce === nothing || announce()
         original = Base.active_project()
         try
-            # `Pkg` precompiles an environment it has just resolved, for the flags
-            # this process happens to be running under. The run wants the same work
-            # done for every set of flags its pools will use, which is one pass over
-            # the environment rather than this one plus another; `precompile_env`
-            # does it, and this stays a resolve so the time reported against it is
-            # the resolve's.
+            # `Pkg` would precompile the new environment for this process's flags
+            # only; `precompile_env` does it once for every set of flags the pools
+            # use, and the time reported against this stays the resolve's.
             withenv("JULIA_PKG_PRECOMPILE_AUTO" => "0") do
                 Pkg.activate(proj; io = devnull)
                 TestEnv.activate()
@@ -404,6 +376,46 @@ function running_from_runtests(target)
     return abspath(String(source)) == abspath(joinpath(target.testdir, "runtests.jl"))
 end
 
+# A replay runs against this machine's environment, which may not be the one the
+# run state was recorded in. Every package whose version differs is named: it is
+# the first thing to rule out when a replay does not fail the way the original did.
+function check_replayed_environment(run::Run)
+    recorded = run.plan.cfg.replayed_manifest
+    isempty(recorded) && return nothing
+    env = Base.active_project()
+    here = manifest_versions(read_text(env === nothing ? nothing : Base.project_file_manifest_path(env)))
+    there = manifest_versions(recorded)
+    diffs = String[]
+    for name in sort!(collect(union(keys(here), keys(there))))
+        h, t = get(here, name, "absent"), get(there, name, "absent")
+        h == t || push!(diffs, string(name, ": ", t, " when recorded, ", h, " here"))
+    end
+    isempty(diffs) && return say(run, "the environment matches the one the run state was recorded in")
+    @warn "YATF: the environment differs from the one the run state was recorded in:\n" *
+        join(("  " * d for d in first(diffs, 40)), "\n") * (length(diffs) > 40 ? "\n  …" : "")
+    return nothing
+end
+
+# Package name => version, from a manifest's text. A package tracked by path is
+# `path`: its path is the recording machine's and says nothing here.
+function manifest_versions(text::AbstractString)
+    out = Dict{String, String}()
+    isempty(text) && return out
+    toml = try
+        TOML.parse(text)
+    catch
+        return out
+    end
+    for (name, entries) in get(toml, "deps", Dict{String, Any}())
+        entries isa AbstractVector || continue
+        for entry in entries
+            entry isa AbstractDict || continue
+            out[name] = haskey(entry, "path") ? "path" : string(get(entry, "version", get(entry, "git-tree-sha1", "stdlib")))
+        end
+    end
+    return out
+end
+
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
 function open_runstate(p::Plan)
@@ -418,14 +430,10 @@ end
 """
     needs_worker(p, u) -> Bool
 
-Whether this unit has to run in a process of its own however the run is
-configured.
-
-`--check-bounds=yes` cannot be applied to a process that is already running, and
-nothing can give an item a process to itself when there is only one. An item that
-asked for either is testing something that depends on it, so it gets a worker even
-under `workers=0` — running it here and reporting a pass would be reporting a pass
-for a test that was never run the way it was written.
+Whether this unit needs a process of its own however the run is configured:
+`--check-bounds=yes` cannot be applied to a running process, and one process
+cannot give an item a process to itself. Such an item gets a worker even under
+`workers=0`; passing it here would pass a test that never ran as written.
 """
 needs_worker(p::Plan, u::UnitIdx) =
     p.units.exclusive[u] || p.profiles[p.units.profile[u]].name !== DEFAULT_PROFILE
@@ -469,25 +477,16 @@ function with_load_path(f, setup_path::AbstractString)
     end
 end
 
-# One process precompiles what every worker is about to need. Without this, N
-# workers hit the same cold cache at the same moment and serialize on Julia's
-# precompilation lock exactly when the run starts.
 """
     profile_projects!(run, p)
 
-Give every profile that declares preferences a project of its own, and record
-where it is.
-
-A package takes its preferences from the environment that owns it. A second
-environment stacked above the first is not consulted — measured — so a profile's
-preferences cannot be layered onto the test environment and have to arrive as the
-worker's own project. Each directory holds the test environment's `Project.toml`
-and `Manifest.toml`, so every package resolves to the same version it would
-otherwise, over a `LocalPreferences.toml` of the environment's own preferences
-with the profile's laid on top.
-
+Give every profile that declares preferences a project of its own. A package takes
+its preferences from the environment that owns it, and a stacked environment is not
+consulted, so a profile's preferences have to arrive as the worker's own project:
+the test environment's `Project.toml` and `Manifest.toml`, over a
+`LocalPreferences.toml` of the environment's preferences with the profile's on top.
 Preferences are part of a cache's identity, so these projects keep caches of their
-own rather than displacing the ones the other workers use.
+own.
 """
 function profile_projects!(run::Run, p::Plan)
     env = Base.active_project()
@@ -514,14 +513,10 @@ end
 """
     copy_env_files(dir, root)
 
-Write `root`'s `Project.toml` and `Manifest.toml` into `dir`, with every path they
-hold made absolute.
-
-`dir` is below `root`, so a relative path copied across resolves somewhere else
-than it did — one directory too deep. Pkg writes one whenever a package is reached
-through another package's checkout, which is how a package developed from a
-checkout is normally reached, and a worker whose project cannot find that package
-dies before it is ready.
+Write `root`'s `Project.toml` and `Manifest.toml` into `dir`, every path made
+absolute: `dir` is below `root`, so a relative path would resolve one directory too
+deep, and a worker whose project cannot find a developed package dies before it is
+ready.
 """
 function copy_env_files(dir::AbstractString, root::AbstractString)
     for file in ("Project.toml", "Manifest.toml")
@@ -536,12 +531,9 @@ end
 """
     absolute_paths!(data, root) -> data
 
-Rewrite every `path` in a parsed project or manifest to an absolute one, reading
-the relative ones from `root`.
-
-The whole table is walked rather than the two places a path is written today: in
-these two files a `path` is a filesystem path wherever it appears, and one missed
-is a package that cannot be found.
+Rewrite every `path` in a parsed project or manifest as absolute, reading relative
+ones from `root`. The whole table is walked: in these files a `path` is a
+filesystem path wherever it appears.
 """
 function absolute_paths!(data::AbstractDict, root::AbstractString)
     for (key, value) in data
@@ -561,95 +553,102 @@ function absolute_paths!(data::AbstractDict, root::AbstractString)
     return data
 end
 
+# One process precompiles what every worker is about to need; otherwise the workers
+# hit the same cold cache at once and serialize on Julia's precompilation lock.
 function precompile_phase(run::Run, p::Plan, target)
-    # The environment first: a setup module is compiled against it, and compiling
-    # one before it is there makes that worker build the dependencies itself, one
-    # at a time, instead of reading what this pass wrote.
+    # The environment first: a setup module compiled before it would make its
+    # worker build the dependencies itself, one at a time.
     precompile_env(run, p)
     precompile_setups(run, p, target)
     return nothing
 end
 
+const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(f.use_pkgimages, ' ', f.debug_level, " *
+    "' ', f.check_bounds, ' ', f.inline, ' ', f.opt_level)"
+
 """
     cache_flags_for(julia_args) -> Base.CacheFlags
 
-The cache flags a worker started with `julia_args` will have.
-
-Asked of a process started the same way rather than derived from the arguments:
-which of them reach the cache key is Julia's business and changes between
-versions, and a wrong answer here silently precompiles for the wrong key.
+The cache flags a worker started with `julia_args` will have, asked of a process
+started the same way: which arguments reach the cache key is Julia's business and
+changes between versions, and a wrong answer precompiles for the wrong key.
 """
-cache_flags_for(julia_args::Cmd) = parse(
-    Base.CacheFlags,
-    read(
-        `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e "show(Base.CacheFlags())"`,
+function cache_flags_for(julia_args::Cmd)
+    out = read(
+        `$(Base.julia_cmd()) $julia_args --startup-file=no --history-file=no -e $CACHE_FLAGS_CODE`,
         String
     )
-)
+    f = split(out)
+    length(f) == 5 || error("YATF: could not read the cache flags of `julia $julia_args`: $out")
+    return Base.CacheFlags(
+        parse(Bool, f[1]), parse(Int, f[2]), parse(Int, f[3]), parse(Bool, f[4]), parse(Int, f[5])
+    )
+end
 
 """
     precompile_env(run, p)
 
 Precompile the test environment once for every set of cache flags the run will
-use: this process's own, and one per pool that has julia arguments of its own.
-
-Every test item's module loads the package under test, and a package image built
-under other julia flags cannot be used, so the first worker of a pool with
-`julia_args` would otherwise compile that package and everything it depends on —
-inside the worker, serially, with no output, while the run looks stalled on its
-first item. One pass here covers every set of flags at once, and what it writes
-serves every later worker and every later run.
-
-This is also where the environment's ordinary precompilation happens. `Pkg` would
-do that as part of resolving, for this process's flags alone; `test_env` turns that
-off so the whole thing is one pass rather than that one and then another.
+use: this process's own, and one per pool with julia arguments of its own. A
+package image built under other flags cannot be used, so a worker with other flags
+would otherwise compile the package and its dependencies itself, serially and
+silently, while the run looks stalled on its first item. `test_env` turns off
+`Pkg`'s own precompilation so that this is the one pass.
 """
 function precompile_env(run::Run, p::Plan)
-    mine = Base.CacheFlags()
     # The flags this process runs under lead, because every pool without julia
     # arguments of its own uses them and because `Pkg` is no longer doing it.
-    configs = Pair{Cmd, Base.CacheFlags}[`` => mine]
+    configs = Pair{Cmd, Base.CacheFlags}[`` => Base.CacheFlags()]
     names = String[]
-    seen = Set{Base.CacheFlags}()
     for pool in p.pools
         prof = p.profiles[pool.profile]
-        # A profile with preferences runs in a project of its own, and a project is
-        # not something `configs` can carry, so it gets a call to itself below.
-        haskey(run.profile_projects, prof.name) && continue
-        # Only julia arguments reach the cache key; a profile that differs only in
-        # threads or environment shares the flags this process already compiled for.
-        isempty(prof.julia_args) && continue
-        args = Cmd(prof.julia_args)
-        flags = try
-            cache_flags_for(args)
-        catch e
-            e isa InterruptException && rethrow()
-            @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
-                   workers will compile what they need themselves" exception = e
-            continue
-        end
-        (flags == mine || flags in seen) && continue
-        push!(seen, flags)
-        push!(configs, args => flags)
+        # Only julia arguments reach the cache key. A profile with preferences runs
+        # in a project of its own, which `configs` cannot carry; it gets a call of
+        # its own below.
+        (isempty(prof.julia_args) || haskey(run.profile_projects, prof.name)) && continue
+        flags = profile_flags(prof)
+        (flags === nothing || flags in last.(configs)) && continue
+        push!(configs, Cmd(prof.julia_args) => flags)
         push!(names, String(prof.name))
     end
-    for prof in values(p.profiles)
-        dir = get(run.profile_projects, prof.name, nothing)
-        dir === nothing && continue
-        precompile_profile_project(run, prof, dir)
+    # One call each: a project is part of a cache's identity, so two profiles with
+    # different preferences are two environments, not two configurations of one.
+    for (name, dir) in run.profile_projects
+        prof = p.profiles[findfirst(q -> q.name === name, p.profiles)]
+        flags = profile_flags(prof)
+        flags === nothing && continue
+        say(run, "precompiling the test environment for profile ", name)
+        precompile_configs(run, Cmd(prof.julia_args) => flags, joinpath(dir, "Project.toml"), "profile `$name`")
     end
-    # Named only when there is something to name. `Pkg` narrates the rest itself,
-    # and says nothing at all when there is nothing to do, which is what this line
-    # would have to work out for itself to avoid printing on every cached run.
-    isempty(names) || printline(
-        run, string(
-            yatf_prefix(), "precompiling the test environment for ",
-            plural(length(names), "profile"), ": ", join(names, ", ")
-        )
-    )
+    # Named only when there is something to name: `Pkg` narrates the rest, and says
+    # nothing when there is nothing to do.
+    isempty(names) || say(run, "precompiling the test environment for ", plural(length(names), "profile"), ": ", join(names, ", "))
+    precompile_configs(run, configs, Base.active_project(), join(names, ", "))
+    return nothing
+end
+
+# The cache flags a profile's workers will have, or `nothing` — said once — when
+# they cannot be read, in which case the workers compile what they need themselves.
+function profile_flags(prof::Profile)
+    return try
+        isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(Cmd(prof.julia_args))
+    catch e
+        e isa InterruptException && rethrow()
+        @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
+               workers will compile what they need themselves" exception = e
+        nothing
+    end
+end
+
+# One `Pkg.precompile` in `project`. Work brought forward, not work that has to
+# succeed: a worker that finds nothing cached still compiles what it needs, one
+# process at a time. `Pkg` draws its own progress by moving the cursor, so ours
+# comes down while it does.
+function precompile_configs(run::Run, configs, project, what::AbstractString)
+    original = Base.active_project()
     try
-        # `Pkg` draws its own progress by moving the cursor, so ours comes down.
         with_status_line_off(run.monitor) do
+            Base.set_active_project(project)
             Pkg.precompile(
                 Pkg.Types.Context(), Pkg.Types.PackageSpec[];
                 configs, warn_loaded = false, already_instantiated = true, io = stdout
@@ -657,46 +656,8 @@ function precompile_env(run::Run, p::Plan)
         end
     catch e
         e isa InterruptException && rethrow()
-        # Work brought forward, not work that has to succeed: a worker that finds
-        # nothing cached still compiles what it needs, one process at a time.
-        @warn "YATF: could not precompile the test environment for \
-               $(join(names, ", ")); its workers will compile what they need \
-               themselves" exception = e
-    end
-    return nothing
-end
-
-# One call each, because a project is part of a cache's identity and `configs`
-# only carries julia arguments: two profiles with different preferences are two
-# environments, not two configurations of one.
-function precompile_profile_project(run::Run, prof::Profile, dir::AbstractString)
-    args = Cmd(prof.julia_args)
-    flags = try
-        isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(args)
-    catch e
-        e isa InterruptException && rethrow()
-        @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
-               workers will compile what they need themselves" exception = e
-        return nothing
-    end
-    printline(
-        run,
-        string(yatf_prefix(), "precompiling the test environment for profile ", prof.name)
-    )
-    original = Base.active_project()
-    try
-        with_status_line_off(run.monitor) do
-            Base.set_active_project(joinpath(dir, "Project.toml"))
-            Pkg.precompile(
-                Pkg.Types.Context(), Pkg.Types.PackageSpec[];
-                configs = args => flags, warn_loaded = false,
-                already_instantiated = true, io = stdout
-            )
-        end
-    catch e
-        e isa InterruptException && rethrow()
-        @warn "YATF: could not precompile the test environment for profile \
-               `$(prof.name)`; its workers will compile what they need themselves" exception = e
+        @warn "YATF: could not precompile the test environment for $what; its workers \
+               will compile what they need themselves" exception = e
     finally
         Base.set_active_project(original)
     end
@@ -713,7 +674,7 @@ function precompile_setups(run::Run, p::Plan, target)
         pkg === nothing || !Base.isprecompiled(pkg)
     end
     isempty(stale) && return nothing
-    printline(run, string(yatf_prefix(), "precompiling ", join(stale, ", ")))
+    say(run, "precompiling ", join(stale, ", "))
     for name in stale
         pkg = Base.identify_package(String(name))
         if pkg === nothing
@@ -724,10 +685,8 @@ function precompile_setups(run::Run, p::Plan, target)
                 )
             )
         end
-        # Julia writes the reason a module would not precompile to the stream it
-        # is given, and throws an exception that says only that it failed. Both
-        # halves are needed to act on it, so the output is captured and reported
-        # with the failure rather than left somewhere above it.
+        # Julia writes why a module would not precompile to the stream it is given,
+        # and throws an exception saying only that it failed; both go in the error.
         out = IOBuffer()
         try
             Base.compilecache(pkg, out, out)
@@ -759,11 +718,14 @@ function run_on_workers(run::Run, target)
                 try
                     run_slot(run, s, target)
                 catch e
-                    e isa InterruptException && (cancel!(run.queues); rethrow())
-                    # This slot is finished, but the run is not: the units it had
-                    # left are still in its queue for the other slots to steal.
-                    # Cancelling everything because one slot fell over is how a
-                    # single bad test item stops a whole suite from running.
+                    if e isa InterruptException
+                        cancel!(run.queues)
+                        record_stopped_item!(run, s)
+                        rethrow()
+                    end
+                    # This slot is finished, not the run: its units stay in its
+                    # queue for the others to steal, so one bad item does not stop
+                    # a suite.
                     @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
                         "left for the other workers" exception = (e, catch_backtrace())
                 end
@@ -774,13 +736,14 @@ function run_on_workers(run::Run, target)
         foreach(wait, tasks)
     catch e
         # Ctrl-C lands in whichever task was running, this one included. Stop
-        # dispatching, and kill the processes rather than wait for them: an item
-        # that sleeps for two minutes would otherwise hold the interrupt for two
-        # minutes. The slot tasks are still waited for, because killing their
-        # workers is what lets them unwind and `shutdown!` must not find a slot
-        # still starting one.
+        # dispatching and kill the processes rather than wait for them, or an item
+        # that sleeps for two minutes holds the interrupt that long. The slot tasks
+        # are still waited for: `shutdown!` must not find a slot starting a worker.
         cancel!(run.queues)
-        e isa InterruptException && kill_workers!(run)
+        if e isa InterruptException
+            kill_workers!(run)
+            interrupt_slots!(tasks)
+        end
         foreach(
             t -> (
                 try
@@ -789,6 +752,58 @@ function run_on_workers(run::Run, target)
             ), tasks
         )
         rethrow()
+    end
+    check_finished(run)
+    return nothing
+end
+
+# Unless the run was stopped, every item ends with an outcome of its own. One that
+# did not is a scheduling bug: said here, with the scheduler's cursors, rather than
+# reported as an item the run never reached.
+function check_finished(run::Run)
+    is_cancelled(run.queues) && return nothing
+    st = run.statuses
+    left = [run.plan.items.name[i] for i in 1:nitems(run.plan) if st.state[i] === UNSEEN || st.state[i] === RUNNING]
+    isempty(left) && return nothing
+    q = run.queues
+    @error "YATF internal error: $(length(left)) test items have no outcome, though the run was not stopped" items = left head = q.head tail = q.tail from = q.from to = q.to slot_pools = q.pool pending = q.pending unclaimed_units = findall(!, q.claimed)
+    return nothing
+end
+
+"""
+    record_stopped_item!(run, slot)
+
+Record the item this slot was running when the run was stopped: it neither failed
+nor finished, and is counted with the items the run never reached.
+"""
+function record_stopped_item!(run::Run, slot::Slot)
+    i = slot.current
+    i == ItemIdx(0) && return nothing
+    # The slot may have recorded it already, on its way out of a dispatch that
+    # failed for a reason of its own.
+    run.statuses.state[i] === UNSEEN || return nothing
+    attempt = max(run.statuses.attempt[i], Int8(1))
+    record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+    return nothing
+end
+
+"""
+    interrupt_slots!(tasks)
+
+Hand the interrupt to each slot task rather than wait for it to notice. Killing
+the workers frees a slot waiting on one and cancelling stops a slot between items,
+but a slot building an environment or held back by the memory guard would wait for
+whatever it is waiting on.
+"""
+function interrupt_slots!(tasks)
+    for t in tasks
+        (t === current_task() || istaskdone(t)) && continue
+        try
+            schedule(t, InterruptException(); error = true)
+        catch
+            # It finished between the two, or was never started: either way there
+            # is nothing left in it to interrupt.
+        end
     end
     return nothing
 end
@@ -802,7 +817,6 @@ function run_slot(run::Run, slot::Slot, target)
         elseif claim.kind === :rebind
             # This slot's own pool is empty and another profile still has work, so
             # the process is replaced instead of the worker cap being exceeded.
-            slot.pool = claim.pool
             slot.profile = run.plan.profiles[run.plan.pools[claim.pool].profile]
             stop_worker!(run, slot)
             continue
@@ -830,30 +844,16 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             YATFWorkers.Worker(;
                 julia_args = prof.julia_args,
                 threads = prof.threads,
-                extra_env = worker_env(run, slot, target),
+                extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, slot.profile.name, Base.active_project()), slot.profile),
                 dir = target.root,
                 project = Base.active_project(),
                 redirect_io = stdout,
-                # Everything a worker says while it is running items: its own
-                # START/DONE lines, which arrive carrying the glyph for how the
-                # item went, and in `logs=:eager` whatever the items print, which
-                # does not.
-                redirect_fn = function (io, pid, line)
-                    mark, at = mark_index(line)
-                    if slot.current == ItemIdx(0)
-                        # Nothing of this worker's is an item's any more. Its own
-                        # verdict for an item the run has already recorded as timed
-                        # out is a pass nobody accepted, and is dropped.
-                        mark == MARK_IDX_ITEM || return nothing
-                        log = slot.dying_log
-                        # A process on its way down: its last words go with the item
-                        # it was running, where the report will pick them up, rather
-                        # than across the middle of the run.
-                        isempty(log) || return append_line(log, line, at)
-                        mark = MARK_IDX_WORKER
-                    end
-                    printline(run, string(slot.prefixes[mark], SubString(line, at)))
-                end
+                # Everything the worker writes: its RUN and DONE records, and under
+                # `logs=:eager` whatever its items print.
+                redirect_fn = let within = Ref(false)
+                    (io, pid, line) -> relay!(run, slot, within, line)
+                end,
+                on_exit = w -> worker_ended!(run, slot.id, w)
             )
         catch e
             e isa InterruptException && rethrow()
@@ -861,11 +861,13 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             attempt <= WORKER_START_RETRIES && sleep(1)
             continue
         end
+        t = time() - run.t0
+        append_event!(run.runstate, EVENT_WORKER_UP, 0, slot.id, w.pid, t, t)
         try
             init_worker!(run, slot, w)
             slot.started_at = time()
             slot.worker_items = 0
-            count_worker_start!(run.monitor)
+            count_worker_start!(run.monitor, slot.id)
             print_worker_line(
                 run, slot.id, "UP", string(
                     "pid ", w.pid, " · threads ", prof.threads,
@@ -909,37 +911,92 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     )
 end
 
-# Opened per line rather than held: this runs only while a worker is dying, a few
-# dozen lines at most, and a handle kept across that window would outlive the
-# item's own writer and have to be closed on every path out of the kill.
-function append_line(path::AbstractString, line::AbstractString, at::Integer)
-    try
-        open(io -> println(io, SubString(line, at)), path, "a")
-    catch e
-        e isa InterruptException && rethrow()
-        # The log is a convenience; losing a line of a dying process's backtrace is
-        # not a reason to disturb the run that is still going.
-    end
+# Held rather than appended as they arrive: the worker still has that log open, and
+# two processes appending to one file keep separate offsets and overwrite each
+# other (measured: lines lost and cut in half). Capped, because a process can print
+# without limit on its way down.
+const MAX_DYING_LINES = 500
+
+function keep_dying_line!(slot::Slot, line::AbstractString)
+    length(slot.dying_lines) < MAX_DYING_LINES && push!(slot.dying_lines, String(line))
     return nothing
 end
 
-function worker_env(run::Run, slot::Slot, target)
-    pathsep = Sys.iswindows() ? ";" : ":"
-    env = Pair{String, String}[
-        "YATF_RUN_ID" => run.runid,
-        "YATF_WORKER" => string(slot.id),
-        "JULIA_LOAD_PATH" => join(LOAD_PATH, pathsep),
-    ]
-    # Stated rather than left to the worker to infer. A worker inherits this
-    # process's environment, so a `JULIA_PROJECT` the caller happened to have set
-    # would otherwise be the project its items resolve against — and the test
-    # environment this run just built, holding the package under test and its test
-    # dependencies, would be the one thing the items could not see.
-    proj = get(run.profile_projects, slot.profile.name, nothing)
-    proj === nothing && (proj = Base.active_project())
-    proj === nothing || push!(env, "JULIA_PROJECT" => proj)
-    append!(env, slot.profile.env)
-    return env
+"""
+    relay!(run, slot, within, line)
+
+One line of what a worker wrote. Its records of an item starting and finishing
+become the item's RUN and DONE lines; anything else is the item talking, between a
+RUN and its DONE, or the process itself. `within` follows the worker's own stream,
+so it never races with the slot's task. While the process is being put down for a
+timeout, the item is already recorded as timed out: a verdict it still manages to
+send is dropped, and what it says goes with the item's log.
+"""
+function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::AbstractString)
+    rec = parse_record(line)
+    if !isempty(slot.dying_log)
+        rec === nothing && keep_dying_line!(slot, line)
+        return nothing
+    end
+    if rec !== nothing
+        within[] = rec.how === nothing
+        return printline(run, item_line(run, slot.id, rec.i, rec.attempt, rec.how))
+    end
+    return printline(run, string(MARK_INDENT, within[] ? MARK_ITEM : MARK_WORKER, " w", slot.id, FIELD, line))
+end
+
+# An item's RUN or DONE line, drawn from what this run knows about the item.
+item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
+    slot_id, i, nitems(run.plan), run.plan.items.name[i], run.name_width, attempt,
+    attempts_for(run.plan, run.plan.items.unit[i]), something(how, run.plan.locations[i])
+)
+
+"""
+    flush_dying_log!(slot)
+
+Put what the worker said while being taken down into the log of the item it was
+running. Called once the process is gone and its relay task joined, so this is the
+file's only writer.
+"""
+function flush_dying_log!(slot::Slot)
+    path = slot.dying_log
+    slot.dying_log = ""
+    if !isempty(path) && !isempty(slot.dying_lines)
+        try
+            open(path, "a") do io
+                for l in slot.dying_lines
+                    println(io, l)
+                end
+            end
+        catch e
+            e isa InterruptException && rethrow()
+            # The log is a convenience; losing a dying process's backtrace is not
+            # a reason to disturb the run that is still going.
+        end
+    end
+    empty!(slot.dying_lines)
+    return nothing
+end
+
+# A worker's environment beyond the coordinator's own: the run and slot it belongs
+# to, the load path as it is now (the setups directory included), the project its
+# items resolve against, and the profile's own variables. The project is stated
+# rather than inherited: a `JULIA_PROJECT` the caller happened to have set would
+# otherwise win over the test environment this run just built.
+function worker_env(run_id, slot_id, project, prof::Profile)
+    env = ["YATF_RUN_ID" => string(run_id), "YATF_WORKER" => string(slot_id), "JULIA_LOAD_PATH" => join(LOAD_PATH, PATHSEP)]
+    project === nothing || push!(env, "JULIA_PROJECT" => project)
+    return append!(env, prof.env)
+end
+
+# Every worker's end is recorded once, by the task that sees its process exit,
+# whichever way it went: closed by the run, killed, or dead on its own.
+function worker_ended!(run::Run, slot::Integer, w::YATFWorkers.Worker)
+    t = time() - run.t0
+    p = w.process
+    append_event!(run.runstate, EVENT_WORKER_DOWN, worker_end_code(w.ended_by), slot, w.pid, t, t;
+        exitcode = p.exitcode, signal = p.termsignal)
+    return nothing
 end
 
 function init_worker!(run::Run, slot::Slot, w::YATFWorkers.Worker)
@@ -949,7 +1006,7 @@ function init_worker!(run::Run, slot::Slot, w::YATFWorkers.Worker)
     fut = YATFWorkers.remote_eval(w, Expr(:block, init.args...))
     fetch_within(
         fut, timeout,
-        TimeoutException(timeout, "the `init` expression of profile `$(slot.profile.name)`")
+        TimeoutException(timeout, "the `init` expression of profile `$(slot.profile.name)`", "", "init_timeout")
     )
     return nothing
 end
@@ -965,24 +1022,85 @@ function stop_worker!(run::Run, slot::Slot)
     catch e
         @error "YATF: could not stop worker $(w.pid)" exception = (e, catch_backtrace())
     end
+    p = w.process
+    status = !process_exited(p) ? " · still running" :
+        p.exitcode == 0 && p.termsignal == 0 ? "" : string(" · ", YATFWorkers.exit_description(p))
     print_worker_line(
-        run, slot.id, "EXIT", string(
-            "pid ", w.pid, " · ",
-            plural(ran, "item"), " · ", fmt_seconds(alive)
-        )
+        run, slot.id, "EXIT", string("pid ", w.pid, " · ", plural(ran, "item"), " · ", fmt_seconds(alive), status)
     )
+    return nothing
+end
+
+# How a worker that was not asked to stop came to an end: its exit status, and
+# what memory looked like when it was last seen, which is most of what an OOM kill
+# leaves behind.
+function died_how(run::Run, slot::Slot, w::YATFWorkers.Worker)
+    how = YATFWorkers.exit_description(w.process)
+    by = w.ended_by
+    alone = by === :connection_lost || by === :process_exit
+    if alone && w.process.termsignal == 9
+        how *= ", which nothing in this run sent: usually the out-of-memory killer"
+    elseif by === :memory_guard
+        how *= ", stopped by the memory guard"
+    elseif !alone
+        how *= string(", stopped after ", replace(String(by), '_' => ' '))
+    end
+    return string(how, memory_note(run.monitor, slot.id))
+end
+
+"""
+    LIVE_RUN
+
+The run this process is part-way through, or nothing. A process runs one at a
+time, and [`report_unfinished_run`](@ref) is the only reader.
+"""
+const LIVE_RUN = Ref{Any}(nothing)
+
+# Registered when a run reaches its test phase; a process that never gets that far
+# has nothing to say at exit.
+const ensure_exit_report = OncePerProcess{Nothing}() do
+    atexit(report_unfinished_run)
+    nothing
+end
+
+"""
+    report_unfinished_run()
+
+Close the books on a run whose process is going down without unwinding. Julia 1.12
+delivers an interrupt to whichever task its first thread is running, which between
+items is a finished one that cannot catch it, so no `finally` runs; a test item
+calling `exit` ends the same way. Best effort: the printer is taken with `trylock`,
+so a line of output cannot hang the exit.
+"""
+function report_unfinished_run()
+    run = LIVE_RUN[]
+    run === nothing && return nothing
+    LIVE_RUN[] = nothing
+    try
+        stop_monitor!(run.monitor)
+        cancel!(run.queues)
+        # Nothing unwound, so the slots never recorded what they were holding.
+        # They are frozen where they were, and each still names its item.
+        foreach(slot -> record_stopped_item!(run, slot), run.slots)
+        finish_run_state!(run.runstate; cancelled = true)
+        if trylock(run.printer)
+            try
+                print_conclusion(run, true)
+            finally
+                unlock(run.printer)
+            end
+        end
+    catch
+    end
     return nothing
 end
 
 """
     kill_workers!(run)
 
-Kill every worker this run has, immediately.
-
-The orderly teardown gives each process seconds to leave on its own, which across
-a pool is most of a minute — a long time to hold a terminal someone has just asked
-for back. Nothing is reported for what they were running: the run is being
-abandoned, not finished.
+Kill every worker this run has, now: the orderly teardown takes most of a minute
+across a pool, a long time to hold a terminal someone has asked for back. Nothing
+is reported for what they were running.
 """
 function kill_workers!(run::Run)
     live = 0
@@ -993,9 +1111,7 @@ function kill_workers!(run::Run)
         live += 1
         YATFWorkers.kill!(w)
     end
-    live == 0 || printline(
-        run, string(yatf_prefix(), "interrupted; killed ", plural(live, "worker"))
-    )
+    live == 0 || say(run, "interrupted; killed ", plural(live, "worker"))
     return nothing
 end
 
@@ -1006,26 +1122,22 @@ function shutdown!(run::Run)
     return nothing
 end
 
-# `what` is the pieces rather than the sentence: one of these is built for every
-# dispatch and almost none of them is ever shown.
+# The pieces rather than the sentence: one of these is built for every dispatch and
+# almost none of them is ever shown. `setting` is what set the limit, so a report
+# says which knob to turn.
 struct TimeoutException <: Exception
     seconds::Int
     kind::String
     subject::String
+    setting::String
 end
 
-TimeoutException(seconds::Integer, kind::AbstractString) =
-    TimeoutException(Int(seconds), String(kind), "")
+TimeoutException(seconds::Integer, kind::AbstractString, subject::AbstractString, setting::AbstractString) =
+    TimeoutException(Int(seconds), String(kind), String(subject), String(setting))
 
 Base.showerror(io::IO, e::TimeoutException) = print(
     io, e.kind, isempty(e.subject) ? "" : string(" ", repr(e.subject)),
-    " timed out after ", e.seconds, " seconds"
-)
-
-# The same words, without "seconds" spelled out, for a one-line report.
-timeout_text(e::TimeoutException) = string(
-    e.kind, isempty(e.subject) ? "" : string(" ", repr(e.subject)),
-    " timed out after ", e.seconds, "s"
+    " timed out after ", e.seconds, "s (", e.setting, ")"
 )
 
 # An item's own keyword wins over the run default, the same way `timeout` and
@@ -1035,22 +1147,22 @@ attempts_for(p::Plan, u::UnitIdx) = 1 + maximum(p.units.span[u]) do i
     p.items.retries[i] == USE_RUN_DEFAULT ? p.cfg.retries : Int(p.items.retries[i])
 end
 
+# The attempt policy, the same wherever the unit runs: on a pool worker, on a
+# sandbox worker, or in this process under `workers=0`.
 function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
     p = run.plan
-    span = p.units.span[u]
-    # An item's own keyword wins over the run default, the same way `timeout` and
-    # `failfast` do. A chain is retried as a unit, so the most demanding member
-    # sets the number of attempts.
     max_attempts = attempts_for(p, u)
     for attempt in 1:max_attempts
-        outcome = run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
-        outcome === :done && return nothing
+        broken = run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
+        has_non_pass(run, u) || return nothing
         if attempt == max_attempts
-            # Out of attempts. A unit cut short by a dead worker leaves items that
-            # never ran: for a chain the state they relied on is gone, so they are
-            # recorded as broken rather than run on a cold worker or passed over.
-            outcome === :broken && mark_remaining_broken!(run, u, Int8(attempt))
-            p.cfg.failfast && has_non_pass(run, u) && cancel!(run.queues)
+            # Out of attempts. A chain cut short by a dead worker has lost the state
+            # its remaining items relied on, so they are recorded as broken.
+            broken && mark_remaining_broken!(run, u, Int8(attempt))
+            # Failfast waits for the last attempt: stopping the run under a retry
+            # would record the failure as a cancellation.
+            p.cfg.failfast && cancel!(run.queues) === false &&
+                print_failfast(run, first(p.units.span[u]))
             return nothing
         end
         # Retrying a chain restarts it from its first item: re-running one item of
@@ -1070,61 +1182,95 @@ function reset_unit!(run::Run, u::UnitIdx)
     return nothing
 end
 
-# `:done` when everything passed, `:retry` when something did not, `:broken` when
-# the worker died part way through the unit.
+# One attempt at every item of a unit: on the slot's worker, or here when there is
+# no pool and the unit did not ask for a process of its own. `true` when a worker
+# was lost part way through, which leaves the rest of the unit unable to run.
 function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8, max_attempts::Int)
     p = run.plan
-    span = p.units.span[u]
     exclusive = p.units.exclusive[u]
-    # A sandbox is a process to itself. The slot can arrive here holding a worker
-    # that has already run other items — its own queue drained and it stole this
-    # unit — and that process is not the one the unit asked for.
+    attempt_item! = single_process(p) && !needs_worker(p, u) ? attempt_here! : attempt_on_worker!
+    # A sandbox is a process to itself, and the slot may arrive holding a worker
+    # that has already run other items.
     exclusive && slot.worker_items > 0 && stop_worker!(run, slot)
-    for i in span
-        is_cancelled(run.queues) && (record_cancelled!(run, i); continue)
-        w = try
-            ensure_worker!(run, slot, target, exclusive)
-        catch e
-            e isa InterruptException && rethrow()
-            record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
-            return :broken
-        end
-        spec = item_spec(run, i, slot, attempt, max_attempts)
-        timeout = item_timeout(p, i)
-        # Mark it running before dispatching: if this process is killed, the file
-        # says which item was in flight, which is the truth and usually the answer.
-        write_status!(run.runstate, i, RUNNING, attempt, slot.id; start_off = time() - run.t0)
-        slot.current = i
-        result = try
-            dispatch(run, w, spec, timeout, slot)
-        catch e
-            slot.current = ItemIdx(0)
-            e isa InterruptException && rethrow()
-            if handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts) === :broken
-                return :broken   # the worker is gone; the rest of this unit cannot be trusted
-            end
-            continue   # an ordinary error on a live worker; `has_non_pass` decides what happens next
-        end
-        slot.current = ItemIdx(0)
-        slot.worker_items += 1
-        record_result!(run, i, slot, attempt, result, max_attempts)
+    for i in p.units.span[u]
+        # Every item is unseen when the loop reaches it: `reset_unit!` puts them
+        # back before each retry.
+        is_cancelled(run.queues) && (run.statuses.state[i] = CANCELLED; continue)
+        attempt_item!(run, slot, i, target, attempt, max_attempts) || return true
     end
     exclusive && stop_worker!(run, slot)
-    slot.units_started += 1
-    if has_non_pass(run, u)
-        p.cfg.failfast && cancel!(run.queues) === false && print_failfast(run, first(span))
-        return :retry
-    end
-    return :done
+    return false
 end
 
-# The item, then the profile's test-end expression: two requests to the same
-# process, each against its own limit. An item's timeout is for the item, and a
-# profile whose test-end expression hangs must not be reported as an item that
-# hung. Most profiles have no test-end expression and send one request.
+# When and in which process an attempt began, marked running before it is sent:
+# if this process is killed, the file says which item was in flight, which is the
+# truth and usually the answer. An outcome the run decides is timed from here.
+function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer)
+    st = run.statuses
+    st.start[i] = Float32(time() - run.t0)
+    st.pid[i] = Int32(pid)
+    pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
+    return nothing
+end
+
+# One attempt at item `i` on the slot's worker, starting one when it has none.
+# `false` when the worker is gone and the rest of its unit cannot be trusted.
+function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::Int8, max_attempts::Int)
+    p = run.plan
+    w = try
+        ensure_worker!(run, slot, target, p.units.exclusive[p.items.unit[i]])
+    catch e
+        e isa InterruptException && rethrow()
+        began!(run, i, slot.id, attempt, 0)
+        record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
+        return false
+    end
+    spec = item_spec(run, i, slot, attempt)
+    began!(run, i, slot.id, attempt, w.pid)
+    slot.current = i
+    result = try
+        dispatch(run, w, spec, item_timeout(p, i), slot)
+    catch e
+        # An interrupt leaves it set: the slot is unwinding, and what it was
+        # running is the one thing `record_stopped_item!` needs from it.
+        e isa InterruptException && rethrow()
+        slot.current = ItemIdx(0)
+        return handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
+    end
+    slot.current = ItemIdx(0)
+    slot.worker_items += 1
+    record_result!(run, i, slot, attempt, result, max_attempts)
+    return true
+end
+
+# One attempt at item `i` in this process. There is no second process to kill, so
+# nothing times out, and no worker to lose, so the unit always goes on.
+function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_attempts::Int)
+    spec = item_spec(run, i, slot, attempt)
+    began!(run, i, slot.id, attempt, getpid())
+    printline(run, item_line(run, nothing, i, attempt, nothing))
+    res = try
+        r = run_item(spec)
+        printline(run, item_line(run, nothing, i, attempt, outcome(r)))
+        with_test_end(r, spec, slot.profile.test_end)
+    catch e
+        e isa InterruptException && rethrow()
+        record_error!(
+            run, i, slot, attempt, ERRORED,
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)))
+        )
+        return true
+    end
+    record_result!(run, i, slot, attempt, res, max_attempts)
+    return true
+end
+
+# The item, then the profile's `test_end`: two requests to one process, each
+# against its own limit, so a `test_end` that hangs is not reported as an item that
+# hung. Most profiles have no `test_end` and send one request.
 function dispatch(run::Run, w::YATFWorkers.Worker, spec::ItemSpec, timeout::Int, slot::Slot)
     fut = YATFWorkers.remote_run(w, spec)
-    res = fetch_within(fut, timeout, TimeoutException(timeout, "test item", spec.name))::ItemResult
+    res = fetch_within(fut, timeout, TimeoutException(timeout, "test item", spec.name, timeout_setting(run.plan, spec.index)))::ItemResult
     test_end = slot.profile.test_end
     (isempty(test_end.args) || res.state === SKIPPED) && return res
     seconds = run.plan.cfg.test_end_timeout_s
@@ -1132,7 +1278,7 @@ function dispatch(run::Run, w::YATFWorkers.Worker, spec::ItemSpec, timeout::Int,
     endres = try
         fetch_within(
             endfut, seconds,
-            TimeoutException(seconds, "the `test_end` expression of profile `$(slot.profile.name)`")
+            TimeoutException(seconds, "the `test_end` expression of profile `$(slot.profile.name)`", "", "test_end_timeout")
         )::ItemResult
     catch e
         # The item ran; it is the profile's own code that did not come back. Saying
@@ -1153,10 +1299,8 @@ Base.showerror(io::IO, e::TestEndFailure) = print(
     sprint(showerror, e.cause)
 )
 
-# A test-end expression that recorded nothing leaves the item's result alone. One
-# that failed becomes a testset nested in the item's, which is where a reader
-# looking at why the item did not pass will find it. The item's own timings stay
-# the item's: what the expression cost is not what the test cost.
+# A `test_end` that recorded nothing leaves the item's result alone; one that failed
+# becomes a testset nested in the item's. The item's timings stay the item's.
 function merge_test_end(res::ItemResult, endres::ItemResult)
     isempty(endres.testset.results) && return res
     push!(res.testset.results, endres.testset)
@@ -1166,14 +1310,10 @@ end
 
 severity(s::ItemState) = s === ERRORED ? 2 : s === FAILED ? 1 : 0
 
-# `fetch(fut)`, or throw `on_timeout` once `seconds` have passed without a reply.
-#
-# The timer closes the future's own channel, so there is no second channel and no
-# task to shuttle between them — this runs once per dispatch, and a channel, a
-# task and a timer is a dozen allocations for a wait. A reply that arrives before
-# the timer fires is buffered in that channel, and `fetch` returns a buffered
-# value whether or not the channel has since been closed, so the race between a
-# reply and its deadline resolves to the reply.
+# `fetch(fut)`, or throw `on_timeout` once `seconds` pass without a reply. The timer
+# closes the future's own channel, so there is no second channel or task per
+# dispatch. A reply that arrived first is buffered, and `fetch` returns a buffered
+# value even from a closed channel, so a reply racing its deadline wins.
 function fetch_within(fut, seconds::Real, on_timeout::Exception)
     timer = Timer(seconds) do _
         close(fut.value, on_timeout)
@@ -1185,7 +1325,8 @@ function fetch_within(fut, seconds::Real, on_timeout::Exception)
     end
 end
 
-# `:broken` when the worker is gone, `:failed` when it is still usable.
+# Whether the worker survived: `false` when it is gone and the rest of the unit
+# cannot be trusted, `true` when the item failed on a process still fit to use.
 function handle_dispatch_failure!(
         run::Run, slot::Slot, i::ItemIdx, attempt::Int8, e,
         max_attempts::Int
@@ -1193,12 +1334,9 @@ function handle_dispatch_failure!(
     w = slot.worker
     item = run.plan.items.name[i]
     if e isa TimeoutException
+        ended = time()   # the item held its worker until here; inspecting it is ours
         if w !== nothing
-            print_worker_line(
-                run, slot.id, "KILL", string(
-                    "pid ", w.pid, " · ", timeout_text(e)
-                )
-            )
+            print_worker_line(run, slot.id, "KILL", string("pid ", w.pid, " · ", sprint(showerror, e)))
             YATFWorkers.inspect!(w)   # where was it: every thread's and task's backtrace, into the item's log
             # `wait` below joins the task relaying this worker's output, so
             # everything the process says on its way down has been filed by the
@@ -1206,62 +1344,73 @@ function handle_dispatch_failure!(
             slot.dying_log = item_log_path(run.logprefix, i, attempt)
             YATFWorkers.terminate!(w, :timeout)
             wait(w)   # a replacement must not overlap the process it replaces
-            slot.dying_log = ""
+            flush_dying_log!(slot)
         end
         slot.worker = nothing
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
-            string(timeout_text(e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)))
+            string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)));
+            ended
         )
-        return :broken
+        return false
     elseif w !== nothing && !w.terminated
         # The request failed but the process is fine: a result that would not
         # serialize, a `skip` expression that threw. The worker keeps everything
         # it has compiled, and the item is an ordinary error.
         record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
-        return :failed
+        return true
     else
+        ended = time()
+        how = ""
         if w !== nothing
-            print_worker_line(
-                run, slot.id, "LOST", string(
-                    "pid ", w.pid, " · exited while running ",
-                    repr(item)
-                )
-            )
-            wait(w)
+            wait(w)   # its exit status is known once its process is reaped
+            how = died_how(run, slot, w)
+            print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
         end
         slot.worker = nothing
-        record_error!(
-            run, i, slot, attempt, ERRORED,
-            string(
-                e isa YATFWorkers.WorkerTerminatedException ?
-                    "the worker running this item died" : sprint(showerror, e),
-                " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues))
+        # A stopped run took this worker away itself: the item neither failed nor
+        # ran, and is counted with the ones that never started.
+        if is_cancelled(run.queues)
+            record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped"; ended)
+        else
+            record_error!(
+                run, i, slot, attempt, ERRORED,
+                string(
+                    e isa YATFWorkers.WorkerTerminatedException ?
+                        string("the worker running this item died: ", how) : sprint(showerror, e),
+                    " · ", retry_note(attempt, max_attempts, false)
+                );
+                ended
             )
-        )
-        return :broken
+        end
+        return false
     end
 end
 
-function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, attempts::Int)
+function item_spec(run::Run, i::ItemIdx, slot::Slot, attempt::Int8)
     p = run.plan
-    # One string rather than a name and a `joinpath` over it. The directory is
-    # this run's own and (item, attempt) is unique within it, so nothing can be
-    # there already and there is nothing to clear away first.
+    # The directory is this run's own and (item, attempt) is unique within it, so
+    # nothing is there to clear first.
     logpath = p.cfg.logs === :eager ? "" : item_log_path(run.logprefix, i, attempt)
-    file = p.files[p.items.fileidx[i]]
     return ItemSpec(
-        i, ItemIdx(nitems(p)), p.items.name[i], file, p.items.line[i],
-        itemlocation(p, i),
+        i, p.items.name[i], p.files[p.items.fileidx[i]], p.items.line[i],
         p.items.code[i], p.items.skip[i],
         p.items.failfast[i] == -1 ? p.cfg.item_failfast : p.items.failfast[i] == 1,
-        run.project_name, slot.profile.name, attempt, Int8(clamp(attempts, 1, 127)),
-        p.cfg.full_stacktraces, logpath, run.name_width
+        run.project_name, slot.profile.name, attempt, p.cfg.full_stacktraces, logpath,
+        item_seed(p.cfg.seed, p.items.name[i])
     )
 end
 
+# The run's seed and the item's name, mixed so that each item draws its own numbers
+# whatever ran before it in the same process. CRC32c rather than `hash`, which may
+# change between Julia versions and would make a recorded seed mean something else.
+item_seed(seed::UInt64, name::AbstractString) = seed ⊻ (UInt64(crc32c(name)) * 0x9e3779b97f4a7c15)
+
 item_timeout(p::Plan, i::ItemIdx) =
     p.items.timeout_s[i] == USE_RUN_DEFAULT ? p.cfg.timeout_s : Int(p.items.timeout_s[i])
+
+timeout_setting(p::Plan, i::Integer) =
+    p.items.timeout_s[i] == USE_RUN_DEFAULT ? "the run's timeout" : string("its own timeout=", p.items.timeout_s[i])
 
 ### Recording ##############################################################
 
@@ -1277,74 +1426,73 @@ function retry_note(attempt::Integer, max_attempts::Integer, cancelled::Bool)
     return string("no retries left (", retries, " of ", retries, " used)")
 end
 
+"""
+    record!(run, i, slot, attempt, state, testset, stats, synthetic, note)
+
+Everything that follows from one attempt's outcome, in one place: the item's
+status in memory and on disk, the count of finished items, and the item's report.
+`synthetic` says the run decided the outcome rather than the item — a timeout, a
+dead worker, a chain cut short — and `testset` then holds a single error saying so.
+"""
+function record!(
+        run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, state::ItemState,
+        testset::Test.AbstractTestSet, stats::YATFWorkers.PerfStats, synthetic::Bool,
+        note::AbstractString; ended::Float64 = time()
+    )
+    (state === UNSEEN || state === RUNNING) && error("YATF internal error: item $i recorded as $state")
+    st = run.statuses
+    st.state[i] = state
+    st.synthetic[i] = synthetic
+    st.attempt[i] = attempt
+    st.slot[i] = slot
+    # An outcome the item reported took what the item measured; one the run decided
+    # took as long as the item held its worker.
+    st.elapsed[i] = synthetic ? max(0.0, ended - run.t0 - st.start[i]) : stats.elapsed_ns / 1.0e9
+    st.compile[i] = stats.compile_ns / 1.0e9
+    st.testsets[i] = testset
+    write_status!(
+        run.runstate, i, state, attempt, slot;
+        start_off = st.start[i], elapsed = st.elapsed[i], compile = st.compile[i],
+        recompile = stats.recompile_ns / 1.0e9, alloc_mb = stats.bytes / 2^20,
+        peak_rss_mb = stats.maxrss / 2^20, pid = st.pid[i]
+    )
+    append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0; item = i, attempt)
+    report_item!(run, i, state, count_done!(run, i), note)
+    return nothing
+end
+
 function record_result!(
         run::Run, i::ItemIdx, slot::Slot, attempt::Int8, res::ItemResult,
         max_attempts::Int = 1
     )
-    st = run.statuses
-    st.synthetic[i] = false
-    st.state[i] = res.state
-    st.attempt[i] = attempt
-    st.slot[i] = slot.id
-    st.elapsed[i] = res.stats.elapsed_ns / 1.0e9
-    st.compile[i] = res.stats.compile_ns / 1.0e9
-    st.testsets[i] = res.testset
-    st.start[i] = Float32(time() - run.t0 - st.elapsed[i])
-    write_status!(
-        run.runstate, i, res.state, attempt, slot.id;
-        start_off = st.start[i],
-        elapsed = st.elapsed[i], compile = st.compile[i],
-        recompile = res.stats.recompile_ns / 1.0e9,
-        alloc_mb = res.stats.bytes / 2^20
-    )
-    n = count_done!(run, i)
     # Only worth saying when there is a policy to state: a plain failure with no
     # retries configured explains itself.
     note = (is_non_pass(res.state) && max_attempts > 1) ?
         retry_note(attempt, max_attempts, is_cancelled(run.queues)) : ""
-    report_item!(run, i, res.state, n, note)
+    record!(run, i, slot.id, attempt, res.state, res.testset, res.stats, false, note)
     return nothing
 end
 
-# `Test.Error` renders its message from the exception stack, not from the value,
-# so a synthesized error needs one or it prints an empty "Got exception" and
-# nothing else.
-exception_stack(msg::AbstractString) =
-    Base.ExceptionStack([(exception = ErrorException(msg), backtrace = Ptr{Nothing}[])])
+record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString; ended::Float64 = time()) =
+    record!(run, i, slot.id, attempt, state, error_testset(run, i, msg, ended), YATFWorkers.PerfStats(), true, msg; ended)
 
-function record_error!(run::Run, i::ItemIdx, slot::Slot, attempt::Int8, state::ItemState, msg::AbstractString)
+# The testset of an outcome the run decided: one error saying why, at the item's
+# own line, so the summary and the verdict count it like any other error.
+function error_testset(run::Run, i::ItemIdx, msg::AbstractString, ended::Float64)
     p = run.plan
-    ts = Test.DefaultTestSet(p.items.name[i])
-    # `Test.record` prints an error where it is recorded. The run prints this one
-    # itself, in the item's own block, so it must not also appear here on its own.
-    with_testset_printing(false) do
-        Test.record(
-            ts, Test.Error(
-                :nontest_error, Expr(:tuple), ErrorException(msg),
-                exception_stack(msg),
-                LineNumberNode(Int(p.items.line[i]), p.files[p.items.fileidx[i]])
-            )
-        )
-    end
-    finish_quietly(ts)
-    st = run.statuses
-    st.state[i] = state
-    st.synthetic[i] = true
-    st.attempt[i] = attempt
-    st.slot[i] = slot.id
-    st.testsets[i] = ts
-    st.start[i] = Float32(time() - run.t0)
-    write_status!(run.runstate, i, state, attempt, slot.id; start_off = st.start[i])
-    n = count_done!(run, i)
-    report_item!(run, i, state, n, msg)
-    return nothing
+    ts = started_testset(p.items.name[i]; verbose = false, at = run.t0 + run.statuses.start[i])
+    finish_quietly(add_error!(ts, msg, source_of(p, i)))
+    finished_at!(ts, ended)
+    return ts
 end
 
 # A retried item is finished once, however many attempts it took.
 function count_done!(run::Run, i::ItemIdx)
     run.statuses.counted[i] && return @atomic run.ndone
     run.statuses.counted[i] = true
-    return @atomic run.ndone += 1
+    n = @atomic run.ndone += 1
+    n <= nitems(run.plan) || error("YATF internal error: $n items counted as finished, of $(nitems(run.plan))")
+    return n
 end
 
 function finish_quietly(ts::Test.AbstractTestSet)
@@ -1360,35 +1508,18 @@ function finish_quietly(ts::Test.AbstractTestSet)
     return ts
 end
 
-function record_cancelled!(run::Run, i::ItemIdx)
-    run.statuses.state[i] === UNSEEN && (run.statuses.state[i] = CANCELLED)
-    return nothing
-end
-
 function mark_remaining_broken!(run::Run, u::UnitIdx, attempt::Int8)
     p = run.plan
     for i in p.units.span[u]
         run.statuses.state[i] === UNSEEN || continue
-        ts = Test.DefaultTestSet(p.items.name[i])
-        with_testset_printing(false) do
-            chain_msg = "the worker running this chain died before this item ran; " *
-                "the state it depended on is gone, so it was not run"
-            Test.record(
-                ts, Test.Error(
-                    :nontest_error, Expr(:tuple), ErrorException(chain_msg),
-                    exception_stack(chain_msg),
-                    LineNumberNode(Int(p.items.line[i]), p.files[p.items.fileidx[i]])
-                )
-            )
-        end
-        finish_quietly(ts)
-        run.statuses.state[i] = BROKEN_CHAIN
-        run.statuses.synthetic[i] = true
-        run.statuses.attempt[i] = attempt
-        run.statuses.testsets[i] = ts
-        write_status!(run.runstate, i, BROKEN_CHAIN, attempt, SlotIdx(0))
-        report_item!(
-            run, i, BROKEN_CHAIN, count_done!(run, i),
+        began!(run, i, SlotIdx(0), attempt, 0)
+        ts = error_testset(
+            run, i, "the worker running this chain died before this item ran; " *
+                "the state it depended on is gone, so it was not run", time()
+        )
+        # Slot 0: in this attempt the item never ran anywhere.
+        record!(
+            run, i, SlotIdx(0), attempt, BROKEN_CHAIN, ts, YATFWorkers.PerfStats(), true,
             "the worker running this chain died before this item ran"
         )
     end
@@ -1402,81 +1533,26 @@ function run_in_process(run::Run, target)
     isempty(p.profiles[1].init.args) ||
         @warn "YATF: the profile's `init` expression is evaluated in this process (workers=0)"
     Core.eval(Main, Expr(:block, p.profiles[1].init.args...))
-    # The items run here, so their own lines have to go through the printer like
-    # everything else this process writes.
-    YATFWorkers.LOG_SINK[] = function (line)
-        mark, at = mark_index(line)
-        printline(run, string(SOLO_PREFIXES[mark], SubString(line, at)))
-    end
-    try
-        run_in_process_items(run, target)
-    finally
-        YATFWorkers.LOG_SINK[] = nothing
-    end
-    return nothing
-end
-
-function run_in_process_items(run::Run, target)
-    p = run.plan
     slot = run.slots[1]
     # Every unit, not just the one slot's queue: a pool that would have had a
     # worker of its own has none here, and its items still have to run.
     for u in UnitIdx(1):UnitIdx(length(p.units))
         is_cancelled(run.queues) && break
-        if needs_worker(p, u)
-            # A sandbox is a process, so this one gets a process — the same path a
-            # pooled run takes, with the worker started and stopped around it.
-            slot.pool = p.units.profile[u]
-            slot.profile = p.profiles[p.units.profile[u]]
-            try
-                run_unit!(run, slot, u, target)
-            finally
-                stop_worker!(run, slot)
-            end
-        else
-            # The same attempt policy as a worker run: an item's own `retries`
-            # wins over the run default, and a chain is retried from its first item.
-            max_attempts = attempts_for(p, u)
-            for attempt in 1:max_attempts
-                run_unit_in_process!(run, slot, u, Int8(attempt), max_attempts)
-                has_non_pass(run, u) || break
-                attempt == max_attempts && break
-                reset_unit!(run, u)
-            end
-        end
-        if p.cfg.failfast && has_non_pass(run, u)
-            cancel!(run.queues) === false && print_failfast(run, first(p.units.span[u]))
-            break
+        # A unit that asked for a process gets one here too — `run_unit_once!`
+        # decides which do — started and stopped around it.
+        slot.profile = p.profiles[p.units.profile[u]]
+        try
+            run_unit!(run, slot, u, target)
+        finally
+            stop_worker!(run, slot)
         end
     end
+    check_finished(run)
     return nothing
 end
 
-# Nothing here can be timed out — there is no second process to kill — so the two
-# blocks run back to back and are merged the way a worker's two replies are.
-function run_with_test_end(spec::ItemSpec, test_end::Expr)
-    res = run_item(spec)
-    (isempty(test_end.args) || res.state === SKIPPED) && return res
-    return merge_test_end(res, YATFWorkers.run_test_end(spec, test_end))
-end
-
-function run_unit_in_process!(run::Run, slot::Slot, u::UnitIdx, attempt::Int8, max_attempts::Int)
-    p = run.plan
-    for i in p.units.span[u]
-        is_cancelled(run.queues) && (record_cancelled!(run, i); continue)
-        spec = item_spec(run, i, slot, attempt, max_attempts)
-        res = try
-            run_with_test_end(spec, p.profiles[1].test_end)
-        catch e
-            e isa InterruptException && rethrow()
-            record_error!(
-                run, i, slot, attempt, ERRORED,
-                string(sprint(showerror, e), " · ",
-                       retry_note(attempt, max_attempts, is_cancelled(run.queues)))
-            )
-            continue
-        end
-        record_result!(run, i, slot, attempt, res, max_attempts)
-    end
-    return nothing
-end
+# The profile's test-end expression after the item, merged the way a worker's two
+# replies are. Nothing here can be timed out: there is no second process to kill.
+with_test_end(res::ItemResult, spec::ItemSpec, test_end::Expr) =
+    isempty(test_end.args) || res.state === SKIPPED ? res :
+    merge_test_end(res, YATFWorkers.run_test_end(spec, test_end))

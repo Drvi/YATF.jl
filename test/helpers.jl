@@ -66,7 +66,20 @@ function capture_run(f)
     end
     output = read(path, String)
     rm(path; force=true)
+    echo_captured(output)
     return value, output
+end
+
+# The runner shows a child's output only when its file fails, so there each
+# captured output is echoed: an assertion about it fails next to what it read.
+function echo_captured(output::AbstractString)
+    get(ENV, "YATF_TEST_ECHO", "") == "1" || return nothing
+    ts = Test.get_testset()
+    println(stdout, "┄┄┄┄ output captured in ", repr(ts isa Test.DefaultTestSet ? ts.description : "?"), " ┄┄┄┄")
+    print(stdout, output)
+    endswith(output, '\n') || println(stdout)
+    println(stdout, "┄┄┄┄ end of captured output ┄┄┄┄")
+    return nothing
 end
 
 # Fixtures that have to know whether they have run before write marker files; keep

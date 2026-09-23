@@ -27,6 +27,7 @@ Base.@kwdef struct PerfStats
     recompile_ns :: UInt64 = 0
     bytes        :: Int64  = 0
     gc_ns        :: Int64  = 0
+    maxrss       :: UInt64 = 0   # the worker process's largest resident size so far, when the item ended
 end
 
 """
@@ -37,21 +38,18 @@ holds no process-local state.
 """
 struct ItemSpec
     index        :: Int32
-    ntotal       :: Int32
     name         :: String
     file         :: String
     line         :: Int32
-    location     :: String    # file:line as the run reports it, relative to the project
     code         :: Expr
     skip         :: Any
     failfast     :: Bool
     project_name :: String
     profile      :: Symbol
     attempt      :: Int8
-    attempts     :: Int8      # how many attempts this item gets in total
     full_stacktraces :: Bool  # keep the frames belonging to the framework itself
     logpath      :: String    # "" to write to the worker's stdout instead
-    name_width   :: Int32     # the run's name column, chosen from all of its names
+    seed         :: UInt64    # where the item's random numbers start
 end
 
 struct ItemResult
@@ -122,7 +120,7 @@ macro timed_with_compilation(ex)
              c0 = Base.cumulative_compile_time_ns() .- c0))
         local diff = Base.GC_Diff(Base.gc_num(), gc0)
         val, PerfStats(; elapsed_ns=t0, compile_ns=first(c0), recompile_ns=last(c0),
-                       bytes=diff.allocd, gc_ns=diff.total_time)
+                       bytes=diff.allocd, gc_ns=diff.total_time, maxrss=Sys.maxrss())
     end
 end
 
@@ -147,22 +145,25 @@ softscope_all!(@nospecialize ex) = (map!(softscope, ex.args, ex.args); ex)
 Evaluate one test item in a fresh module and return its results. Never throws for
 a failing test: a failure is a result, not an error.
 """
-function run_item(spec::ItemSpec; printing::Bool=false)
-    log_item(spec, "RUN")
-    result = in_item(spec; printing) do
-        _run_item(spec)
-    end
-    log_item(spec, "DONE", result)
-    return result
-end
+run_item(spec::ItemSpec; printing::Bool=false) = in_item(() -> _run_item(spec), spec; printing)
+
+# The lines a worker writes to its stdout as an item starts and finishes: data for
+# the coordinator, which draws the RUN and DONE lines from them. On stdout rather
+# than with the result because the item's own output travels there, and the DONE
+# line must come after all of it.
+const RECORD_MARK = "\x1eYATF "
+record_run(spec::ItemSpec) = string(RECORD_MARK, "RUN ", spec.index, " ", spec.attempt)
+record_done(spec::ItemSpec, r::ItemResult) = string(
+    RECORD_MARK, "DONE ", spec.index, " ", spec.attempt, " ", UInt8(r.state), " ",
+    r.stats.elapsed_ns, " ", r.stats.compile_ns, " ", r.stats.maxrss
+)
 
 """
     run_test_end(spec, test_end) -> ItemResult
 
-Evaluate a profile's test-end expression in a fresh module, after the item `spec`
-describes has finished. Its results are its own: the expression checks what the
-item left behind, so what it costs and what it finds belong to the profile rather
-than to the item, and the coordinator times it against its own limit.
+Evaluate a profile's `test_end` expression in a fresh module, after the item
+`spec` describes. Its results and its cost belong to the profile rather than the
+item, and the coordinator times it against a limit of its own.
 """
 function run_test_end(spec::ItemSpec, test_end::Expr)
     ts = Test.DefaultTestSet(string(spec.name, " test_end"))
@@ -177,10 +178,9 @@ function run_test_end(spec::ItemSpec, test_end::Expr)
     return ItemResult(spec.index, state_of(ts), transferrable(ts), stats)
 end
 
-# The scope every piece of a test item's user code runs in: the item is visible to
-# `current_testitem`, and nothing the item's testsets record is printed here —
-# under a run the coordinator prints them, in one place and in one piece. Run
-# straight from a REPL there is no coordinator, and `printing` says so.
+# The scope an item's user code runs in: the item is visible to `current_testitem`,
+# and its testsets print nothing here, because under a run the coordinator prints
+# them. Straight from a REPL there is no coordinator, and `printing` says so.
 function in_item(f, spec::ItemSpec; printing::Bool=false)
     info = TestItemInfo(spec.name, spec.file, spec.line, spec.attempt, spec.profile)
     return with(CURRENT_TESTITEM => info) do
@@ -190,114 +190,12 @@ function in_item(f, spec::ItemSpec; printing::Bool=false)
     end
 end
 
-# Bracketing lines for every item, on the worker's real stdout rather than in the
-# item's captured log: when a run hangs or a machine runs out of memory, the
-# question is which items were in flight, and the answer has to be in the output
-# whatever the log mode is and whether or not the item ever finishes.
-function log_item(spec::ItemSpec, state::AbstractString, result=nothing)
-    # The buffer carries the coordinator's colour setting, so `printstyled` emits
-    # escapes only when the coordinator is attached to a terminal.
-    buf = IOBuffer()
-    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
-    print(io, result === nothing ? MARK_RUNNING : state_mark(result.state), " ")
-    # `Libc.strftime` rather than Dates: every worker loads this package, so it
-    # carries only what it cannot do without.
-    print(io, Libc.strftime("%H:%M:%S", time()), FIELD)
-    printstyled(io, state; bold=true)
-    pad_to(io, WORKER_STATE_WIDTH, textwidth(state))
-    print(io, FIELD)
-    if spec.ntotal > 0
-        print(io, lpad(spec.index, ndigits(spec.ntotal)), "/", spec.ntotal, FIELD)
-    end
-    # Padded so the columns after the name stay put for the whole run; a name
-    # longer than the column pushes them out rather than being cut, because the
-    # name is what identifies the item.
-    pad_to(io, spec.name_width, print_quoted(io, spec.name))
-    # A retry is the same item again, so it gets the same line with a field of its
-    # own rather than an announcement of its own.
-    spec.attempt > 1 &&
-        print(io, FIELD, "retry ", spec.attempt - 1, " of ", max(spec.attempts - 1, 1))
-    print(io, FIELD)
-    if result === nothing
-        print(io, "at ")
-        printstyled(io, spec.location; bold=true)
-    else
-        pct = result.stats.elapsed_ns > 0 ?
-            round(Int, 100 * result.stats.compile_ns / result.stats.elapsed_ns) : 0
-        printstyled(io, rpad(short_state(result.state), STATE_WIDTH);
-                    color=state_color(result.state))
-        print(io,
-              FIELD, lpad(fmt_secs(result.stats.elapsed_ns / 1e9), TIME_WIDTH),
-              " (", lpad(pct, 2), "% compile)",
-              FIELD, "maxrss ", fmt_gib(Sys.maxrss()))
-    end
-    println(io)
-    emit_log(String(take!(buf)))
-    return nothing
-end
-
-"""
-    print_quoted(io, s) -> Int
-
-Write `s` as `repr` would and return the width written.
-
-`repr` builds an `IOBuffer` and an escaped copy of the string; almost no test item
-name holds anything that needs escaping, and this runs twice for every item in the
-suite. When there is nothing to escape the quotes go straight to `io`.
-"""
-function print_quoted(io::IO, s::AbstractString)
-    if needs_escaping(s)
-        quoted = repr(s)
-        print(io, quoted)
-        return textwidth(quoted)
-    end
-    print(io, '"', s, '"')
-    return textwidth(s) + 2
-end
-
-# What `repr` of a string would change. Anything unprintable covers the control
-# characters and the escapes Julia writes for them.
-needs_escaping(s::AbstractString) =
-    any(c -> c == '"' || c == '\\' || c == '$' || !isprint(c), s)
-
-# Padding without building a padded copy of the thing being padded.
-function pad_to(io::IO, width::Integer, used::Integer)
-    for _ in 1:(width - used)
-        write(io, UInt8(' '))
-    end
-    return nothing
-end
-
-"""
-    LOG_SINK
-
-Where an item's `START`/`DONE` lines go. On a worker that is the process's own
-stdout, which the coordinator relays a line at a time. Running in this process
-there is nobody to relay them, and writing straight to stdout would cut across
-whatever the coordinator is printing — so it installs a sink of its own.
-"""
-const LOG_SINK = Ref{Any}(nothing)
-
-function emit_log(line::AbstractString)
-    sink = LOG_SINK[]
-    if sink === nothing
-        write(stdout, line)
-        flush(stdout)
-    else
-        sink(line)
-    end
-    return nothing
-end
-
 """
     trim_internal_frames(stack)
 
-Cut each backtrace short at the first frame belonging to this package. Below that
-point every frame is the machinery that called the test item — the evaluation, the
-capture, the socket — and none of it says anything about why the item failed.
-
-`runtests(full_stacktraces=true)` keeps them, for when the machinery is the
-suspect.
+Cut each backtrace at the first frame belonging to this package: below it is the
+machinery that called the item, which says nothing about why it failed.
+`runtests(full_stacktraces=true)` keeps them.
 """
 function trim_internal_frames(stack)
     return Base.ExceptionStack([(exception=e.exception, backtrace=trim_backtrace(e.backtrace))
@@ -322,175 +220,11 @@ function trim_backtrace(bt)
     return bt
 end
 
-"""
-    short_state(state) -> String
-
-The outcome as it appears in a run's output. The four everyday ones are kept to
-four characters so the column stays narrow across thousands of lines; the rare
-ones are spelled out and are allowed to push the line, which is the right way for
-an unusual outcome to catch the eye.
-"""
-short_state(state::ItemState) =
-    state === PASSED       ? "PASS" :
-    state === FAILED       ? "FAIL" :
-    state === ERRORED      ? "ERR"  :
-    state === SKIPPED      ? "SKIP" :
-    state === TIMEDOUT     ? "TIMEOUT" :
-    state === BROKEN_CHAIN ? "BROKEN" :
-    state === CANCELLED    ? "CANCELLED" : string(state)
-
-"""
-    ITEM_MARKS
-
-The glyph a test item's line carries, by how the item went: blue while it runs,
-then the colour of its outcome.
-
-`log_item` writes this at the start of the line, before anything else, because at
-the moment the line is written only this process knows how the item went — the
-coordinator draws the rest of the line and has not been told yet. The line is
-self-describing: the coordinator strips the glyph and redraws the line around it,
-and a line that reaches a terminal without being redrawn still reads.
-"""
-const MARK_RUNNING = "🔵"
-const MARK_PASSED = "🟢"
-const MARK_FAILED = "🔴"
-const MARK_SET_ASIDE = "🟡"
-
-const ITEM_MARKS = (MARK_RUNNING, MARK_PASSED, MARK_FAILED, MARK_SET_ASIDE)
-
-"""
-    state_mark(state) -> String
-
-`state_color`'s palette as a glyph: green for a pass, red for anything that went
-wrong, yellow for what was set aside.
-"""
-state_mark(state::ItemState) =
-    state === PASSED ? MARK_PASSED :
-    (state === SKIPPED || state === CANCELLED) ? MARK_SET_ASIDE :
-    is_non_pass(state) ? MARK_FAILED : MARK_RUNNING
-
-"""
-    state_color(state) -> Symbol
-
-`Test`'s palette, so an outcome looks the same here as it does in the summary
-`Test` prints: green for a pass, red for anything that went wrong, yellow for
-what was set aside.
-"""
-state_color(state::ItemState) =
-    state === PASSED ? :green :
-    state === SKIPPED || state === CANCELLED ? Base.warn_color() :
-    is_non_pass(state) ? Base.error_color() : :default
-
-"""
-    quoted_width(name) -> Int
-
-The number of columns [`print_quoted`](@ref) will take for `name`.
-
-Paired with it deliberately: the width of the name column is chosen from these,
-and a disagreement between the two would show up as a column that is off by one
-for exactly the names that needed escaping.
-"""
-quoted_width(name::AbstractString) =
-    needs_escaping(name) ? textwidth(repr(name)) : textwidth(name) + 2
-
-# Bounds on the name column. Narrower than the floor is not worth aligning; wider
-# than the ceiling is a column of blanks on a line nobody can read anyway.
-const MIN_NAME_WIDTH = 12
-const MAX_NAME_WIDTH = 60
-
-# One name in this many may be left to overflow when they cannot all be held. A
-# whole number rather than a fraction: `1 - 0.9` is not a tenth, and the rounding
-# it causes moves the answer by a name.
-const NAME_OUTLIER_SHARE = 10
-
-# ...and the number the column is always willing to leave out, however few names
-# there are. A tenth of five names is none, and one wild name among five should
-# still not set the width for the other four.
-const NAME_OUTLIER_ALLOWANCE = 2
-
-# Cover the whole tail rather than nine names in ten when the difference is this
-# small: a column a few characters wider that nothing overflows reads better than
-# one that is exactly wide enough for most.
-const NAME_TAIL_SLACK = 8
-
-# What the rest of a DONE line takes at its widest — glyph, worker, clock, state,
-# counter, and the timing and memory after the name.
-const LINE_RESERVED = 85
-
-"""
-    name_width(names; columns = 0) -> Int
-
-How wide the name column should be for a run of `names`.
-
-One width for the whole run, chosen from the names it will actually print, so the
-columns after it stay put. `columns` is the terminal's width when there is a
-terminal, and `0` when the output is going somewhere that has no width.
-
-The rule is in two steps. Start from the widest name the column could settle on
-after leaving out as many as it is allowed to — one in
-[`NAME_OUTLIER_SHARE`](@ref) of them, or [`NAME_OUTLIER_ALLOWANCE`](@ref),
-whichever is more. Then climb back up through
-the names above it for as long as each is within [`NAME_TAIL_SLACK`](@ref) of
-where we started, so a tail that is only a little longer is covered rather than
-left to overflow.
-
-What that buys: a suite of two thousand names, all about ten characters except
-two of sixty, gets a ten-wide column and two long lines — not sixty columns of
-blanks on the other 1998. A suite whose names are all within a few characters of
-each other gets a column that fits every one of them.
-"""
-function name_width(names; columns::Integer = 0)
-    isempty(names) && return MIN_NAME_WIDTH
-    widths = sort!([quoted_width(n) for n in names])
-    n = length(widths)
-    allowed = max(NAME_OUTLIER_ALLOWANCE, n ÷ NAME_OUTLIER_SHARE)
-    wanted = widths[max(1, n - allowed)]
-    for j in (max(1, n - allowed) + 1):n
-        widths[j] - wanted <= NAME_TAIL_SLACK || break
-        wanted = widths[j]
-    end
-    # The floor is on the budget, not on the answer: a suite whose names are all
-    # eight characters wide wants an eight-wide column, not a floor's worth of
-    # blanks after every one of them.
-    budget = columns > 0 ? clamp(columns - LINE_RESERVED, MIN_NAME_WIDTH, MAX_NAME_WIDTH) :
-        MAX_NAME_WIDTH
-    return min(wanted, budget)
-end
-
-"""
-    terminal_columns() -> Int
-
-How wide the output is, or `0` when it is not going to a terminal and so has no
-width to speak of.
-"""
-terminal_columns() = stdout isa Base.TTY ? displaysize(stdout)[2] : 0
-"""
-    FIELD
-
-What separates one field of a line from the next.
-
-A middle dot rather than a pipe: the line is a row of small facts about one item,
-and the same separator inside a field and between fields makes a run of them read
-as one table rather than as two nested ones.
-"""
-const FIELD = " · "
-
-# "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" and "UP" are shorter. Nothing here
-# reaches five, and every line in the run pays for this column.
-const WORKER_STATE_WIDTH = 4
-const STATE_WIDTH = 4     # "PASS"; the rarer outcomes are longer and may overflow
-const TIME_WIDTH  = 5     # "99.9s"; an item that runs longer than that pushes the column
-
-# One unit each, always: a column that switches between ms and s, or MiB and GiB,
-# cannot be compared down the page at a glance.
-fmt_secs(s::Real) = string(round(s; digits=1), "s")
-fmt_gib(b::Real) = string(round(b / 2^30; digits=1), " GiB")
-
 function _run_item(spec::ItemSpec)
     if should_skip(spec)
         ts = Test.DefaultTestSet(spec.name)
         Test.record(ts, Test.Broken(:skipped, spec.name))
-        return ItemResult(spec.index, SKIPPED, transferrable(ts), PerfStats())
+        return ItemResult(spec.index, SKIPPED, transferrable(ts), PerfStats(; maxrss=Sys.maxrss()))
     end
     ts = Test.DefaultTestSet(spec.name; failfast=spec.failfast)
     stats = PerfStats()
@@ -509,8 +243,8 @@ end
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString)
     stats = PerfStats()
     body = Expr(:block)
-    # Through YATF rather than directly, so that an item's `@test` works whatever
-    # the test environment does or does not declare (§3.1 of the design).
+    # Through YATF, so `@test` works whether or not the test environment declares
+    # `Test`.
     push!(body.args, :(using YATF.Test))
     isempty(spec.project_name) || push!(body.args, :(using $(Symbol(spec.project_name))))
     append!(body.args, code.args)
@@ -519,7 +253,9 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     try
         with_testset(ts) do
             _, stats = @timed_with_compilation capture_output(spec.logpath) do
-                with_source_path(() -> Core.eval(Main, mod_expr), spec.file)
+                with_seed(spec.seed) do
+                    with_source_path(() -> Core.eval(Main, mod_expr), spec.file)
+                end
                 nothing
             end
         end
@@ -578,19 +314,14 @@ function with_testset_printing(f, enabled::Bool)
     end
 end
 
-# How Test tracks the active testset is internal and has changed shape: a
-# task-local stack with push/pop before Julia 1.13, scoped values from 1.13 on.
-# Detect the shape rather than the version, and let `test_runitem.jl` fail loudly
-# if a future release grows a third one.
+# How Test tracks the active testset is internal: a task-local stack before 1.13,
+# scoped values from 1.13. The shape is detected rather than the version.
 """
     without_enclosing_testset(f)
 
-Run `f` with no enclosing testset in scope.
-
-`Test.finish` attaches a testset to the enclosing one whenever the testset depth
-is not zero. A test item's results belong to the run's own report, so finishing
-one must not silently graft it onto whatever `@testset` the caller of
-`runtests` happened to be inside.
+Run `f` with no enclosing testset in scope. `Test.finish` attaches a testset to the
+enclosing one whenever the depth is not zero, and an item's results belong to the
+run's report, not to whatever `@testset` the caller of `runtests` is inside.
 """
 function without_enclosing_testset(f)
     if isdefined(Test, :TESTSET_DEPTH) && Test.TESTSET_DEPTH isa ScopedValue
@@ -624,6 +355,18 @@ function with_testset(f, ts::Test.AbstractTestSet)
           "this build of Test is not supported")
 end
 
+# The item's random numbers start from its seed, and the task's own stream is put
+# back afterwards: in a run without workers this task is the caller's.
+function with_seed(f, seed::UInt64)
+    saved = copy(Random.default_rng())
+    Random.seed!(seed)
+    try
+        return f()
+    finally
+        copy!(Random.default_rng(), saved)
+    end
+end
+
 function with_source_path(f, path)
     tls = task_local_storage()
     prev = get(tls, :SOURCE_PATH, nothing)
@@ -645,6 +388,7 @@ function capture_output(f, logpath::AbstractString)
     # logger has to be told, or every captured log record comes out grey.
     color = get(stdout, :color, false)::Bool
     open(logpath, "a") do io
+        line_buffered!(io)
         redirect_stdout(io) do
             redirect_stderr(io) do
                 with_logger(ConsoleLogger(IOContext(io, :color => color))) do
@@ -653,6 +397,20 @@ function capture_output(f, logpath::AbstractString)
             end
         end
     end
+end
+
+# `bufmode_t` in Julia's src/support/ios.h: bm_none = 1000, bm_line, bm_block, bm_mem.
+const IOS_LINE_BUFFERED = Cint(1001)
+
+# A process killed by a signal never flushes, so a block-buffered capture loses the
+# lines an item printed just before it crashed, and the runtime's own crash report,
+# written straight to the descriptor, lands ahead of them. Line-buffered, every
+# finished line is on disk as it is printed, at about 2 µs a line. `Base` has no
+# setting for this, and a stream that refuses it is still a working capture.
+function line_buffered!(io::IOStream)
+    ccall(:ios_bufmode, Cint, (Ptr{Cvoid}, Cint), io.ios, IOS_LINE_BUFFERED) == 0 ||
+        @warn "YATF worker: captured output is block-buffered; a crash may lose its last lines" maxlog = 1
+    return io
 end
 
 function state_of(ts::Test.AbstractTestSet)

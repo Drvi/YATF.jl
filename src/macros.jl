@@ -5,13 +5,13 @@
 
 Declare an independently runnable group of tests.
 
-A test item is never expanded by the Julia compiler: `YATF` reads test files by
-parsing them, and evaluates the body inside a fresh module on a worker process.
-Expanding this macro therefore means a test file was `include`d directly, which
-is an error — run the tests with `YATF.runtests()` instead.
+`YATF.runtests()` finds test items by parsing test files and runs each body in a
+fresh module on a worker process. Evaluating the macro itself — pasting an item
+into the REPL, or `include`ing its file — runs that one item the same way in this
+session, or on a worker of its own when it is sandboxed.
 
-Keyword arguments must be literals, with the single exception of `skip`, which
-may be any expression and is evaluated on the worker.
+Keyword arguments must be literals, except `skip`, which may be any expression and
+is evaluated on the worker.
 
 | Keyword | Meaning |
 |:--------|:--------|
@@ -24,12 +24,9 @@ may be any expression and is evaluated on the worker.
 | `sandbox=true` | run alone in a process that is torn down afterwards |
 | `sandbox=:profile` | run in the pool for `[profiles.profile]` of `TestItems.toml` |
 """
-# Expanding this macro means the item was evaluated rather than scanned: pasted
-# into a REPL, or in a file somebody `include`d. Both want the same thing — run
-# this one item, here, with as much of a run around it as one process can provide.
-# The whole call is handed to `run_interactive`, which reads it with the scanner's
-# own parser, so a pasted item means exactly what the same item means in a file.
 macro testitem(args...)
+    # The call goes to `run_interactive` whole, to be read by the scanner's own
+    # parser: a pasted item means exactly what the same item means in a file.
     call = Expr(:macrocall, Symbol("@testitem"), __source__, args...)
     return :($(run_interactive)($(QuoteNode(call)), $(QuoteNode(__source__))))
 end

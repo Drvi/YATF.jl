@@ -15,6 +15,7 @@ using YATF: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
         elapsed = @elapsed states, run, _ = run_states(dir; workers=1, logs=:issues, monitor=false)
         @test states["never finishes"] === TIMEDOUT
         @test run.statuses.attempt[1] == 3          # the first go and two retries
+        @test run.statuses.elapsed[1] >= 2          # it held its worker for its limit, not for nothing
         # Three attempts of two seconds, not one attempt of two shared between them.
         @test elapsed >= 6
         @test elapsed < 120
@@ -36,6 +37,7 @@ using YATF: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
             # work, because it is the one people set.
             @test occursin("live tasks", out)
             @test occursin("KILL", out)
+            @test occursin("timed out after 2s (its own timeout=2)", out)
         end
     end
 
@@ -73,7 +75,7 @@ using YATF: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
         # rest never ran, and the run says so rather than passing them over.
         @test count(==(ERRORED), values(states)) == 1
         @test count(==(UNSEEN), values(states)) == 2
-        @test occursin("`init` expression of profile `default` timed out after 2 seconds", out)
+        @test occursin("`init` expression of profile `default` timed out after 2s (init_timeout)", out)
         # Said once: the run does not restate what the failure already says.
         @test count("`init` expression of profile", out) == 1
         # An item that never ran is not an item that passed.

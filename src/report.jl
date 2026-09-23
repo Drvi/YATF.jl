@@ -21,29 +21,19 @@ function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
     if !isempty(p.setups)
         println(io, "  ", rpad("setups", 17), join(p.setups, ", "))
     end
-    println(io)
-    for s in 1:nslots(p)
-        pool = p.pools[p.slot_pool[s]]
+    for (k, pool) in enumerate(p.pools)
         prof = p.profiles[pool.profile]
-        units = p.slot_units[s]
-        est = sum(u -> p.units.est_s[u], units; init = 0.0)
-        print(io, "worker ", s, "  profile=", prof.name)
-        pool.exclusive && print(io, " exclusive")
-        isempty(prof.julia_args) || print(io, " ", join(prof.julia_args, " "))
-        print(io, "  ", plural(length(units), "unit"))
-        est > 0 && print(io, ", est ", fmt_seconds(est))
+        slots = [s for s in 1:nslots(p) if p.slot_pool[s] == k]
         println(io)
-        for u in units
-            print_unit(io, p, u, "    ")
+        print(io, "profile ", prof.name)
+        isempty(prof.julia_args) || print(io, "  ", join(prof.julia_args, " "))
+        println(io, "  ", isempty(slots) ? "waiting for a free worker" : plural(length(slots), "worker"))
+        print_units(io, p, pool.head, "first, to whichever worker asks")
+        for s in slots
+            print_units(io, p, p.slot_units[s], "worker $s walks")
         end
-    end
-    for k in p.pending
-        pool = p.pools[k]
-        prof = p.profiles[pool.profile]
-        println(
-            io, "waiting for a free worker  profile=", prof.name,
-            pool.exclusive ? " exclusive" : "", "  ", plural(length(pool.units), "unit")
-        )
+        isempty(slots) && print_units(io, p, pool.body, "then, in file order")
+        print_units(io, p, pool.tail, "last, to whichever worker asks")
     end
     if !isempty(show_excluded)
         println(io)
@@ -51,6 +41,16 @@ function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
         for line in show_excluded
             println(io, "  ", line)
         end
+    end
+    return nothing
+end
+
+function print_units(io::IO, p::Plan, units::UnitRange{UnitIdx}, what::AbstractString)
+    isempty(units) && return nothing
+    est = sum(u -> p.units.est_s[u], units; init = 0.0)
+    println(io, "  ", what, ": ", plural(length(units), "unit"), est > 0 ? string(", est ", fmt_seconds(est)) : "")
+    for u in units
+        print_unit(io, p, u, "    ")
     end
     return nothing
 end
@@ -104,103 +104,131 @@ end
 """
     yatf_prefix(io=stdout) -> String
 
-The one prefix the framework speaks under. Everything YATF says about a run — the
-scan, the header, the progress line, the closing summary — starts with it, so a
-reader can tell the framework's voice from the tests' at a glance.
-
-Indented by [`GUTTER`](@ref): the things YATF says that take more than one line are
-drawn in a bracket, and the two columns the bracket's gutter occupies are the two
-this leaves blank, so every `[YATF]` in a run starts in the same column.
+The prefix everything YATF says about a run starts with, indented by
+[`GUTTER`](@ref) so that it lines up with the text inside a bracket.
 """
-function yatf_prefix(io::IO = stdout)
-    buf = IOBuffer()
-    print(buf, GUTTER)
-    printstyled(IOContext(buf, :color => get(io, :color, false)::Bool), "[YATF] "; bold = true)
-    return String(take!(buf))
-end
+yatf_prefix(io::IO = stdout) =
+    GUTTER * sprint(x -> printstyled(x, "[YATF] "; bold = true); context = :color => get(io, :color, false)::Bool)
 
-"""
-    GUTTER
-
-What a bracket's `┌ `, `│ ` and `└ ` occupy, as blanks. A line YATF prints that
-needs no bracket leaves that room so it lines up with the ones that do.
-"""
+# What a bracket's `┌ `, `│ ` and `└ ` occupy, as blanks.
 const GUTTER = "  "
 
-# Worker lifecycle, test items and the run's own report share one line shape, so
-# they line up in a log and a reader can skim by glyph before reading:
+# Worker lifecycle, test items and the run's own report share one line shape:
 #     ⚫ w1 · 16:30:28 · UP   · pid 48123 · threads 2,1
 #     🔵 w1 · 16:30:28 · RUN  ·  1/11 · "passes" · at test/basics_test.jl:1
 #     🟢 w1 · 16:30:29 · DONE ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
 #     ⚪ w0 · 16:30:29 · INFO ·  3/11 · 0 failed · 2/2 workers · tree mem 1.1G (max 1.2G) · …
+#     🧪 w1 · whatever a test item printed for itself
 #
 # A circle is the framework speaking, and its colour is the news: blue in flight,
-# green passed, red not, yellow set aside, black the worker itself, white the run
-# reporting on itself. The one glyph that is not a circle is the one line that is
-# not the framework — `MARK_ITEM`, for what a test item printed for itself.
-#
-# Every glyph here is two columns wide in Unicode's width tables and carries no
-# variation selector, which is what keeps the `w1 |` column in the same place on
-# every line. The obvious picks — 🛠️ and ℹ️ — are width 1 in those tables and
-# width 2 in most terminals, and a log comes out ragged wherever the two disagree.
-const MARK_WORKER = "⚫"   # a worker's own lifecycle
-const MARK_ITEM = "🧪"   # whatever a test item printed for itself
-const MARK_INFO = "⚪"   # the run reporting on itself
+# green passed, red not, yellow set aside, black the worker, white the run itself.
+# Every glyph is two columns wide in Unicode's tables and has no variation
+# selector, which keeps the `w1` column in place; 🛠️ and ℹ️ are width 1 in the
+# tables and width 2 in most terminals.
+const MARK_RUNNING = "🔵"
+const MARK_PASSED = "🟢"
+const MARK_FAILED = "🔴"
+const MARK_SET_ASIDE = "🟡"
+const MARK_WORKER = "⚫"
+const MARK_ITEM = "🧪"
+const MARK_INFO = "⚪"
 const MARK_INDENT = "   "
 
-# A test item's own lines come in already carrying the glyph for how the item went
-# (`YATFWorkers.ITEM_MARKS`): blue while it runs, then the colour of its outcome.
-# Anything else is unlabelled output from the worker's stdout, and which of the
-# last two it gets depends on whether an item was running when it arrived: a print
-# from a test is the item talking, a signal backtrace from a process being taken
-# down is not.
-const LINE_MARKS = (YATFWorkers.ITEM_MARKS..., MARK_ITEM, MARK_WORKER)
-const MARK_IDX_ITEM = length(YATFWorkers.ITEM_MARKS) + 1
-const MARK_IDX_WORKER = length(YATFWorkers.ITEM_MARKS) + 2
+const FIELD = " · "
+const WORKER_STATE_WIDTH = 4   # "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" and "UP" are shorter
+const STATE_WIDTH = 4          # "PASS"; the rarer outcomes are longer and may push the line
+const TIME_WIDTH = 5           # "99.9s"
 
-"""
-    mark_index(line) -> (index, at)
+# One unit each, always: a column that switches between ms and s, or MiB and GiB,
+# cannot be compared down the page at a glance.
+fmt_secs(s::Real) = string(round(s; digits = 1), "s")
+fmt_gib(b::Real) = string(round(b / 2^30; digits = 1), " GiB")
 
-Which of [`LINE_MARKS`](@ref) a relayed line calls for, and the byte its text
-starts at.
+# Four columns for the common outcomes; the rare ones are spelled out and may push
+# the line.
+short_state(state::ItemState) =
+    state === PASSED ? "PASS" : state === FAILED ? "FAIL" : state === ERRORED ? "ERR" :
+    state === SKIPPED ? "SKIP" : state === TIMEDOUT ? "TIMEOUT" :
+    state === BROKEN_CHAIN ? "BROKEN" : state === CANCELLED ? "CANCELLED" : string(state)
 
-A line the worker's own `log_item` wrote begins with its glyph and a space; a line
-a test item printed begins with whatever the item printed. Splitting them here is
-what lets the worker choose the colour and the coordinator choose the layout.
-"""
-function mark_index(line::AbstractString)
-    for (i, mark) in pairs(YATFWorkers.ITEM_MARKS)
-        startswith(line, mark) && return i, ncodeunits(mark) + 2
+# `Test`'s palette, so an outcome looks the same here as in `Test`'s summary.
+state_color(state::ItemState) =
+    state === PASSED ? :green : state === SKIPPED || state === CANCELLED ? Base.warn_color() :
+    is_non_pass(state) ? Base.error_color() : :default
+state_mark(state::ItemState) =
+    state === PASSED ? MARK_PASSED : state === SKIPPED || state === CANCELLED ? MARK_SET_ASIDE :
+    is_non_pass(state) ? MARK_FAILED : MARK_RUNNING
+
+# A string as `repr` writes it, returning the width written; `repr` builds a copy,
+# and almost no item name needs escaping.
+function print_quoted(io::IO, s::AbstractString)
+    needs_escaping(s) || (print(io, '"', s, '"'); return textwidth(s) + 2)
+    quoted = repr(s)
+    print(io, quoted)
+    return textwidth(quoted)
+end
+needs_escaping(s::AbstractString) = any(c -> c == '"' || c == '\\' || c == '$' || !isprint(c), s)
+quoted_width(name::AbstractString) = needs_escaping(name) ? textwidth(repr(name)) : textwidth(name) + 2
+
+# Written a byte at a time: the status line pads several numbers on every redraw.
+function pad_to(io::IO, width::Integer, used::Integer)
+    for _ in 1:(width - used)
+        write(io, UInt8(' '))
     end
-    return MARK_IDX_ITEM, 1
-end
-
-# `MARK_INDENT`, a glyph and a trailing space: what a line with no worker to name
-# is drawn with, one per glyph so the common path is a single concatenation.
-const SOLO_PREFIXES = ntuple(i -> string(MARK_INDENT, LINE_MARKS[i], " "), length(LINE_MARKS))
-
-# The lead-in every one of those lines shares: the glyph, the worker it is about,
-# and the time. The clock is passed in rather than read here, because the line
-# that is redrawn after everything else the run prints has a cheaper way to get it
-# than formatting one per draw.
-function print_line_head(io::IO, mark::AbstractString, slot_id::Integer, clock::AbstractString)
-    print(io, MARK_INDENT, mark, " w")
-    print_int(io, slot_id)
-    print(io, FIELD, clock, FIELD)
     return nothing
 end
 
-# A run with no workers has nothing to number. The column is dropped rather than
-# filled with a zero that stands for a process nobody asked for.
-function print_line_head(io::IO, mark::AbstractString, ::Nothing, clock::AbstractString)
-    print(io, MARK_INDENT, mark, " ", clock, FIELD)
-    return nothing
+# Bounds on the name column: narrower is not worth aligning, wider is a column of
+# blanks on a line nobody can read anyway.
+const MIN_NAME_WIDTH = 12
+const MAX_NAME_WIDTH = 60
+# The column may leave this share of the names to overflow, and always at least
+# this many: one wild name among five should not set the width for the other four.
+const NAME_OUTLIER_SHARE = 10
+const NAME_OUTLIER_ALLOWANCE = 2
+# ...but covers a tail that is this close, rather than leave it to overflow.
+const NAME_TAIL_SLACK = 8
+# What the rest of a DONE line takes at its widest.
+const LINE_RESERVED = 85
+
+"""
+    name_width(names; columns = 0) -> Int
+
+One width for the name column for the whole run, so the columns after it stay put:
+the widest name once the allowed outliers are set aside, extended through the
+names above it while each is within `NAME_TAIL_SLACK`. Two thousand ten-character
+names and two of sixty get a ten-wide column and two long lines. `columns` is the
+terminal's width, or `0` when there is none.
+"""
+function name_width(names; columns::Integer = 0)
+    isempty(names) && return MIN_NAME_WIDTH
+    widths = sort!([quoted_width(n) for n in names])
+    n = length(widths)
+    allowed = max(NAME_OUTLIER_ALLOWANCE, n ÷ NAME_OUTLIER_SHARE)
+    wanted = widths[max(1, n - allowed)]
+    for j in (max(1, n - allowed) + 1):n
+        widths[j] - wanted <= NAME_TAIL_SLACK || break
+        wanted = widths[j]
+    end
+    # The floor is on the budget, not the answer: names all eight wide want an
+    # eight-wide column, not a floor's worth of blanks after each.
+    budget = columns > 0 ? clamp(columns - LINE_RESERVED, MIN_NAME_WIDTH, MAX_NAME_WIDTH) : MAX_NAME_WIDTH
+    return min(wanted, budget)
 end
-
-# Everything a test item says when it is running here rather than on a worker.
-
 
 clock_now() = Libc.strftime("%H:%M:%S", time())
+
+# The start every line shares: glyph, the worker it is about (none in a run
+# without workers), and the time. The clock is passed in because the status line,
+# redrawn after everything the run prints, has a cheaper way to get it.
+function print_line_head(io::IO, mark::AbstractString, slot_id, clock::AbstractString)
+    print(io, MARK_INDENT, mark, " ")
+    slot_id === nothing || (print(io, "w"); print_int(io, slot_id); print(io, FIELD))
+    print(io, clock, FIELD)
+    return nothing
+end
+
+print_word(io::IO, word::AbstractString) = (print_bold(io, rpad(word, WORKER_STATE_WIDTH)); print(io, FIELD))
 
 # `printstyled` builds a closure and a padded string per call, and the status line
 # is redrawn after every line the run prints.
@@ -212,90 +240,130 @@ function print_bold(io::IO, text::AbstractString)
     return nothing
 end
 
-function print_worker_line(run, slot_id, state::AbstractString, text::AbstractString)
-    buf = IOBuffer()
-    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
+# Text built for printing, in colour when the run's own output is.
+styled(f) = sprint(f; context = :color => get(stdout, :color, false)::Bool)
+
+# A line the run says about itself.
+say(run, parts...) = printline(run, string(yatf_prefix(), parts...))
+
+print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) = printline(run, styled() do io
     print_line_head(io, MARK_WORKER, slot_id, clock_now())
-    printstyled(io, rpad(state, WORKER_STATE_WIDTH); bold = true)
-    print(io, FIELD, text)
-    printline(run, String(take!(buf)))
+    print_word(io, state)
+    print(io, text)
+end)
+
+"""
+    item_line(slot_id, i, total, name, width, attempt, attempts, how) -> String
+
+An item's RUN line when `how` is where it is, and its DONE line when `how` is how
+it went: `(; state, elapsed_ns, compile_ns, maxrss)`. A retry is the same item
+again, so it gets the same line with a field of its own; `total` is 0 when there
+is no count to give.
+"""
+item_line(slot_id, i, total, name, width, attempt, attempts, how) = styled() do io
+    done = !(how isa AbstractString)
+    print_line_head(io, done ? state_mark(how.state) : MARK_RUNNING, slot_id, clock_now())
+    print_word(io, done ? "DONE" : "RUN")
+    total > 0 && print(io, lpad(i, ndigits(total)), "/", total, FIELD)
+    # A name longer than the column pushes the rest out rather than being cut:
+    # the name is what identifies the item.
+    pad_to(io, width, print_quoted(io, name))
+    attempt > 1 && print(io, FIELD, "retry ", attempt - 1, " of ", max(attempts - 1, 1))
+    print(io, FIELD)
+    if done
+        pct = how.elapsed_ns > 0 ? round(Int, 100 * how.compile_ns / how.elapsed_ns) : 0
+        printstyled(io, rpad(short_state(how.state), STATE_WIDTH); color = state_color(how.state))
+        print(io, FIELD, lpad(fmt_secs(how.elapsed_ns / 1.0e9), TIME_WIDTH), " (", lpad(pct, 2), "% compile)")
+        print(io, FIELD, "maxrss ", fmt_gib(how.maxrss))
+    else
+        print(io, "at ")
+        print_bold(io, how)
+    end
+end
+
+outcome(r::ItemResult) = (; r.state, r.stats.elapsed_ns, r.stats.compile_ns, r.stats.maxrss)
+
+"""
+    parse_record(line) -> Union{Nothing, NamedTuple}
+
+A worker's record of an item starting or finishing (`YATFWorkers.record_run`,
+`record_done`) as `(; i, attempt, how)`, with `how === nothing` for a start; or
+`nothing` for any other line.
+"""
+function parse_record(line::AbstractString)
+    startswith(line, YATFWorkers.RECORD_MARK) || return nothing
+    word, rest... = split(SubString(line, ncodeunits(YATFWorkers.RECORD_MARK) + 1), ' ')
+    n = map(x -> tryparse(Int, x), rest)
+    any(isnothing, n) && return nothing
+    word == "RUN" && length(n) == 2 && return (; i = n[1], attempt = n[2], how = nothing)
+    (word == "DONE" && length(n) == 6 && 0 <= n[3] <= Int(CANCELLED)) || return nothing
+    return (; i = n[1], attempt = n[2], how = (; state = ItemState(n[3]), elapsed_ns = n[4], compile_ns = n[5], maxrss = n[6]))
+end
+
+# Where the time before the first test item went: on a large suite, the wait.
+function print_startup(io::IO, s::Startup)
+    parts = String[]
+    s.files > 0      && push!(parts, string("files ", fmt_seconds(s.files)))
+    s.plan > 0.005   && push!(parts, string("plan ", fmt_seconds(s.plan)))
+    s.setup > 0.005  && push!(parts, string("setup ", fmt_seconds(s.setup)))
+    isempty(parts) || println(io, "startup: ", join(parts, " · "))
     return nothing
 end
 
 """
     print_run_header(run)
 
-The handful of facts about a run that are not visible from the call: which YATF
-and which Julia, how much work, how many processes with what given to them, and
-the environment it all resolved to. Printed once.
+What the call does not show: which YATF and Julia, how much work, how many
+processes with what given to them, and the environment it resolved to.
 """
-# Where the time before the first test item went. On a large suite this is the
-# part people wait through, and without a line for it the wait looks like nothing
-# happening.
-function print_startup(io::IO, s::Startup)
-    parts = String[]
-    s.files > 0      && push!(parts, string("files ", fmt_seconds(s.files)))
-    s.env > 0.005    && push!(parts, string("environment ", fmt_seconds(s.env)))
-    s.plan > 0.005   && push!(parts, string("plan ", fmt_seconds(s.plan)))
-    s.precompile > 0.005 && push!(parts, string("precompile ", fmt_seconds(s.precompile)))
-    isempty(parts) || println(io, "startup: ", join(parts, " · "))
-    return nothing
-end
-
 function print_run_header(run)
     p = run.plan
-    head = IOBuffer()
-    print(
-        head, pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
-        " in ", plural(length(p.files), "file")
-    )
-    # The commit, so a CI log says what to check out to reproduce this run.
-    rev = project_revision(p.root)
-    isempty(rev) || print(head, " · rev ", first(rev, 10))
-    p.cfg.workers == 0 ? print(head, " · in this process") :
-        print(
-            head, " · ", plural(length(run.slots), "worker"), " · threads ",
-            p.profiles[1].threads
-        )
-    body = IOBuffer()
-    println(body, "env ", something(Base.active_project(), "none"))
-    print_startup(body, p.startup)
-    # Only profiles that actually change something are worth a line.
-    for prof in p.profiles
-        parts = String[]
-        isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
-        prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
-        isempty(prof.env) || push!(parts, join(("\$k=\$v" for (k, v) in prof.env), " "))
-        isempty(prof.init.args) || push!(parts, "init expression")
-        isempty(parts) && continue
-        println(body, "profile ", prof.name, ": ", join(parts, " · "))
+    head = sprint() do io
+        print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
+              " in ", plural(length(p.files), "file"))
+        # The commit, so a CI log says what to check out to reproduce this run.
+        rev = project_revision(p.root)
+        isempty(rev) || print(io, " · rev ", first(rev, 10))
+        print(io, " · seed ", seed_text(p.cfg.seed))
+        p.cfg.workers == 0 ? print(io, " · in this process") :
+            print(io, " · ", plural(length(run.slots), "worker"), " · threads ", p.profiles[1].threads)
     end
-    print_yatf_block(run, String(take!(head)), String(take!(body)))
+    body = sprint() do io
+        println(io, "env: ", something(Base.active_project(), "none"))
+        print_startup(io, p.startup)
+        # Only profiles that actually change something are worth a line.
+        for prof in p.profiles
+            parts = String[]
+            isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
+            prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
+            isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
+            isempty(prof.init.args) || push!(parts, "init expression")
+            isempty(prof.test_end.args) || push!(parts, "test end expression")
+            isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
+        end
+    end
+    print_yatf_block(run, head, body)
     return nothing
 end
 
 """
     print_yatf_block(run, head, body)
 
-Something YATF has to say that runs to more than one line, drawn in a bracket.
-
-The bracket is what makes a block one thing rather than a first line and some
-stray indented text underneath it, which matters most when several workers are
-printing at once. A block with nothing under its first line is not a block, and
+Something YATF says that runs to more than one line, drawn in a bracket so that it
+reads as one block among the workers' output. With nothing under its first line it
 is printed as the plain line it is.
 """
 function print_yatf_block(run, head::AbstractString, body::AbstractString)
-    isempty(strip(body)) && return printline(run, string(yatf_prefix(), head))
+    isempty(strip(body)) && return say(run, head)
     return printline(run, bracket(body, "[YATF]", head, "", :white))
 end
 
 """
     printline(run, text)
 
-The one way anything reaches the terminal during a run. Erases the pinned status
-line, writes `text` whole, and puts the status line back, all while holding the
-printer lock — so a log record, a worker's relayed output and the status line can
-never end up on the same line.
+The one way anything reaches the terminal during a run: erase the pinned status
+line, write `text` whole, and put the status line back, all under the printer lock,
+so a log record, a worker's output and the status line never share a line.
 """
 function printline(run, text::AbstractString)
     @lock run.printer begin
@@ -311,13 +379,13 @@ function printline(run, text::AbstractString)
     end
     return nothing
 end
+
 """
     RunLogger
 
-Routes every log record produced during a run through [`printline`](@ref). Log
-records are formatted whole and then written once: a `ConsoleLogger` writing
-straight to `stdout` emits a record in several writes, which is how a warning ends
-up spliced into the status line.
+Routes every log record of a run through [`printline`](@ref), formatted whole and
+written once: a `ConsoleLogger` on `stdout` writes a record in several pieces, and
+a warning ends up spliced into the status line.
 """
 struct RunLogger{L <: Logging.AbstractLogger} <: Logging.AbstractLogger
     parent::L
@@ -332,20 +400,13 @@ function Logging.handle_message(
         l::RunLogger, level, message, _module, group, id,
         file, line; kwargs...
     )
-    buf = IOBuffer()
-    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
-    formatter = Logging.ConsoleLogger(io, Logging.BelowMinLevel)
-    Logging.handle_message(formatter, level, message, _module, group, id, file, line; kwargs...)
-    printline(l.run, String(take!(buf)))
+    printline(l.run, styled() do io
+        Logging.handle_message(Logging.ConsoleLogger(io, Logging.BelowMinLevel), level, message, _module, group, id, file, line; kwargs...)
+    end)
     return nothing
 end
 
-
-print_failfast(run, i::ItemIdx) = printline(
-    run, string(
-        yatf_prefix(), "stopping after ", repr(run.plan.items.name[i]), " failed (failfast)"
-    )
-)
+print_failfast(run, i::ItemIdx) = say(run, "stopping after ", repr(run.plan.items.name[i]), " failed (failfast)")
 
 """
     print_conclusion(run)
@@ -354,40 +415,74 @@ The block that closes a run. On a terminal it lands where the progress line was,
 so the last thing on screen says how the run went rather than which items
 happened to finish last.
 """
-function print_conclusion(run)
+function print_conclusion(run, interrupted::Bool = false)
     p = run.plan
     st = run.statuses
-    head = IOBuffer()
-    print(
-        head, "ran ", plural(nitems(p), "test item"), " in ", fmt_seconds(time() - run.t0),
-        single_process(p) ? " in this process" : string(" on ", plural(length(run.slots), "worker"))
+    elapsed = fmt_seconds(time() - run.t0)
+    tally = state_tally(st.state)
+    # An interrupted run got through some of its items, and how many is the news.
+    head = string(
+        interrupted ?
+            string("interrupted after ", count(s -> s !== UNSEEN && s !== CANCELLED, st.state), " of ",
+                   plural(nitems(p), "test item"), " in ", elapsed) :
+            string("ran ", plural(nitems(p), "test item"), " in ", elapsed,
+                   single_process(p) ? " in this process" : string(" on ", plural(length(run.slots), "worker"))),
+        isempty(tally) ? ", all passed" : string(", ", join(tally, ", "))
     )
-    tally = state_tally(st, nitems(p))
-    print(head, isempty(tally) ? ", all passed" : string(", ", join(tally, ", ")))
-    body = IOBuffer()
-    run.monitor === nothing || print_memory_summary(body, run.monitor; indent = "")
-    run.runstate === nothing || println(body, "run state: ", run.runstate.path)
-    print_yatf_block(run, String(take!(head)), String(take!(body)))
+    body = styled() do io
+        run.monitor === nothing || print_memory_summary(io, run.monitor; indent = "")
+        if run.runstate !== nothing
+            print(io, "run state: ")
+            printstyled(io, run.runstate.path; color = :light_black)
+            println(io)
+        end
+    end
+    print_yatf_block(run, head, body)
     return nothing
 end
 
 # Everything that is not a plain pass, in the order a reader cares about.
-function state_tally(st, n::Integer)
+function state_tally(states)
     out = String[]
-    for (state, label) in (
-            (FAILED, "failed"), (ERRORED, "errored"), (TIMEDOUT, "timed out"),
-            (BROKEN_CHAIN, "broken by a dead worker"), (SKIPPED, "skipped"),
-            (CANCELLED, "cancelled"), (UNSEEN, "did not run"),
-        )
-        c = count(==(state), st.state)
+    for (state, label) in STATE_LABELS
+        state === PASSED && continue
+        c = count(==(state), states)
         c > 0 && push!(out, string(c, " ", label))
     end
     return out
 end
 
-# A file's wall time: from the first of its items being dispatched to the last of
-# them finishing. With several workers those spans overlap between files, so they
-# do not sum to the run's wall time — the root row is that.
+const STATE_LABELS = (
+    PASSED => "passed", FAILED => "failed", ERRORED => "errored", TIMEDOUT => "timed out",
+    BROKEN_CHAIN => "broken by a dead worker", SKIPPED => "skipped", CANCELLED => "cancelled",
+    UNSEEN => "did not run", RUNNING => "still running",
+)
+
+# Why a worker ended, as a person says it.
+worker_end_text(by::Symbol) =
+    by === :close ? "closed by the run" : by === :timeout ? "killed for a timeout" :
+    by === :connection_lost || by === :process_exit ? "died" : by === :memory_guard ? "killed by the memory guard" :
+    by === :interrupt ? "killed by an interrupt" : by === :init_failed ? "its init expression failed" :
+    replace(String(by), '_' => ' ')
+
+# A run's testsets are built after the items finish, so both ends are set from what
+# the run recorded. 1.13 takes the start as a keyword and holds `time_end`
+# atomically; 1.12 has neither.
+@static if VERSION >= v"1.13"
+    started_testset(name::AbstractString; verbose::Bool, at::Float64) =
+        Test.DefaultTestSet(name; verbose, time_start = at)
+    finished_at!(ts::Test.DefaultTestSet, at::Float64) = (@atomic ts.time_end = at)
+else
+    function started_testset(name::AbstractString; verbose::Bool, at::Float64)
+        ts = Test.DefaultTestSet(name; verbose)
+        ts.time_start = at
+        return ts
+    end
+    finished_at!(ts::Test.DefaultTestSet, at::Float64) = (ts.time_end = at)
+end
+
+# A file's wall time: from its first item's dispatch to its last item's end. With
+# several workers these overlap, so they do not sum to the run's time.
 function file_testset(run, fid::Int32)
     p = run.plan
     st = run.statuses
@@ -399,8 +494,8 @@ function file_testset(run, fid::Int32)
     end
     name = p.relfiles[fid]
     isfinite(first_start) || return Test.DefaultTestSet(name; verbose = p.cfg.verbose)
-    ts = Test.DefaultTestSet(name; verbose = p.cfg.verbose, time_start = run.t0 + first_start)
-    @atomic ts.time_end = run.t0 + last_end
+    ts = started_testset(name; verbose = p.cfg.verbose, at = run.t0 + first_start)
+    finished_at!(ts, run.t0 + last_end)
     return ts
 end
 
@@ -416,7 +511,7 @@ function report(run)
     # `Test` prints `time_end - time_start` in its own Time column, so the run's
     # times are put where it already looks rather than into a column of our own.
     # The root's clock starts when the run did, so its row is the run's wall time.
-    root = Test.DefaultTestSet("YATF"; verbose = true, time_start = run.t0)
+    root = started_testset("YATF"; verbose = true, at = run.t0)
     byfile = Dict{Int32, Test.DefaultTestSet}()
     for fid in sort!(unique(p.items.fileidx))
         byfile[fid] = file_testset(run, fid)
@@ -435,122 +530,108 @@ function report(run)
     return root
 end
 
-# An item that never ran is not an item that passed. A run cut short — by a
-# profile whose `init` expression will not start, by a slot that fell over, by
-# failfast — leaves items with no testset to fold in, and folding nothing would
-# make the emptiest possible run the greenest. So what is missing is recorded.
+# An item that never ran is not an item that passed. A run cut short (an `init`
+# that will not start, a dead slot, failfast) records what is missing, or the
+# emptiest run would be the greenest.
 function record_unrun!(root::Test.AbstractTestSet, run)
     p = run.plan
     st = run.statuses
     idxs = [i for i in 1:nitems(p) if st.state[i] === UNSEEN || st.state[i] === CANCELLED]
     isempty(idxs) && return nothing
     shown = join((repr(p.items.name[i]) for i in Iterators.take(idxs, 5)), ", ")
-    msg = string(
-        length(idxs), " of ", plural(nitems(p), "test item"), " did not run because the run ",
-        "stopped early: ", shown, length(idxs) > 5 ? ", …" : ""
-    )
+    why = is_cancelled(run.queues) ? "did not run because the run stopped early" :
+        "have no outcome, though the run was not stopped (a YATF bug, logged above)"
+    msg = string(length(idxs), " of ", plural(nitems(p), "test item"), " ", why, ": ", shown, length(idxs) > 5 ? ", …" : "")
     # The conclusion block above says the same thing in the run's own words; this
     # record exists so the verdict is wrong when the run was.
-    with_testset_printing(false) do
-        Test.record(
-            root, Test.Error(
-                :nontest_error, Expr(:tuple), ErrorException(msg), exception_stack(msg),
-                LineNumberNode(Int(p.items.line[first(idxs)]), p.files[p.items.fileidx[first(idxs)]])
-            )
-        )
-    end
+    add_error!(root, msg, source_of(p, first(idxs)))
     return nothing
 end
 
-# `Test` prints a failure where it is recorded, which for us is on a worker with
-# printing switched off. So the coordinator prints them itself: a summary table
-# that says "2 errors" without saying what they were is not a test report.
-"""
-    report_item!(run, i, state)
+# Where an item is, as a stack frame would say it.
+source_of(p::Plan, i::Integer) = LineNumberNode(Int(p.items.line[i]), p.files[p.items.fileidx[i]])
 
-Everything an item has to say, said when the item finishes rather than at the end
-of the run, and written in one piece so another worker's output cannot land in the
-middle of it: the failures first, then the captured logs — a failure is read
-together with the output that led to it.
+# An error the run synthesized, recorded into `ts` without `Test` printing it: the
+# run prints what it records itself. `Test.Error` renders its message from the
+# exception stack, so the stack carries it.
+function add_error!(ts::Test.AbstractTestSet, msg::AbstractString, source::LineNumberNode)
+    stack = Base.ExceptionStack([(exception = ErrorException(msg), backtrace = Ptr{Nothing}[])])
+    with_testset_printing(false) do
+        Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), ErrorException(msg), stack, source))
+    end
+    return ts
+end
+
+"""
+    report_item!(run, i, state, n, msg)
+
+Everything an item has to say, written when it finishes and in one piece so that
+no other worker's output lands inside it: its failures, then its captured logs.
+`Test` would print failures where they are recorded, on a worker with printing
+switched off, so the coordinator prints them.
 """
 function report_item!(run, i::ItemIdx, state::ItemState, n::Integer, msg::AbstractString)
     p = run.plan
+    # A cancelled item has nothing of its own to show; the conclusion counts them.
+    state === CANCELLED && return nothing
     # Having nothing to say is the common case — a passing item in `:issues` mode —
     # and everything below this line allocates to find that out.
     (is_non_pass(state) || wants_log(p.cfg.logs, state) || p.cfg.verbose) || return nothing
-    body = IOBuffer()
-    io = IOContext(body, :color => get(stdout, :color, false)::Bool)
-    # A coordinator-written outcome — a timeout, a dead worker — is already stated
-    # in this block's first line; showing the record it synthesized would say it
-    # again, word for word.
-    is_non_pass(state) && !run.statuses.synthetic[i] && print_failures(io, run, i)
-    print_item_log(io, run, i, state)
-    body.size == 0 && return nothing
+    body = styled() do io
+        # A coordinator-written outcome — a timeout, a dead worker — is already
+        # stated in this block's first line; showing the record it synthesized
+        # would say it again, word for word.
+        is_non_pass(state) && !run.statuses.synthetic[i] && print_failures(io, run, i)
+        print_item_log(io, run, i, state)
+    end
+    isempty(body) && return nothing
     total = nitems(p)
-    label = string("[", lpad(n, ndigits(total)), "/", total, "] ", YATFWorkers.short_state(state))
+    label = string("[", lpad(n, ndigits(total)), "/", total, "] ", short_state(state))
     rest = string(repr(p.items.name[i]), isempty(msg) ? "" : string(" · ", msg))
     footer = string(
         "@ ", itemfile(p, i), ":", p.items.line[i], on_worker(run, i)
     )
-    printline(
-        run, bracket(
-            strip_root(String(take!(body)), p.root), label, rest, footer,
-            YATFWorkers.state_color(state)
-        )
-    )
+    printline(run, bracket(strip_root(body, p.root), label, rest, footer, state_color(state)))
     return nothing
 end
 
 """
-    bracket(body, header, footer, color) -> String
+    bracket(body, label, rest, footer, color) -> String
 
-Everything one item has to say, drawn as a single block in the shape `Logging`
-uses for a multi-line record: `┌` on the first line, `│` down the side, `└` on the
-last. Test failures, captured logs and the odd crash dump then read as one thing
-rather than as unrelated paragraphs from whichever worker got there first.
+`body` drawn in the shape `Logging` gives a multi-line record: `┌`, the coloured
+`label` and `rest` on the first line, `│` down the side, and `└` on the last, with
+`footer` dimmed.
 """
 function bracket(
         body::AbstractString, label::AbstractString, rest::AbstractString,
         footer::AbstractString, color
     )
-    buf = IOBuffer()
-    io = IOContext(buf, :color => get(stdout, :color, false)::Bool)
     # Coloured like a log record: the gutter and the label carry the colour, what
     # follows is ordinary text, and the location at the bottom is dimmed.
-    printstyled(io, "┌ "; color, bold = true)
-    printstyled(io, label; color, bold = true)
-    isempty(rest) || print(io, " ", rest)
-    println(io)
-    lines = collect(eachsplit(chomp(body), '\n'))
-    # `└` carries the last thing there is, as a log record's does: the location
-    # when there is one, and otherwise the final line of the body.
-    tail = isempty(footer) && !isempty(lines) ? pop!(lines) : nothing
-    for line in lines
-        printstyled(io, "│ "; color, bold = true)
-        println(io, line)
-    end
-    printstyled(io, isempty(footer) && tail === nothing ? "└" : "└ "; color, bold = true)
-    if tail !== nothing
-        println(io, tail)
-    elseif isempty(footer)
+    return styled() do io
+        printstyled(io, "┌ ", label; color, bold = true)
+        isempty(rest) || print(io, " ", rest)
         println(io)
-    else
-        printstyled(io, footer; color = :light_black)
+        lines = collect(eachsplit(chomp(body), '\n'))
+        # `└` carries the last thing there is, as a log record's does: the location
+        # when there is one, and otherwise the final line of the body.
+        tail = isempty(footer) && !isempty(lines) ? pop!(lines) : nothing
+        for line in lines
+            printstyled(io, "│ "; color, bold = true)
+            println(io, line)
+        end
+        printstyled(io, isempty(footer) && tail === nothing ? "└" : "└ "; color, bold = true)
+        tail === nothing ? (isempty(footer) || printstyled(io, footer; color = :light_black)) : print(io, tail)
         println(io)
     end
-    return String(take!(buf))
 end
 
 """
     strip_root(text, root)
 
-`text` with the project's own directory taken off the front of every path in it.
-
-`Test` and the stacktrace printer name a file by the path the parser was given,
-and that path is absolute on purpose: it is also what `@__FILE__` expands to, and
-what `@__DIR__` is derived from, so a test item that loads a fixture next to
-itself depends on it. The shortening therefore happens here, on the way out,
-where it is presentation and cannot change what the item's code means.
+`text` with the project's directory taken off every path in it. Paths stay absolute
+while an item runs, because `@__FILE__` and `@__DIR__` depend on them; shortening
+them on the way out cannot change what the item's code means.
 """
 function strip_root(text::AbstractString, root::AbstractString)
     isempty(root) && return text
@@ -589,10 +670,8 @@ function print_item_log(io::IO, run, i::ItemIdx, state::ItemState)
         println(io)
         return nothing
     end
-    # A bracket of its own, nested inside the item's: what the item printed is one
-    # thing, and its own `@info`/`@warn` records keep their brackets inside this
-    # one. Written through rather than indented, so the item's formatting and
-    # colours are the ones its author meant to see.
+    # A bracket of its own inside the item's, written through rather than indented,
+    # so the item's own log records and colours come out as its author meant.
     logs = trim_blank_lines(open(io -> read(io, String), path, "r"))
     print(io, bracket(logs, "Captured logs", "", "", Base.info_color()))
     return nothing
@@ -603,9 +682,7 @@ end
 trim_blank_lines(text::AbstractString) =
     replace(replace(text, r"\A(?:[ \t]*\n)+" => ""), r"(?:\n[ \t]*)+\z" => "")
 
-# With no workers there is no worker to name: the slot exists so the scheduler has
-# something to talk about, and saying "on worker 1" about this process is telling
-# the reader about a process that was never started.
+# With no workers there is no worker to name.
 on_worker(run, i::ItemIdx) =
     (single_process(run.plan) || run.statuses.slot[i] == 0) ? "" :
     string(" on worker ", run.statuses.slot[i])
@@ -616,11 +693,8 @@ item_logpath(run, i::ItemIdx) =
 """
     item_log_path(prefix, index, attempt) -> String
 
-Where one attempt at one item writes what it prints.
-
-Built a byte at a time rather than with `string`, which boxes each number and runs
-the whole `print` pipeline: seven allocations for a prefix, two integers and a
-suffix, once for every dispatch in the run.
+Where one attempt at one item writes what it prints. Built a byte at a time:
+`string` boxes each number, and this runs for every dispatch.
 """
 function item_log_path(prefix::String, index::Integer, attempt::Integer)
     n = ncodeunits(prefix)

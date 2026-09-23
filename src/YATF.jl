@@ -15,28 +15,25 @@ contain `@testitem` declarations and nothing else. Shared setup code goes in
 module YATF
 
 using Base.ScopedValues: ScopedValue, with
-using Dates: Dates
 using Logging: Logging, with_logger, current_logger
 using Pkg: Pkg
+using Random: RandomDevice
 using Test
 using Test: Test
 using TestEnv: TestEnv
 using TOML: TOML
 
-# The worker side lives in its own package (`lib/YATFWorkers`), so a worker
-# process loads the protocol and the item runner and nothing else. The names a
-# test item or the coordinator reaches for are imported here.
+# The worker side is a package of its own, so a worker loads the protocol and the
+# item runner and nothing else.
 using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_yatf_run, run_item,
-    with_testset_printing, without_enclosing_testset, pad_to, FIELD,
-    WORKER_STATE_WIDTH
+    with_testset_printing, without_enclosing_testset, PATHSEP
 
 export @testitem
 
-# `Test` is re-exported, so `using YATF` is all a test file needs: a test item's
-# body gets `@test`, `@testset` and the rest without the test environment having
-# to declare `Test` itself. YATF already depends on it.
+# Re-exported, so a test item's body has `@test` and the rest without the test
+# environment declaring `Test`.
 export Test, runtests
 for name in names(Test)
     name === :Test && continue
@@ -69,20 +66,25 @@ the item that line is inside.
 
 # Keywords
 
-Selection: `name` (`String` for an exact match, `Regex` for a partial one) and
-`tags` (a symbol or vector of symbols an item must carry all of, or a string
-expression such as `"!slow"` or `"juliac || serializer"`).
+Selection: `name` (`String` for an exact match, `Regex` for a partial one, or a
+set of exact names) and `tags` (a symbol or vector of symbols an item must carry
+all of, or a string expression such as `"!slow"` or `"juliac || serializer"`).
 
 Execution: `workers` (a count, or `0` to run in this process), `threads`,
 `timeout`, `init_timeout` and `test_end_timeout` (a profile's `init` and `test_end`
 expressions are timed separately from the items, and default to `timeout`),
 `retries`, `failfast`, `memory_threshold`, `full_stacktraces` (keep the
-framework's own frames in a failing item's stacktrace; trimmed by default).
+framework's own frames in a failing item's stacktrace; trimmed by default), `seed`
+(every item draws its random numbers from this and its own name; random unless
+given, and printed at the start of the run).
 
 Output: `logs` (`:issues`, `:batched`, `:eager`), `report`, `verbose`,
 `monitor`, `monitor_interval`.
 
-State: `dry_run` prints the plan and runs nothing.
+State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
+downloaded from CI, say) and runs it again: the same items, settings, profiles
+and seed, with any keyword given here winning, and a warning naming each package
+whose version differs from the one recorded.
 
 Every keyword can also be set in `test/TestItems.toml`, which additionally
 declares sandbox profiles and forced ordering; an explicit keyword wins.
@@ -101,16 +103,20 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
     end
 end
 
-# Everything up to the point where a process would be started. Split out so that
-# the plan can be inspected, printed, or executed without re-deriving it.
+# Everything up to starting a process, so a plan can be inspected, printed or run.
 function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
+    rs = replay === nothing ? nothing : read_replay(String(replay), target)
+    if rs !== nothing
+        # The items and settings it recorded, under whatever the call says itself.
+        selected = name !== nothing || tags !== nothing || !isempty(target.paths) || target.line != 0
+        selected || (name = Set(it.name for it in rs.items))
+        kwargs = merge(recorded_settings(rs), kwargs)
+    end
     filter = Filter(; name, tags, paths = target.paths, line = target.line)
     setups = setup_modules(target.testdir)
-    # Reading the files is the first thing a run does and it can take a moment on a
-    # large suite, so it says what it is doing and what it found. There is no
-    # printer yet — nothing else is writing this early.
+    # Printed directly: there is no printer yet, and nothing else writes this early.
     println(
         stdout, yatf_prefix(), "reading test files under ",
         relpath_or_path(target.testdir, target.root),
@@ -129,9 +135,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs.
             )
         )
     end
-    # Every file, whatever the selection: a suite that does not parse, or that
-    # declares one name twice, is broken rather than smaller, and finding that out
-    # depends on reading all of it.
+    # Every file, whatever the selection: a broken suite is broken, not smaller.
     items = scan(files, filter, setups; strays)
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
     println(
@@ -144,47 +148,63 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs.
     files_seconds = time() - t_files
     t_plan = time()
     cfg = read_config(target.testdir; nunits = length(items), kwargs...)
-    cfg = apply_runstate(cfg, items, target, replay)
+    rs === nothing || (cfg = replayed_config(cfg, rs))
     p = plan(
         items, cfg; history = history(target.root), root = target.root,
-        strict_order = is_full_run(filter, target)
+        strict_order = is_full_run(filter, target),
+        selection = is_full_run(filter, target) ? "" : describe(filter, target)
     )
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan
     return p, target
 end
 
-# Reproducing a run means running it with the same worker configuration, which is
-# what `replay` is for: point it at a run state — one downloaded from CI, say —
-# and the profiles it recorded are used in place of the ones this checkout
-# declares. Only when asked. A run state found lying next to the project is not a
-# request to run differently, and applying one would put a stale `init` expression
-# ahead of an explicit `threads=` argument.
-function apply_runstate(cfg::RunConfig, items::Vector{RawItem}, target, replay)
-    replay === nothing && return cfg
-    rs = read_run_state(String(replay))
-    rs === nothing && throw(ConfigError("could not read a run state from $(replay)"))
-    isempty(rs.profiles) && return cfg
-    same = all(rs.profiles) do (name, prof)
-        haskey(cfg.profiles, name) && profiles_match(cfg.profiles[name], prof)
-    end
-    same && return cfg
+# `replay`: a run state (one downloaded from CI, say) to run again. Only when asked:
+# a run state lying next to the project is not a request to run differently.
+function read_replay(path::String, target)
+    rs = read_run_state(path)
+    rs === nothing && throw(ConfigError(
+        "could not read a run state from $path: it is missing, damaged, or written by another version of YATF"
+    ))
+    id, here = get(rs.meta, "project_id", ""), project_id(target.root)
+    id == here || throw(ConfigError("$path records a run of project $(repr(id)), not of this one ($(repr(here)))"))
+    m(k) = get(rs.meta, k, "")
     println(
-        stdout, yatf_prefix(), "applying the worker configuration recorded in ",
-        basename(rs.path)
+        stdout, yatf_prefix(), "replaying ", basename(path), ": ", plural(length(rs.items), "test item"),
+        " · seed ", m("seed"), " · recorded with julia ", m("julia"), " on ", m("machine"),
+        isempty(m("revision")) ? "" : string(" at rev ", first(m("revision"), 10))
     )
-    merged = merge(cfg.profiles, rs.profiles)
-    return RunConfig(;
-        cfg.workers, cfg.threads, cfg.timeout_s, cfg.init_timeout_s, cfg.test_end_timeout_s,
-        cfg.retries, cfg.failfast, cfg.item_failfast, cfg.logs, cfg.report, cfg.verbose,
-        cfg.memory_threshold, cfg.full_stacktraces, cfg.monitor, cfg.monitor_interval,
-        profiles = merged, cfg.order_first, cfg.order_last
-    )
+    return rs
 end
 
-profiles_match(a::Profile, b::Profile) =
-    a.julia_args == b.julia_args && a.threads == b.threads && a.env == b.env &&
-    expr_text(a.init) == expr_text(b.init) && expr_text(a.test_end) == expr_text(b.test_end)
+# The settings a run state recorded, as `runtests` keywords.
+function recorded_settings(rs::RunStateRecord)
+    out = Pair{Symbol, Any}[]
+    for (key, parse_) in REPLAYED_SETTINGS
+        text = get(rs.meta, string(key), "")
+        isempty(text) && continue
+        value = try
+            parse_(text)
+        catch
+            throw(ConfigError("the run state's `$key` setting is unreadable: $(repr(text))"))
+        end
+        push!(out, key => value)
+    end
+    return NamedTuple(out)
+end
+
+# The recorded profiles in place of this checkout's, each preferences file written
+# back out from what was recorded, and the recorded manifest kept for comparison.
+function replayed_config(cfg::RunConfig, rs::RunStateRecord)
+    profiles = copy(cfg.profiles)
+    for (name, prof) in rs.profiles
+        prefs = get(rs.preferences, name, "")
+        path = isempty(prefs) ? "" : (f = tempname() * ".toml"; write(f, prefs); f)
+        profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path)
+    end
+    fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
+    return RunConfig(; merge(fields, (; profiles, replayed_manifest = get(rs.meta, "environment_manifest", "")))...)
+end
 
 """
     retry_failed(paths...; kwargs...)
@@ -200,15 +220,13 @@ function retry_failed(args...; kwargs...)
                 (isempty(runstate_files(target.root)) ? " (no run state found for this project)" : "")
         )
     )
-    names = sort!(collect(h.failed))
+    names = Set(keys(h.failed))
     println(
         stdout, yatf_prefix(), "re-running ", plural(length(names), "item"),
         " that did not pass"
     )
-    return runtests(args...; name = Regex("^(" * join(map(escape_string_regex, names), "|") * ")\$"), kwargs...)
+    return runtests(args...; name = names, kwargs...)
 end
-
-escape_string_regex(s::AbstractString) = replace(s, r"([\\^\$.|?*+()\[\]{}])" => s"\\\1")
 
 """
     Target
@@ -267,10 +285,8 @@ function split_line_suffix(path::AbstractString)
     return String(m.captures[1]), parse(Int32, m.captures[2])
 end
 
-# With no arguments, where do we look for tests? Not at the active project:
-# `Pkg.test` builds its environment in a temporary directory, so under the most
-# common entry point of all the active project is not the package being tested.
-# The file being evaluated is.
+# Not the active project: under `Pkg.test` that is a temporary environment, and the
+# package is where the `runtests.jl` being evaluated is.
 function default_search_dir()
     source = get(task_local_storage(), :SOURCE_PATH, nothing)
     if source !== nothing && basename(String(source)) == "runtests.jl"
@@ -315,7 +331,7 @@ is_full_run(f::Filter, t::Target) =
 
 function describe(f::Filter, t::Target)
     parts = String[]
-    f.name === nothing || push!(parts, "name = $(repr(f.name))")
+    f.name === nothing || push!(parts, f.name isa Set ? plural(length(f.name), "named item") : "name = $(repr(f.name))")
     f.tags === nothing || push!(parts, "tags = $(f.tags)")
     f.line == 0 || push!(parts, "line $(f.line)")
     isempty(t.paths) || push!(parts, "paths " * join(map(p -> relpath_or_path(p, t.root), t.paths), ", "))
@@ -324,20 +340,10 @@ end
 
 using PrecompileTools: @setup_workload, @compile_workload
 
-"""
-    PRECOMPILE_SIGNATURES
-
-The paths a run takes that the workload below cannot take for it, as signatures.
-
-Two things stop the workload from simply running a suite: starting a worker means
-starting a process while the package is being built, and running a test item
-means evaluating code into `Main`, which leaves a module behind and makes Julia
-warn that incremental compilation may be broken. Everything either of those leads
-to is listed here instead.
-
-`with_test_env` is deliberately absent: its first argument is a closure, and there
-is no concrete signature to name.
-"""
+# The paths a run takes that the workload below cannot take for it: starting a
+# worker starts a process during the build, and running an item evaluates code
+# into `Main`, which makes Julia warn that incremental compilation may be broken.
+# `with_test_env` takes a closure and has no concrete signature to name.
 const PRECOMPILE_SIGNATURES = (
     (test_env, (Target,)),
     (resolve_target, (Tuple{String},)),
@@ -348,11 +354,9 @@ const PRECOMPILE_SIGNATURES = (
     (run_slot, (Run, Slot, Target)),
 )
 
-# Everything between `runtests()` being called and the first test item starting:
-# reading the files, resolving the configuration, planning, and the shapes the run
-# prints. Measured on a 2000-item suite, this path takes 2.3s the first time it
-# runs in a process and 0.04s afterwards — all of that difference is compilation,
-# and it is paid before anything appears on screen.
+# Everything between `runtests()` and the first test item: reading, configuring,
+# planning and the shapes the run prints. On a 2,000-item suite this takes 2.3 s
+# uncompiled and 0.04 s compiled, paid before anything appears on screen.
 @setup_workload begin
     source = """
     @testitem "precompile one" tags=[:a] timeout=60 begin
@@ -363,7 +367,6 @@ const PRECOMPILE_SIGNATURES = (
         @test true
     end
     """
-    bytes = Vector{UInt8}(codeunits(source))
     # A real directory, because the run reads real directories: the walk, the
     # parallel scan and the TOML are each their own pile of code.
     dir = mktempdir()
@@ -373,14 +376,6 @@ const PRECOMPILE_SIGNATURES = (
     write(joinpath(dir, "test", "TestItems.toml"), "[run]\nworkers = 2\n")
     testdir = joinpath(dir, "test")
     @compile_workload begin
-        for mode in (:stream, :parseall)
-            items, errors, names = RawItem[], ScanError[], ItemName[]
-            if mode === :stream
-                scan_stream!(items, errors, names, bytes, "precompile_test.jl", Filter(), Dict{Symbol, String}())
-            else
-                scan_parseall!(items, errors, names, bytes, "precompile_test.jl", Filter(), Dict{Symbol, String}())
-            end
-        end
         files = discover(testdir)
         setups = setup_modules(testdir)
         items = scan(files, Filter(), setups; ntasks = 2)
@@ -396,6 +391,7 @@ const PRECOMPILE_SIGNATURES = (
         rsf = init_run_state(statepath, p)
         write_status!(rsf, 1, RUNNING, 1, 1)
         write_status!(rsf, 1, PASSED, 1, 1; elapsed = 0.1, compile = 0.05)
+        append_event!(rsf, EVENT_ATTEMPT, UInt8(PASSED), 1, 1, 0.1, 0.2; item = 1, attempt = 1)
         write_memory!(rsf, MemStats())
         finish_run_state!(rsf)
         read_run_state(statepath)
@@ -410,7 +406,10 @@ const PRECOMPILE_SIGNATURES = (
         print_bytes(buf, 512 * 2^20, TOTAL_WIDTH)
         print_1dp(buf, 2.5, 4)
         print_int(buf, 42, 4)
-        YATFWorkers.print_quoted(buf, "an item")
+        print_quoted(buf, "an item")
+        item_line(1, 1, 2, "an item", 12, 1, 1, "a_test.jl:1")
+        item_line(1, 1, 2, "an item", 12, 2, 2, (; state = PASSED, elapsed_ns = 1, compile_ns = 0, maxrss = 1))
+        parse_record(string(YATFWorkers.RECORD_MARK, "DONE 1 1 2 3 4 5"))
         item_log_path("/precompile/item_", 1, 1)
         bracket("a line\nanother", "[1/2] FAIL", "\"an item\"", "@ a_test.jl:1", :red)
         fmt_seconds(0.5); plural(2, "worker"); plural(1, "process", "processes")

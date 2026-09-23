@@ -27,6 +27,7 @@ const TEST_FILES = [
     "test_timeouts.jl",
     "test_sandbox.jl",
     "test_crashes.jl",
+    "test_runner.jl",
     "test_execute.jl",
     "test_setups.jl",
     "test_workers.jl",
@@ -41,7 +42,6 @@ const TEST_FILES = [
     "test_plan.jl",
     "test_gating.jl",
     "test_config.jl",
-    "test_runner.jl",
     "test_precompile.jl",
     "test_interactive.jl",
 ]
@@ -61,13 +61,28 @@ run_file(file::AbstractString) = @testset "$file" begin
     include(joinpath(@__DIR__, file))
 end
 
+# Where the suite ran, for a CI log read by someone who was not there.
+print_environment() = println(
+    "[tests] julia ", VERSION, " (", Base.GIT_VERSION_INFO.commit_short, ") · ", Sys.MACHINE, " · ",
+    Sys.CPU_THREADS, " CPU threads · ", round(Sys.total_memory() / 2^30; digits = 1), " GiB · threads ",
+    Threads.nthreads(:default), ",", Threads.nthreads(:interactive), " · ", default_jobs(), " files at a time",
+    get(ENV, "CI", "") == "true" ? " · CI" : ""
+)
+
 if !isempty(ARGS)
-    # A child, or someone running one file by hand.
+    # A child, or someone running one file by hand. The hook makes the signal a
+    # hung file is sent print every task's backtrace, which is where it is stuck.
+    YATFWorkers.install_inspection_hook()
     foreach(run_file, ARGS)
 elseif default_jobs() <= 1
+    print_environment()
     @testset "YATF" begin
-        foreach(run_file, TEST_FILES)
+        for file in TEST_FILES
+            println(stdout, "[tests] running ", file)
+            run_file(file)
+        end
     end
 else
+    print_environment()
     report_files(run_in_parallel(@__FILE__, TEST_FILES, default_jobs()))
 end

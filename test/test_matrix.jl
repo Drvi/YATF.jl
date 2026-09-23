@@ -138,17 +138,17 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
                     @test any(l -> occursin(repr(name), l) && occursin(word, l), dones)
                 end
                 # Blue while it runs, whatever the item turns out to be.
-                @test all(l -> occursin(YATFWorkers.MARK_RUNNING, l), starts)
+                @test all(l -> occursin(YATF.MARK_RUNNING, l), starts)
                 for (name, state) in MATRIX_STATES
                     line = only(filter(l -> occursin(repr(name), l), dones))
-                    @test occursin(YATFWorkers.state_mark(state), line)
+                    @test occursin(YATF.state_mark(state), line)
                 end
                 # ...and the glyph is the one the colour would have been.
-                @test count(l -> occursin(YATFWorkers.MARK_PASSED, l), dones) ==
+                @test count(l -> occursin(YATF.MARK_PASSED, l), dones) ==
                     count(==(PASSED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATFWorkers.MARK_SET_ASIDE, l), dones) ==
+                @test count(l -> occursin(YATF.MARK_SET_ASIDE, l), dones) ==
                     count(==(SKIPPED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATFWorkers.MARK_FAILED, l), dones) == 5
+                @test count(l -> occursin(YATF.MARK_FAILED, l), dones) == 5
             end
 
             @testset "the name column lines the outcomes up" begin
@@ -164,7 +164,7 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
                 columns = unique(first(findfirst(r"(PASS|FAIL|ERR|SKIP)", l)) for l in fitting)
                 @test length(columns) == 1
                 # ...and the width is the one the names asked for.
-                @test width == YATFWorkers.name_width(collect(keys(MATRIX_STATES)))
+                @test width == YATF.name_width(collect(keys(MATRIX_STATES)))
             end
 
             @testset "a failure names the line it failed on" begin

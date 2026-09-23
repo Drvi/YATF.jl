@@ -4,15 +4,25 @@
 @testset "parallel test runner" begin
     runner = joinpath(@__DIR__, "runtests.jl")
 
-    function run_snippet(code::AbstractString)
+    function run_snippet(code::AbstractString; limit = FILE_LIMIT_SECONDS)
         dir = mktempdir()
         file = joinpath(dir, "snippet_test_file.jl")
         write(file, code)
         try
-            return run_file_in_subprocess(runner, file)
+            return run_file_in_subprocess(runner, file; limit)
         finally
             rm(dir; force=true, recursive=true)
         end
+    end
+
+    @testset "a file that hangs is stopped at its limit, with what it printed" begin
+        r = run_snippet("""@testset "hangs" begin\n    println("got as far as this"); flush(stdout)\n    sleep(600)\nend\n"""; limit=20)
+        @test !r.ok
+        @test occursin("still running after the 20s limit", r.status)
+        @test occursin("got as far as this", r.output)
+        # Where it was stuck: every task's backtrace from the inspection hook, or
+        # every thread's from SIGTERM. Windows has neither signal.
+        Sys.iswindows() || @test occursin("==== Thread", r.output) || occursin("signal 15", r.output)
     end
 
     @testset "a file whose tests pass is a pass" begin

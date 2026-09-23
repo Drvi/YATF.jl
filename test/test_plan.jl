@@ -16,14 +16,20 @@ end
 # The order items would run in if the workers' queues were concatenated.
 dispatch_order(p) = [p.items.name[i] for i in 1:nitems(p)]
 slot_names(p, s) = [p.items.name[i] for u in p.slot_units[s] for i in p.units.span[u]]
+# Every item in the order the plan hands them out: each pool's head, its slots' stretches
+# (the whole body for a pool still waiting for a slot), then its tail.
+planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
+              for r in [[pool.head]; [p.slot_units[s] for s in 1:nslots(p) if p.slot_pool[s] == k];
+                        k in p.pending ? [pool.body] : UnitRange{Int32}[]; [pool.tail]]
+              for u in r for i in p.units.span[u]]
 
 @testset "plan" begin
-    @testset "every item lands in exactly one unit on exactly one worker" begin
+    @testset "every item lands in exactly one unit, handed out exactly once" begin
         p = make_plan()
         @test nitems(p) == 6
         @test length(p.units) == 5
         @test sort(dispatch_order(p)) == sort([i.name for i in read_items()])
-        assigned = reduce(vcat, [slot_names(p, s) for s in 1:nslots(p)])
+        assigned = planned(p)
         @test sort(assigned) == sort(dispatch_order(p))
         @test length(unique(assigned)) == length(assigned)
     end
@@ -97,7 +103,10 @@ slot_names(p, s) = [p.items.name[i] for u in p.slot_units[s] for i in p.units.sp
     @testset "workers are capped by the work available" begin
         p = make_plan(; workers=64)
         @test nslots(p) <= length(p.units)
-        @test all(s -> !isempty(p.slot_units[s]), 1:nslots(p))
+        # and no pool has more slots than it has units to hand out
+        for (k, pool) in enumerate(p.pools)
+            @test count(==(k), p.slot_pool) <= length(pool.head) + length(pool.body) + length(pool.tail)
+        end
     end
 
     @testset "affinity keeps items that share a file or a setup together" begin
@@ -114,11 +123,62 @@ slot_names(p, s) = [p.items.name[i] for u in p.slot_units[s] for i in p.units.sp
 
     @testset "history drives ordering" begin
         h = History(Dict("uses setup" => 100.0, "add works" => 0.1, "mul works" => 0.1),
-                    Set(["mul works"]))
+                    Dict("mul works" => 0), 0.0)
         p = make_plan(; history=h, workers=2)
         # the failure from last time is dispatched before the rest of its pool's work
         order = dispatch_order(p)
         @test findfirst(==("mul works"), order) < findfirst(==("uses setup"), order)
+    end
+
+    items(names...) = join(("@testitem \"$n\" begin\n    @test true\nend\n" for n in names))
+    function plan_dir(dir; history=History(), workers=2)
+        testdir = joinpath(dir, "test")
+        raw = scan(discover(testdir), Filter(), setup_modules(testdir))
+        return plan(raw, read_config(testdir; nunits=length(raw), workers); history, root=dir)
+    end
+
+    @testset "recent failures and changed files lead, then long units, then file order" begin
+        dir = make_pkg("Urgent", "test/a_test.jl" => items("a1", "a2", "a3"),
+                       "test/b_test.jl" => items("b1", "b2"), "test/c_test.jl" => items("c1", "c2"))
+        # a3 failed in the last run and b2 two runs ago; c2 takes more than a quarter
+        # of a slot's share of the work.
+        h = History(Dict("c2" => 60.0, "a1" => 1.0), Dict("b2" => 2, "a3" => 0), 0.0)
+        p = plan_dir(dir; history=h)
+        @test length(only(p.pools).head) == 3
+        @test dispatch_order(p) == ["a3", "b2", "c2", "a1", "a2", "b1", "c1"]
+        # A file written since the last run leads, in file order.
+        since = maximum(mtime, readdir(joinpath(dir, "test"); join=true))
+        sleep(0.05)
+        touch(joinpath(dir, "test", "b_test.jl"))
+        @test dispatch_order(plan_dir(dir; history=History(Dict{String,Float64}(), Dict{String,Int}(), since)))[1:2] ==
+              ["b1", "b2"]
+        # A sandboxed unit goes before any of them: its process is fresh anyway.
+        write(joinpath(dir, "test", "c_test.jl"), items("c1") * "@testitem \"alone\" sandbox=true begin\n    @test true\nend\n")
+        @test first(dispatch_order(plan_dir(dir; history=h))) == "alone"
+    end
+
+    @testset "the body is cut at a file boundary rather than through a file" begin
+        p = plan_dir(make_pkg("Cut", "test/a_test.jl" => items("a1", "a2", "a3"), "test/b_test.jl" => items("b1")))
+        @test [slot_names(p, s) for s in 1:2] == [["a1", "a2", "a3"], ["b1"]]
+        p = plan_dir(make_pkg("OneFile", "test/a_test.jl" => items("a1", "a2", "a3", "a4")))
+        @test [slot_names(p, s) for s in 1:2] == [["a1", "a2"], ["a3", "a4"]]
+    end
+
+    @testset "a slot takes the head, walks its stretch, halves the largest one left, then the tail" begin
+        p = plan_dir(make_pkg("Claims", "test/a_test.jl" => items("a1", "a2", "a3", "a4", "a5", "a6"),
+                              "test/b_test.jl" => items("b1", "b2"),
+                              "test/TestItems.toml" => "[order]\nfirst = [\"b2\"]\nlast = [\"a1\"]\n"))
+        q = YATF.Queues(p)
+        next(s) = (c = YATF.claim!(q, s); c.kind === :unit ? p.items.name[first(p.units.span[c.unit])] : c.kind)
+        @test [next(2), next(2), next(1)] == ["b2", "b1", "a2"]
+        @test next(2) == "a5"                                   # the second half of a3–a6
+        @test [next(1), next(1), next(1)] == ["a3", "a4", "a6"] # then the one unit slot 2 had left
+        @test [next(2), next(2)] == ["a1", :done]
+        # A cursor pointing at a unit already handed out is a scheduling bug, stopped
+        # rather than run twice.
+        q2 = YATF.Queues(p)
+        q2.claimed[q2.head[1]] = true
+        @test_throws ErrorException YATF.claim!(q2, 1)
     end
 
     @testset "planning is deterministic" begin
@@ -133,7 +193,7 @@ slot_names(p, s) = [p.items.name[i] for u in p.slot_units[s] for i in p.units.sp
     @testset "in-process runs use a single slot" begin
         p = make_plan(; workers=0)
         @test nslots(p) == 1
-        @test length(slot_names(p, 1)) == nitems(p)
+        @test sort(planned(p)) == sort(dispatch_order(p))
     end
 
     @testset "the plan prints" begin

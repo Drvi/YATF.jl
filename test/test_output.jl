@@ -32,12 +32,12 @@ using YATFWorkers: YATFWorkers
         # fixture passes.
         for l in starts
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_RUNNING) w\\d+ · " *
+                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_RUNNING) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · RUN  · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
         end
         for l in dones
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATFWorkers.MARK_PASSED) w\\d+ · " *
+                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_PASSED) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
             @test occursin("maxrss", l)
         end
@@ -51,12 +51,12 @@ using YATFWorkers: YATFWorkers
         @test !isempty(heads)
         @test all(l -> startswith(l, YATF.MARK_INDENT), heads)
         marks = unique(first(split(strip(l))) for l in heads)
-        known = Set([YATF.MARK_WORKER, YATF.MARK_INFO, YATF.LINE_MARKS...])
+        known = Set([YATF.MARK_INFO, (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER)...])
         @test issubset(marks, known)
         # This fixture starts workers, runs items that pass, and reports.
         @test YATF.MARK_WORKER in marks
-        @test YATFWorkers.MARK_RUNNING in marks
-        @test YATFWorkers.MARK_PASSED in marks
+        @test YATF.MARK_RUNNING in marks
+        @test YATF.MARK_PASSED in marks
         # ...and the column `w<n>` starts in is the same on all of them.
         cols = unique(length(SubString(l, 1, prevind(l, first(findfirst(r" w\d+ · ", l))))) for l in heads)
         @test length(cols) == 1
@@ -65,7 +65,7 @@ using YATFWorkers: YATFWorkers
     @testset "the run reports on itself when there is no terminal" begin
         status = filter(l -> occursin("· INFO ", l), lines)
         @test !isempty(status)
-        @test all(l -> startswith(l, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATFWorkers.FIELD), status)
+        @test all(l -> startswith(l, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATF.FIELD), status)
         @test any(l -> occursin("mem ", l), status)
         @test any(l -> occursin("load ", l), status)   # CPU load, as well as memory
         @test any(l -> occursin("workers", l), status)
@@ -117,8 +117,8 @@ using YATFWorkers: YATFWorkers
     end
 
     @testset "the name column is chosen from the names the run will print" begin
-        nw(names; columns=0) = YATFWorkers.name_width(names; columns)
-        qw = YATFWorkers.quoted_width
+        nw(names; columns=0) = YATF.name_width(names; columns)
+        qw = YATF.quoted_width
         widest(names) = maximum(qw, names)
 
         short = ["item $i" for i in 1:100]
@@ -140,21 +140,21 @@ using YATFWorkers: YATFWorkers
         for names in (short, outliers, tight, vcat(short, ["x"^150]),
                       vcat(short[1:90], ["slightly longer name $i" for i in 1:10]))
             over = count(n -> qw(n) > nw(names), names)
-            @test over <= max(YATFWorkers.NAME_OUTLIER_ALLOWANCE,
-                              length(names) ÷ YATFWorkers.NAME_OUTLIER_SHARE)
+            @test over <= max(YATF.NAME_OUTLIER_ALLOWANCE,
+                              length(names) ÷ YATF.NAME_OUTLIER_SHARE)
         end
 
         # A terminal narrows the column; a narrow one does not squeeze it away.
         long = ["a considerably longer test item name $i" for i in 1:100]
         @test nw(long; columns=200) > nw(long; columns=120) > nw(long; columns=80)
-        @test nw(long; columns=40) >= YATFWorkers.MIN_NAME_WIDTH
-        @test nw(long) <= YATFWorkers.MAX_NAME_WIDTH
-        @test nw(String[]) >= YATFWorkers.MIN_NAME_WIDTH
+        @test nw(long; columns=40) >= YATF.MIN_NAME_WIDTH
+        @test nw(long) <= YATF.MAX_NAME_WIDTH
+        @test nw(String[]) >= YATF.MIN_NAME_WIDTH
         @test nw(["just the one"]) == qw("just the one")
 
         # The width it counts on is the width the line actually takes.
         for n in ["plain", "with \"quotes\"", "emoji 🎉", "tab\there", "dollar \$x", ""]
-            @test qw(n) == textwidth(sprint(YATFWorkers.print_quoted, n))
+            @test qw(n) == textwidth(sprint(YATF.print_quoted, n))
         end
     end
 
@@ -250,7 +250,7 @@ using YATFWorkers: YATFWorkers
                      "tab\there", "newline\nhere", "unicode é", "emoji 🎉", "",
                      "\e[1mnot an escape sequence"]
             io = IOBuffer()
-            width = YATFWorkers.print_quoted(io, name)
+            width = YATF.print_quoted(io, name)
             written = String(take!(io))
             @test written == repr(name)
             @test width == textwidth(written)
@@ -273,5 +273,44 @@ using YATFWorkers: YATFWorkers
         @test read(`$(Base.julia_cmd()) --startup-file=no --color=yes --color=no -e $ask`,
                    String) == "false"
         @test read(plain_julia("-e", ask), String) == "false"
+    end
+
+    @testset "what a worker says while it dies is filed once it is gone" begin
+        # The worker still has the item's log open while it is being taken down,
+        # and `open(path, "a")` seeks to the end when it opens rather than on every
+        # write — so two processes appending to one file keep separate offsets and
+        # write over each other. These lines wait for the process to go.
+        dir = mktempdir()
+        path = joinpath(dir, "item_1_1.log")
+        write(path, "what the item printed\n")     # the worker's own capture
+        slot = YATF.Slot(
+            YATF.SlotIdx(1),
+            YATF.Profile(YATF.DEFAULT_PROFILE), nothing, 0.0, 0, YATF.ItemIdx(0),
+            path, String[]
+        )
+        for i in 1:3
+            YATF.keep_dying_line!(slot, "signal $i")
+        end
+        @test read(path, String) == "what the item printed\n"     # nothing yet
+        YATF.flush_dying_log!(slot)
+        @test readlines(path) == ["what the item printed", "signal 1", "signal 2", "signal 3"]
+        # ...and the slot is ready for the process that replaces this one.
+        @test isempty(slot.dying_lines)
+        @test isempty(slot.dying_log)
+
+        # A process can print without limit on its way down.
+        slot.dying_log = path
+        for i in 1:(YATF.MAX_DYING_LINES + 50)
+            YATF.keep_dying_line!(slot, "line $i")
+        end
+        @test length(slot.dying_lines) == YATF.MAX_DYING_LINES
+        YATF.flush_dying_log!(slot)
+        @test length(readlines(path)) == 4 + YATF.MAX_DYING_LINES
+
+        # A log that cannot be written is a lost backtrace, never a failed run.
+        slot.dying_log = joinpath(dir, "no", "such", "dir", "x.log")
+        YATF.keep_dying_line!(slot, "x")
+        @test YATF.flush_dying_log!(slot) === nothing
+        @test isempty(slot.dying_lines)
     end
 end

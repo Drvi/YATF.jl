@@ -1,12 +1,5 @@
-# Reading test files.
-#
-# The scanner never evaluates user code: it parses. Everything the scheduler,
-# the dry run, the config validator and the run state need is a pure function of
-# the file's bytes, so no test file can hang, crash or allocate in the process
-# that is coordinating the run.
-
-using Base.JuliaSyntax: JuliaSyntax, ParseStream, @K_str, kind, parse!, build_tree,
-    peek, peek_full_token, first_byte, any_error, ParseError
+# Reading test files. The scanner parses and never evaluates, so no test file can
+# hang, crash or allocate in the process that coordinates the run.
 
 const TEST_FILE_SUFFIXES = ("_test.jl", "_tests.jl")
 const TESTSETUPS_DIR = "testsetups"
@@ -23,15 +16,10 @@ discover(testdir::AbstractString) = first(walk_test_dir(testdir))
 """
     walk_test_dir(testdir) -> (tests, strays)
 
-Every test file under `testdir`, and every other Julia file found there, both
-sorted. Hidden directories, `testsetups/`, and directories holding their own
-`Project.toml` (subprojects) are not descended into, and neither are hidden files.
-
-`strays` exists because the alternative is silence. A run reads the files it
-recognizes; a file of tests that nobody named `*_test.jl` would simply never be
-read, and the run would report a clean pass without it. So the leftovers are
-collected and the run refuses to start until each one is named, moved into
-`testsetups/`, or removed.
+Every test file under `testdir`, and every other Julia file there, both sorted.
+Hidden files and directories, `testsetups/` and subprojects (directories with a
+`Project.toml`) are skipped. The strays are reported, not skipped: a file of tests
+not named `*_test.jl` would otherwise never run, and the run would pass without it.
 """
 function walk_test_dir(testdir::AbstractString)
     tests, strays = String[], String[]
@@ -87,113 +75,32 @@ end
 
 ### Statement extraction ###################################################
 
-# Two implementations of the same contract: given a file's bytes, hand back each
-# top-level statement as (line, Expr), plus the item name when it can be had
-# without building the tree.
-#
-# `:stream` uses Base.JuliaSyntax and can reject an item on its name without
-# building an AST for its body. Base.JuliaSyntax is internal to Base, so a
-# self-check decides which to use, and falls back to `:parseall`, which only uses
-# public API. The framework may get slower when a Base internal moves; it may not
-# break.
-#
-# The check runs once per process, the first time anything is scanned, so a
-# process that never scans never pays for it. The mode is passed down as an
-# argument, so a caller (the test suite, above all) can ask for one scanner
-# specifically.
+# `Meta.parseall` returns a syntax error as a statement at the line where parsing
+# stopped, rather than throwing. Nothing after it can be trusted, so it is the
+# file's one error.
 function scan_file!(
         items::Vector{RawItem}, errors::Vector{ScanError}, names::Vector{ItemName},
-        path::String, filter::Filter, known_setups, mode::Symbol
+        path::String, filter::Filter, known_setups
     )
-    bytes = try
-        read(path)
+    src = try
+        read(path, String)
     catch e
         push!(errors, ScanError(path, 0, "could not read file: $(sprint(showerror, e))"))
         return
     end
-    if mode === :stream
-        scan_stream!(items, errors, names, bytes, path, filter, known_setups)
-    else
-        scan_parseall!(items, errors, names, bytes, path, filter, known_setups)
-    end
-    return
-end
-
-function scan_stream!(items, errors, names, bytes::Vector{UInt8}, path, filter, known_setups)
-    stream = ParseStream(bytes)
-    line_starts = line_start_table(bytes)
-    nerr = length(errors)
-    # A file the selection cannot reach is still parsed; none of its bodies are.
-    wanted_file = matches_path(filter.paths, path)
-    while true
-        JuliaSyntax.bump_trivia(stream; skip_newlines = true)
-        peek(stream) == K"EndMarker" && break
-        line = line_at(line_starts, first_byte(stream))
-        name_bytes = peek_item_name(stream, bytes)
-        # An item the filter rejects on its name is rejected without building its
-        # body's AST; its name is still recorded, because names must be unique
-        # across the suite and not merely across this run.
-        skip_body = name_bytes !== nothing &&
-            (!wanted_file || (filter.line == 0 && !matches_name(filter.name, name_bytes)))
-        parse!(stream; rule = :statement)
-        if any_error(stream)
-            push!(errors, ScanError(path, line, sprint(showerror, ParseError(stream; filename = path))))
-            return
-        end
-        if skip_body
-            push!(names, ItemName(String(copy(name_bytes)), path, line))
-        else
-            ex = build_tree(Expr, stream; filename = path, first_line = line)
-            handle_statement!(items, errors, names, ex, path, line, filter, known_setups)
-        end
-        empty!(stream)
-    end
-    length(errors) == nerr || return
-    return
-end
-
-function scan_parseall!(items, errors, names, bytes::Vector{UInt8}, path, filter, known_setups)
-    ex = try
-        Meta.parseall(String(copy(bytes)); filename = path)
-    catch e
-        push!(errors, ScanError(path, 0, sprint(showerror, e)))
-        return
-    end
     line = Int32(0)
-    for a in ex.args
+    for a in Meta.parseall(src; filename = path).args
         if a isa LineNumberNode
             line = Int32(a.line)
+        elseif a isa Expr && a.head in (:error, :incomplete)
+            msg = a.args[1]
+            push!(errors, ScanError(path, line, msg isa AbstractString ? msg : sprint(showerror, msg)))
+            return
         else
             handle_statement!(items, errors, names, a, path, line, filter, known_setups)
         end
     end
     return
-end
-
-# Byte offset of the start of each line, so a byte position maps to a line number
-# with one binary search instead of a scan.
-function line_start_table(bytes::Vector{UInt8})
-    starts = Int32[1]
-    for i in eachindex(bytes)
-        bytes[i] == UInt8('\n') && push!(starts, Int32(i + 1))
-    end
-    return starts
-end
-
-line_at(starts::Vector{Int32}, pos::Integer) = Int32(searchsortedlast(starts, Int32(pos)))
-
-# `@testitem "name"` has a fixed token shape; read the name out of it without
-# building a tree. Returns `nothing` for any other shape, which then takes the
-# ordinary path and produces a proper error message.
-function peek_item_name(stream, bytes::Vector{UInt8})
-    kind(peek_full_token(stream, 1)) == K"@" || return nothing
-    t2 = peek_full_token(stream, 2)
-    view(bytes, t2.first_byte:t2.last_byte) == b"testitem" || return nothing
-    kind(peek_full_token(stream, 3)) == K"\"" || return nothing
-    t4 = peek_full_token(stream, 4)
-    kind(t4) == K"String" || return nothing
-    kind(peek_full_token(stream, 5)) == K"\"" || return nothing
-    return view(bytes, t4.first_byte:t4.last_byte)
 end
 
 ### Header parsing #########################################################
@@ -232,9 +139,7 @@ end
 
 function parse_testitem(ex::Expr, path, line, errors, known_setups)
     err(msg) = (push!(errors, ScanError(path, line, msg)); nothing)
-    # Walked by index rather than through slices of `ex.args`: this runs once for
-    # every item in the suite, and two slices per item is two copies per item of
-    # something already in memory.
+    # Indexed rather than sliced: slices would copy `ex.args` twice for every item.
     lo, hi = 2, length(ex.args)
     lo > hi && return err("`@testitem` needs a name and a body")
     if ex.args[lo] isa LineNumberNode
@@ -337,8 +242,8 @@ function literal(@nospecialize(v))
         return isempty(out) ? Any[] : [x for x in out]
     end
     if v isa Expr && v.head === :call && length(v.args) == 3 && v.args[1] in (:*, :+, :-, :/)
-        # `timeout=5*60` reads better than `timeout=300`; constant folding of
-        # literal arithmetic is safe because there is nothing to look up.
+        # `timeout=5*60` reads better than `timeout=300`, and folding literal
+        # arithmetic looks nothing up.
         a, b = literal(v.args[2]), literal(v.args[3])
         (a isa Real && b isa Real) || return NotALiteral()
         return getfield(Base, v.args[1])(a, b)
@@ -376,30 +281,25 @@ end
     scan(files, filter, known_setups; ntasks, strays) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
-(file, line). Throws `ScanFailure` listing every problem found — the `strays`
-among them — so one run surfaces every broken file rather than the first one.
+(file, line). Throws a `ScanFailure` listing every problem, the `strays` among
+them, so one run surfaces every broken file.
 """
 function scan(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
-        ntasks::Int = default_scan_tasks(), mode::Symbol = scanner_mode(),
+        ntasks::Int = default_scan_tasks(),
         strays::Vector{String} = String[]
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
-    # A file holds tens of items; starting the buffers there saves the first
-    # handful of doublings, each of which copies every `RawItem` found so far.
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64)) for _ in 1:nt]
     ch = Channel{String}(length(files))
     foreach(f -> put!(ch, f), files)
     close(ch)
-    # The buffers are taken out of `chunks` here and interpolated into the task:
-    # a task that indexed `chunks` itself would read the loop variable when it
-    # runs rather than when it was spawned, and two tasks would share one buffer.
     @sync for t in 1:nt
         items, errors, names = chunks[t]
         Threads.@spawn begin
             its, errs, nms = $items, $errors, $names
             for path in ch
-                scan_file!(its, errs, nms, path, filter, known_setups, mode)
+                scan_file!(its, errs, nms, path, filter, known_setups)
             end
         end
     end
@@ -419,8 +319,7 @@ function scan(
     return items
 end
 
-# More tasks than threads hides IO latency; too many multiplies GC pressure on an
-# allocation-heavy parse. Capped because parsing is allocation-bound, not IO-bound.
+# Twice the threads to hide file IO; capped, because parsing is allocation-bound.
 default_scan_tasks() = clamp(2 * Threads.nthreads(), 1, 16)
 
 # `runtests("file.jl:42")` means the item that line is inside: the last one that
@@ -458,45 +357,4 @@ function check_unique_names(items::Vector{RawItem}, rejected::Vector{ItemName} =
     end
     isempty(errors) || throw(ScanFailure(errors))
     return items
-end
-
-### Self-check #############################################################
-
-const SELFCHECK_SOURCE = """
-@testitem "a" tags=[:x] timeout=2 begin
-    using Test
-    @test true
-end
-@testitem "b" chain=:c begin
-    @test false
-end
-"""
-
-"""
-    scanner_mode() -> Symbol
-
-Which statement extractor to use, `:stream` or `:parseall`, decided once per
-process by running the streaming scanner against a known input. If Base's
-internals have moved under us it answers `:parseall`, so the framework gets
-slower rather than wrong.
-"""
-const scanner_mode = OncePerProcess{Symbol}() do
-    try
-        items, errors, names = RawItem[], ScanError[], ItemName[]
-        bytes = Vector{UInt8}(codeunits(SELFCHECK_SOURCE))
-        known = Dict{Symbol, String}()
-        scan_stream!(items, errors, names, bytes, "selfcheck.jl", Filter(), known)
-        ok = isempty(errors) && length(items) == 2 &&
-            items[1].name == "a" && items[1].tags == [:x] && items[1].timeout_s == 2 &&
-            items[1].line == 1 && items[2].name == "b" && items[2].chain === :c &&
-            items[2].line == 5
-        # The name fast path must agree with the parsed name, or filtering lies.
-        stream = ParseStream(bytes)
-        JuliaSyntax.bump_trivia(stream; skip_newlines = true)
-        nm = peek_item_name(stream, bytes)
-        ok &= nm !== nothing && String(copy(nm)) == "a"
-        ok ? :stream : :parseall
-    catch
-        :parseall
-    end
 end

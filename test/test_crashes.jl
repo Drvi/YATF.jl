@@ -24,6 +24,42 @@ end
 """
 
 @testset "crashes" begin
+    @testset "a worker that dies says how its process ended" begin
+        with_runstate_dir() do dir
+            (states, _, _), out = capture_run() do
+                run_states(fixture("Faulty.jl"); workers=1, tags=nothing, name=Set(["kills its worker"]),
+                           logs=:issues, monitor=false)
+            end
+            @test states["kills its worker"] === ERRORED
+            @test occursin("died while running \"kills its worker\": exited with code 7", out)
+            @test occursin("the worker running this item died: exited with code 7", out)
+            rs = read_run_state(only(readdir(dir; join=true)))
+            down = only(e for e in rs.events if e.kind === :worker_down)
+            @test down.ended_by in (:connection_lost, :process_exit)
+            @test (down.exitcode, down.signal) == (7, 0)
+            @test only(e for e in rs.events if e.kind === :attempt).pid == down.pid == only(rs.statuses).pid
+        end
+    end
+
+    if !Sys.iswindows()
+        @testset "what an item printed survives its worker being killed" begin
+            dir = make_pkg("KilledMidway", "test/k_test.jl" => """
+            @testitem "killed" begin
+                println("the last line before the kill")
+                run(`kill -9 \$(getpid())`)
+                sleep(10)
+            end
+            """)
+            (states, _, _), out = capture_run() do
+                run_states(dir; workers=1, logs=:issues, monitor=false)
+            end
+            @test states["killed"] === ERRORED
+            @test occursin("the last line before the kill", out)
+            @test occursin("killed by signal 9", out)
+            @test occursin("which nothing in this run sent", out)
+        end
+    end
+
     @testset "a worker that dies in its init expression is replaced" begin
         with_marker_dir() do work
             marker = joinpath(work, "count")
@@ -152,6 +188,25 @@ end
             rs = read_run_state(run.runstate.path)
             @test rs.complete
             @test !rs.cancelled
+            # Stamped when it started and again when it finished, in that order.
+            @test 0 < rs.start_unix <= rs.end_unix
+        end
+    end
+
+    @testset "a run state that cannot be written is done without" begin
+        # A directory beneath an ordinary file cannot be created on any platform.
+        blocker = touch(tempname())
+        try
+            dir = make_pkg("NoRunState", "test/t_test.jl" => ONE_ITEM)
+            # Said through the run's own printer, like every record raised during a run.
+            (states, run, _), out = withenv("YATF_RUNSTATE_DIR" => joinpath(blocker, "runs")) do
+                capture_run(() -> run_states(dir; workers=0, logs=:issues, monitor=false))
+            end
+            @test occursin("could not open a run state", out)
+            @test run.runstate === nothing
+            @test states["the item"] === PASSED
+        finally
+            rm(blocker; force=true)
         end
     end
 
@@ -168,8 +223,8 @@ end
             run_states(dir; workers=1, logs=:issues, monitor=false, failfast=true)
             h = history(dir; nruns=1)
             # The failure and the item that never got a turn, both.
-            @test "a fails" in h.failed
-            @test "b never runs" in h.failed
+            @test haskey(h.failed, "a fails")
+            @test haskey(h.failed, "b never runs")
         end
     end
 end
@@ -177,10 +232,18 @@ end
 # The checkout, for a child process that has to find the same one.
 const REPO_ROOT = dirname(@__DIR__)
 
+# Whether a pid belongs to a process that is still there. Signal 0 checks for one
+# without sending anything; the workers are the dead coordinator's children, so
+# they are reparented and reaped rather than left as zombies.
+process_alive(pid::Integer) = ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0
+
+# Windows has no signal to send: `kill` there terminates the process outright, so
+# there is no teardown to watch.
+Sys.iswindows() ||
 @testset "an interrupt takes the workers with it, at once" begin
-    # Ctrl-C is someone asking for their terminal back. The run used to let every
-    # slot finish the item it had in flight first, so an item with a long sleep in
-    # it held the interrupt for as long as it liked.
+    # Ctrl-C is someone asking for their terminal back: the run goes down without
+    # waiting for the item each slot has in flight, which here sleeps for ten
+    # minutes.
     ready = joinpath(mktempdir(), "ready")
     script = """
     # A script exits on SIGINT unless told otherwise; a REPL raises it, and the
@@ -211,10 +274,11 @@ const REPO_ROOT = dirname(@__DIR__)
     write(io, script)
     close(io)
     err = Base.BufferStream()
+    log = Base.BufferStream()
     proc = run(pipeline(
         setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
                "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
-        stdout = devnull, stderr = err,
+        stdout = log, stderr = err,
     ); wait = false)
     # The items say when they are running, so the interrupt lands mid-item rather
     # than during an environment build that can take minutes.
@@ -228,11 +292,36 @@ const REPO_ROOT = dirname(@__DIR__)
     wait(proc)
     elapsed = time() - t0
     close(err)
+    close(log)
     out = read(err, String)
+    printed = read(log, String)
+    started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
     rm(path; force=true)
-    @test occursin("CAUGHT InterruptException", out)
-    @test occursin("ALIVE 0", out)
     # Generously above the second it takes, and far below the ten minutes an item
     # here sleeps for: what is checked is that it does not wait for them.
     @test elapsed < 30
+    # Asked from outside the run, because that is where it matters: whatever the
+    # coordinator got to do on its way down, no worker of its is still running. A
+    # worker takes a moment to die after the signal reaches it.
+    @test length(started) == 4
+    deadline = time() + 10
+    while time() < deadline && any(process_alive, started)
+        sleep(0.2)
+    end
+    @test !any(process_alive, started)
+    # The report never happens — the exception takes the run out before it — so the
+    # run says what it got through on its way past. The items it took a worker away
+    # from did not fail and are counted, not reported one by one. On 1.12 nothing
+    # unwinds to say this, and the exit hook is what says it instead.
+    @test occursin("interrupted after 0 of 4 test items", printed)
+    @test occursin("4 cancelled", printed)
+    @test !occursin("the worker running this item died", printed)
+    @test !occursin("ERR ", printed)
+    # The run itself sees the exception from 1.13. On 1.12 it is delivered to
+    # whichever task thread 1 is running, which between items is one that has
+    # already finished and has nothing left to catch it; the process dies there.
+    if VERSION >= v"1.13"
+        @test occursin("CAUGHT InterruptException", out)
+        @test occursin("ALIVE 0", out)
+    end
 end

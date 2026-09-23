@@ -1,5 +1,7 @@
 # YATF.jl
 
+[![CI](https://github.com/Drvi/YATF.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Drvi/YATF.jl/actions/workflows/CI.yml)
+
 Yet another testing framework. Runs a package's tests as independent *test items*
 across worker processes.
 
@@ -201,7 +203,10 @@ downloaded from CI says what to check out to reproduce it, and a flag saying the
 run was cancelled, which is what makes the items with no result in it mean "never
 reached" rather than "passed".
 
-Later runs use it to put last time's failures first and to estimate durations.
+Later runs use it to decide the order: recent failures and items in test files
+changed since the last run go first, then items long enough to set the length of
+the run, then the rest in file order — each worker walking its own stretch of
+files, so that neighbouring items reuse what the worker has already compiled.
 `YATF.runtests(replay="…/run.yatf")` re-creates the worker configuration a run
 recorded — only when asked: a run state lying next to the project is not a request
 to run differently, and an explicit keyword always wins. The path is printed at the

@@ -1,9 +1,30 @@
 using YATF: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
             SKIPPED, BROKEN_CHAIN, CANCELLED, ConfigError, nitems, is_non_pass
 using Logging: Logging
+using Random: Random
 
 const FAULTY = fixture("Faulty.jl")
 const BASICPKG = fixture("Basic.jl")
+
+@testset "every item draws from the run's seed, whatever ran before it" begin
+    with_journal() do jdir
+        pkg = make_pkg("Seeded", "test/s_test.jl" => """
+        @testitem "one" begin
+            write(joinpath(ENV["YATF_JOURNAL"], "one-" * string(time_ns())), string(rand(UInt64)))
+        end
+        @testitem "two" begin
+            write(joinpath(ENV["YATF_JOURNAL"], "two-" * string(time_ns())), string(rand(UInt64)))
+        end
+        """)
+        Random.seed!(42); expected = rand(UInt64); Random.seed!(42)
+        run_states(pkg; workers=0, seed=7, logs=:issues, monitor=false)
+        @test rand(UInt64) == expected   # the caller's own stream, untouched by the items
+        run_states(pkg; workers=1, seed=7, name="two", logs=:issues, monitor=false)
+        draws(prefix) = [read(f, String) for f in readdir(jdir; join=true) if startswith(basename(f), prefix)]
+        @test length(draws("two-")) == 2 && allequal(draws("two-"))   # after "one", or alone on a worker
+        @test only(draws("one-")) != first(draws("two-"))
+    end
+end
 
 @testset "execute" begin
     @testset "a passing suite passes, on workers and in-process" begin
@@ -101,7 +122,8 @@ const BASICPKG = fixture("Basic.jl")
     end
 
     @testset "retries work the same way in this process" begin
-        # The in-process path has its own loop; it must apply the same policy.
+        # An attempt in this process goes through the same attempt loop as one on a
+        # worker; what differs is only how the item is run.
         with_marker_dir() do dir
             states, _, _ = run_states(FAULTY; workers=0, tags=[:retry], logs=:issues)
             @test states["passes on the second try"] === PASSED
@@ -147,20 +169,24 @@ const BASICPKG = fixture("Basic.jl")
     end
 
     @testset "failfast stops the run" begin
-        states, _, _ = run_states(FAULTY; workers=1, failfast=true, logs=:issues,
+        states, _, _ = run_states(FAULTY; workers=1, failfast=true, retries=1, logs=:issues,
                                   name=r"^(fails|passes|errors)$")
-        @test any(is_non_pass, values(states))
+        # The item that stopped the run is still the failure it was once its retry
+        # has failed too: stopping under the retry would record it as cancelled.
+        @test count(s -> s === FAILED || s === ERRORED, values(states)) == 1
         @test any(==(UNSEEN), values(states)) || length(states) == 1
     end
 
-    @testset "an in-process run prints through the coordinator's printer" begin
-        # The item checks this from the inside, in both modes; here we check the
-        # sink is left as it was found.
+    @testset "an item's RUN and DONE lines are drawn by the coordinator, on a worker or not" begin
         for workers in (0, 1)
-            @test YATFWorkers.LOG_SINK[] === nothing
-            states, _, _ = run_states(FAULTY; workers, tags=[:routing], logs=:issues)
+            (states, _, _), out = capture_run() do
+                run_states(FAULTY; workers, tags=[:routing], logs=:issues)
+            end
             @test states["its own log lines go through the coordinator"] === PASSED
-            @test YATFWorkers.LOG_SINK[] === nothing
+            @test count("· RUN ", out) == 1
+            @test count("· DONE ", out) == 1
+            # What a worker writes about an item is data for the coordinator.
+            @test !occursin(YATFWorkers.RECORD_MARK, out)
         end
     end
 

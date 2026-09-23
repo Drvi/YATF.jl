@@ -1,37 +1,33 @@
 # Worker processes.
 #
 # One worker is one Julia process on this machine, connected to the coordinator
-# over a loopback TCP socket. The coordinator sends one request at a time, and the
+# over a loopback TCP socket. The coordinator sends one request at a time and the
 # worker answers each on its root task before reading the next, so nothing in the
-# protocol is ever concurrent. Two request kinds and two reply kinds cover a test
-# run:
+# protocol is concurrent:
 #
 #     EVAL  expr::Expr                       -> RESULT nothing            | ERROR message::String
 #     RUN   spec::ItemSpec                   -> RESULT result::ItemResult | ERROR message::String
 #     END   (spec::ItemSpec, test_end::Expr) -> RESULT result::ItemResult | ERROR message::String
 #
-# RUN and END are separate requests because they are timed separately: a profile's
-# test-end expression is the suite's own code, and the time it takes is not the
-# item's. A profile without one sends no END request at all.
+# RUN and END are separate because they are timed separately: a profile's
+# `test_end` is the suite's code, not the item's.
 #
-# Errors cross the wire as strings. An exception object can hold a type that
-# exists only on the worker, and the coordinator could not even deserialize it; a
-# string always arrives. The only object that crosses is an item's result, and a
-# result that cannot be serialized becomes an ERROR that says so.
+# Errors cross as strings, because an exception can hold a type that exists only on
+# the worker. The only object that crosses is an item's result, and one that cannot
+# be serialized becomes an ERROR that says so.
 #
 # Each message is
 #
 #     id::UInt64  kind::UInt8  len::UInt32  payload[len]  MSG_BOUNDARY
 #
-# The whole message is assembled in memory before any of it is written, so a
-# payload that fails to serialize leaves nothing on the wire, and the header is
-# raw, so a payload that fails to deserialize is still reported against its
-# request. The boundary is a check, not a resynchronization point: the header
-# carries the length, so a missing boundary means the stream is corrupt, and the
-# connection is dropped rather than trusted.
+# assembled whole before any of it is written, so a payload that fails to serialize
+# leaves nothing on the wire. The header is raw, so a payload that fails to
+# deserialize is still reported against its request. The boundary is a check, not
+# a resynchronization point: a missing one means the stream is corrupt, and the
+# connection is dropped.
 #
-# Closing the connection is the shutdown request: a worker exits when it reads
-# EOF, whether the coordinator closed the socket on purpose or died.
+# Closing the connection is the shutdown request: a worker exits when it reads EOF,
+# whether the coordinator closed the socket or died.
 
 export Worker, remote_eval, remote_fetch, remote_run, remote_end, inspect!, terminate!,
        WorkerTerminatedException, RemoteException
@@ -47,18 +43,15 @@ const KIND_END    = UInt8(5)
 const MSG_BOUNDARY = UInt8[0x79, 0x8e, 0x8e, 0xf5, 0x6e, 0x9b, 0x2e, 0x97, 0xd5, 0x7d]
 const HEADER_BYTES = sizeof(UInt64) + sizeof(UInt8) + sizeof(UInt32)
 
-# The coordinator writes a cookie to the worker's stdin, and the worker serves the
-# one connection that presents it. Same machine, so this is not about attackers:
-# it stops a port scanner or an endpoint agent from taking the worker's only
-# connection and leaving the coordinator waiting for a worker that will never
-# answer.
+# The coordinator writes a cookie to the worker's stdin, and the worker serves only
+# the connection that presents it. Not against attackers: it stops a port scanner
+# or an endpoint agent from taking the worker's one connection.
 const COOKIE_BYTES = 32
 
-# Once the coordinator closes the connection a healthy worker exits within
-# milliseconds. Julia prints every thread's backtrace on SIGTERM before exiting,
-# which is a hung worker's most useful last words, so SIGTERM gets a moment
-# before SIGKILL. A process that survives SIGKILL is stuck in the kernel, and
-# nothing more can be done about it from here.
+# A healthy worker exits within milliseconds of the connection closing. On SIGTERM
+# Julia prints every thread's backtrace, a hung worker's most useful last words, so
+# SIGTERM gets a moment before SIGKILL. A process that survives SIGKILL is stuck in
+# the kernel.
 const GRACEFUL_EXIT_SECONDS = 3
 const TERM_GRACE_SECONDS    = 2
 const KILL_WAIT_SECONDS     = 10
@@ -72,13 +65,9 @@ struct Frame
     error   :: Any     # the exception, when the payload could not be deserialized here
 end
 
-# `serialize` in the latest world, so that a `serialize` method a test item
-# defined for one of its own types is used rather than the generic path.
-#
-# `sizehint` is what the last message to this worker came to. An `IOBuffer` starts
-# at 32 bytes and doubles, so serializing an item's syntax tree into a fresh one
-# copies it through every power of two on the way; the messages in a run are all
-# much the same size, so the previous one is a good guess at the next.
+# `serialize` in the latest world, so a method a test item defined for its own type
+# is used. `sizehint` is the size of the previous message: a run's messages are
+# much alike, and a fresh `IOBuffer` doubles its way up from 32 bytes.
 function encode_message(id::UInt64, kind::UInt8, payload, sizehint::Integer = 0)
     buf = IOBuffer(; sizehint = max(Int(sizehint), 64))
     write(buf, id, kind, UInt32(0))
@@ -91,17 +80,9 @@ function encode_message(id::UInt64, kind::UInt8, payload, sizehint::Integer = 0)
     return take!(buf)
 end
 
-"""
-    FrameReader
-
-The byte buffers one reader reuses between messages.
-
-A connection is read by exactly one task — `process_responses` on the coordinator,
-`serve_requests` on the worker — so these need no locking, and the bytes of a
-message are finished with before the next one is read. What the payload
-*deserializes into* cannot be reused: an item's code and a test's results are
-arbitrary object graphs, and building them is the point.
-"""
+# The byte buffers one reader reuses between messages. A connection is read by
+# exactly one task (`process_responses` on the coordinator, `serve_requests` on the
+# worker), so they need no lock.
 struct FrameReader
     header   :: Vector{UInt8}
     payload  :: Vector{UInt8}
@@ -112,9 +93,7 @@ FrameReader() = FrameReader(
     zeros(UInt8, HEADER_BYTES), UInt8[], zeros(UInt8, length(MSG_BOUNDARY))
 )
 
-# `read(io, T)` for a number allocates a `Ref` to read into, so a header read
-# field by field is three allocations before the payload is even looked at. The
-# header comes in as bytes and is picked apart in place.
+# Picked apart in place: `read(io, T)` of a number allocates a `Ref` per field.
 @inline function header_field(buf::Vector{UInt8}, ::Type{T}, offset::Int) where {T}
     return GC.@preserve buf unsafe_load(Ptr{T}(pointer(buf, offset + 1)))
 end
@@ -166,14 +145,41 @@ mutable struct Worker
     @atomic last_encoded :: Int          # size of the last message sent, as a buffer hint
     @atomic terminated :: Bool
     @atomic closing    :: Bool           # the coordinator closed the connection and expects the worker to exit on its own
+    # Why the process was ended: the `from` of the first `terminate!`, `:interrupt`
+    # for `kill!`. `:connection_lost` and `:process_exit` mean it ended on its own.
+    @atomic ended_by   :: Symbol
+    const on_exit    :: Any              # called with the worker once its process has exited, or nothing
 end
 
 struct WorkerTerminatedException <: Exception
     worker::Worker
 end
 
-Base.showerror(io::IO, e::WorkerTerminatedException) =
+function Base.showerror(io::IO, e::WorkerTerminatedException)
     print(io, "worker ", e.worker.pid, " terminated")
+    process_exited(e.worker.process) && print(io, ": ", exit_description(e.worker.process))
+end
+
+"""
+    exit_description(process) -> String
+
+How a process ended, as a report says it: `exited with code 7`, or `killed by
+signal 9 (Killed)`.
+"""
+function exit_description(p::Base.Process)
+    p.termsignal == 0 || return string("killed by signal ", p.termsignal, signal_name(p.termsignal))
+    # A Windows status such as 0xC0000005 means something in hex and nothing in decimal.
+    code = p.exitcode
+    return string("exited with code ", 0 <= code <= 255 ? string(code) : string("0x", string(UInt32(code % UInt32); base = 16, pad = 8)))
+end
+
+function signal_name(sig::Integer)
+    Sys.iswindows() && return ""
+    name = ccall(:strsignal, Cstring, (Cint,), sig)
+    name == C_NULL && return ""
+    # macOS appends the number ("Killed: 9"), which the caller has already said.
+    return string(" (", replace(unsafe_string(name), r":\s*\d+$" => ""), ")")
+end
 
 """
     RemoteException
@@ -292,16 +298,18 @@ that the number of live processes never exceeds the configured cap.
 function terminate!(w::Worker, from::Symbol=:manual, cause::Exception=WorkerTerminatedException(w))
     (; success) = @atomicreplace w.terminated false => true
     success || return nothing
+    @atomic w.ended_by = from
     @lock w.lock begin
         for (_, fut) in w.futures
             close(fut.value, cause)
         end
         empty!(w.futures)
     end
-    # A worker whose connection the coordinator closed exits on its own. Signalling
-    # a process that is already exiting turns the end of a normal run into a crash
-    # in the log, so it gets a moment to leave first.
-    w.closing && wait_exit(w.process, GRACEFUL_EXIT_SECONDS)
+    # A worker that is already exiting (the coordinator closed the connection, or
+    # the worker closed its own) gets a moment to finish. Signalled, it would report
+    # the signal instead of the exit status it was about to give, and print a
+    # backtrace for a crash that never happened.
+    (w.closing || from === :connection_lost) && wait_exit(w.process, GRACEFUL_EXIT_SECONDS)
     if !process_exited(w.process)
         signal!(w.pid, w.process, Base.SIGTERM)
         if !wait_exit(w.process, TERM_GRACE_SECONDS)
@@ -318,25 +326,27 @@ end
 function watch_and_terminate!(w::Worker, ev::Threads.Event)
     notify(ev)
     wait(w.process)
-    terminate!(w, :process_exit)
+    terminate!(w, w.closing ? :close : :process_exit)
+    w.on_exit === nothing && return nothing
+    try
+        w.on_exit(w)
+    catch e
+        @error "YATF: recording the exit of worker $(w.pid) failed" exception = (e, catch_backtrace())
+    end
     return nothing
 end
 
-# Closing the connection is the shutdown request; `terminate!` gives the worker a
-# few seconds to act on it before escalating to signals.
 """
     kill!(w)
 
-Stop the worker now, with none of the grace an orderly shutdown allows.
-
-An interrupt is someone asking for their terminal back. `terminate!` gives the
-process a window to exit on its own and then another to handle `SIGTERM`, which
-across a pool is most of a minute; here it is killed outright and whatever it was
-doing is abandoned. Safe to call on a worker already being torn down — that is the
-common case, since the interrupt lands while the run is in the middle of one.
+Stop the worker now, without the grace `terminate!` allows: an interrupt is someone
+asking for their terminal back, and across a pool the graceful windows add up to
+most of a minute. Safe on a worker already being torn down, which is the common
+case.
 """
 function kill!(w::Worker)
-    @atomic w.terminated = true
+    (; success) = @atomicreplace w.terminated false => true
+    success && (@atomic w.ended_by = :interrupt)
     @lock w.lock begin
         for (_, fut) in w.futures
             close(fut.value, WorkerTerminatedException(w))
@@ -353,6 +363,8 @@ function kill!(w::Worker)
     return nothing
 end
 
+# Closing the connection is the shutdown request; `terminate!` gives the worker a
+# moment to act on it before signalling.
 function Base.close(w::Worker)
     @atomic w.closing = true
     close(w.socket)
@@ -361,10 +373,8 @@ function Base.close(w::Worker)
     return nothing
 end
 
-# Waits for the worker's tasks to finish and never throws: by the time anyone
-# waits, the worker is being torn down, and a task that failed on the way out has
-# already reported itself. Propagating here would take down the coordinator's
-# slot, and with it the rest of that slot's queue.
+# Never throws: by now the worker is being torn down, and a task that failed on the
+# way out has reported itself. Throwing would take down the slot and its queue.
 function Base.wait(w::Worker)
     for t in (w.process_watch, w.messages, w.output)
         try
@@ -382,12 +392,15 @@ end
 # `Base.require` on the `PkgId` finds it through the manifest either way.
 const PKGID = Base.PkgId(@__MODULE__)
 
+# What separates the entries of a path list in an environment variable.
+const PATHSEP = Sys.iswindows() ? ";" : ":"
+
 worker_startup_code(connect_timeout::Real) = string(
     "YATFWorkers = Base.require(Base.PkgId(Base.UUID(\"", PKGID.uuid, "\"), \"YATFWorkers\")); ",
     "YATFWorkers.startworker(", connect_timeout, ")")
 
 """
-    Worker(; julia_args, threads, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn)
+    Worker(; julia_args, threads, extra_env, dir, project, connect_timeout, redirect_io, redirect_fn, on_exit)
 
 Start a worker process and connect to it.
 """
@@ -401,14 +414,14 @@ function Worker(;
         connect_timeout::Int=60,
         redirect_io::IO=stdout,
         redirect_fn=(io, pid, line) -> println(io, "      worker ", pid, " | ", line),
+        on_exit=nothing,
     )
     env = Dict{String,String}(env)
     for (k, v) in extra_env
         env[k] = v
     end
-    pathsep = Sys.iswindows() ? ";" : ":"
-    haskey(env, "JULIA_LOAD_PATH") || (env["JULIA_LOAD_PATH"] = join(LOAD_PATH, pathsep))
-    haskey(env, "JULIA_DEPOT_PATH") || (env["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, pathsep))
+    haskey(env, "JULIA_LOAD_PATH") || (env["JULIA_LOAD_PATH"] = join(LOAD_PATH, PATHSEP))
+    haskey(env, "JULIA_DEPOT_PATH") || (env["JULIA_DEPOT_PATH"] = join(DEPOT_PATH, PATHSEP))
     project === nothing || haskey(env, "JULIA_PROJECT") || (env["JULIA_PROJECT"] = project)
     # Every worker would otherwise start a BLAS thread pool sized for the whole machine.
     haskey(env, "OPENBLAS_NUM_THREADS") || (env["OPENBLAS_NUM_THREADS"] = "1")
@@ -440,7 +453,7 @@ function Worker(;
         end
         w = Worker(ReentrantLock(), ReentrantLock(), pid, proc, sock,
                    Task(nothing), Task(nothing), Task(nothing),
-                   Dict{UInt64,Future}(), UInt64(0), 0, false, false)
+                   Dict{UInt64,Future}(), UInt64(0), 0, false, false, :none, on_exit)
         e1 = Threads.Event(); w.process_watch = Threads.@spawn watch_and_terminate!(w, $e1)
         e2 = Threads.Event(); w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, $e2)
         e3 = Threads.Event(); w.messages = Threads.@spawn process_responses(w, $e3)
@@ -469,7 +482,7 @@ function read_port(proc::Base.Process, io::IO, pid::Integer, fn)
         isempty(line) || (fn(io, pid, line); flush(io))
     end
     wait(proc)
-    error("worker process exited before it was ready (exit code $(proc.exitcode), signal $(proc.termsignal))")
+    error("the worker process ", exit_description(proc), " before it was ready")
 end
 
 # The result travels through a channel rather than a condition: a condition's
@@ -541,16 +554,12 @@ function process_responses(w::Worker, ev::Threads.Event)
                     "everything they hold must be of a type the coordinator knows; a custom ",
                     "AbstractTestSet or exception type defined inside a test is the usual cause.")))
             elseif frame.kind === KIND_RESULT
-                # The waiter may have given up and closed this channel — a request
-                # past its deadline does that. The reply is late, not wrong, and
-                # dropping it is not a reason to distrust the connection.
+                # The waiter may have given up and closed the channel, as a request
+                # past its deadline does: the reply is late, not wrong. `put!` then
+                # raises whatever reason the channel was closed with.
                 try
                     put!(fut.value, frame.payload)
                 catch e
-                    # Closing a channel carries the reason, and `put!` raises that
-                    # reason rather than an `InvalidStateException` — a timeout
-                    # would come back here as the timeout. Whatever it says, a
-                    # closed channel means the waiter has gone.
                     isopen(fut.value) && rethrow()
                 end
             elseif frame.kind === KIND_ERROR
@@ -561,7 +570,7 @@ function process_responses(w::Worker, ev::Threads.Event)
         end
     catch e
         if e isa EOFError || e isa Base.IOError
-            terminate!(w, :connection_lost)   # the worker died, or the coordinator closed the connection
+            terminate!(w, w.closing ? :close : :connection_lost)   # the coordinator closed it, or the worker died
         else
             @error "YATF: protocol error with worker $(w.pid); terminating it" exception=(e, catch_backtrace())
             terminate!(w, :protocol_error, e)
@@ -666,23 +675,19 @@ function startworker(connect_timeout::Real)
     exit(0)
 end
 
-# On SIGINFO or SIGUSR1 the runtime prints every thread's backtrace and collects a
-# short CPU profile, and `Profile` reports that profile afterwards from a task.
-# In a deadlock the blocked tasks are what matters and no thread is running them,
-# so their backtraces go first. Best effort: a worker without the hook is still a
-# worker.
 """
     wide_display(f)
 
-Run `f` with a display size no terminal has.
-
-A worker's output is a pipe, and `displaysize` calls a pipe eighty columns wide.
-A profile report is a table of file, line and function laid out to that width, so
-eighty columns is exactly where the part naming what ran gets cut off — which is
-the only part worth having.
+Run `f` with a display size no terminal has. A worker's output is a pipe, which
+`displaysize` calls eighty columns wide, and a profile report laid out to that
+width cuts off the part that names what ran.
 """
 wide_display(f) = withenv(f, "COLUMNS" => "10000", "LINES" => "10000")
 
+# On SIGINFO or SIGUSR1 the runtime prints every thread's backtrace and collects a
+# short CPU profile, which `Profile` reports afterwards from a task. In a deadlock
+# the blocked tasks matter and no thread runs them, so their backtraces go first.
+# Best effort: a worker without the hook is still a worker.
 function install_inspection_hook()
     INSPECT_SIGNAL === nothing && return nothing
     try
@@ -726,8 +731,12 @@ function handle_request(frame::Frame)
             return KIND_ERROR, format_error(e, catch_backtrace())
         end
     elseif frame.kind === KIND_RUN
+        spec = frame.payload
         try
-            return KIND_RESULT, run_item(frame.payload)
+            println(stdout, record_run(spec)); flush(stdout)
+            result = run_item(spec)
+            println(stdout, record_done(spec, result)); flush(stdout)
+            return KIND_RESULT, result
         catch e
             return KIND_ERROR, "the worker could not run this test item: " * format_error(e, catch_backtrace())
         end

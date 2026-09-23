@@ -25,7 +25,7 @@ using Pkg: Pkg
                                                   "JULIA_LOAD_PATH" => nothing));
                               stdout=out, stderr=out))
         log = read(out, String)
-        ok || @info "the standalone package's tests failed; its output was:\n$log"
+        echo_captured(log)
         return ok, log
     end
 

@@ -1,3 +1,4 @@
+using Random: Random
 using YATF: init_run_state, write_status!, finish_run_state!, read_run_state, history,
             runstate_files, runstate_dir, prune_runstates, new_runstate_path, prepare,
             execute, plan, scan, discover, setup_modules, read_config, Filter, History,
@@ -26,7 +27,7 @@ end
         @test !rs.cancelled
         @test length(rs.items) == nitems(p)
         @test rs.items[1].name == p.items.name[1]
-        @test rs.julia == string(VERSION)
+        @test rs.meta["julia"] == string(VERSION)
         @test rs.statuses[1].state === PASSED
         @test rs.statuses[1].elapsed ≈ 1.5f0
         @test rs.statuses[1].compile ≈ 0.5f0
@@ -85,10 +86,15 @@ end
         finish_run_state!(init_run_state(path, p))
         full = read(path)
         garbled = joinpath(mktempdir(), "garbled.yatf")
-        for seed in 1:25
+        # Seeded, so that a corruption which breaks the reader breaks every run of
+        # this file rather than one in a hundred. A count is what usually does it:
+        # the number some garbled bytes happen to spell, taken as a length, is an
+        # allocation nobody comes back from.
+        rng = Random.Xoshiro(20250921)
+        for _ in 1:400
             bytes = copy(full)
             for _ in 1:20
-                bytes[rand(1:length(bytes))] = rand(UInt8)
+                bytes[rand(rng, 1:length(bytes))] = rand(rng, UInt8)
             end
             write(garbled, bytes)
             @test (read_run_state(garbled); true)
@@ -168,7 +174,7 @@ end
             run = execute(p, target)
             rm(run.logdir; force=true, recursive=true)
             h = history(pkg)
-            @test h.failed == Set(["fails"])
+            @test h.failed == Dict("fails" => 0)
             # `retry_failed` re-runs exactly those
             p2, _ = prepare((pkg,); workers=1, logs=:issues, name=Regex("^(fails)\$"))
             @test [p2.items.name[i] for i in 1:nitems(p2)] == ["fails"]
@@ -224,7 +230,7 @@ end
         p = plan(items, read_config(joinpath(dir, "test")); root=dir)
         path = joinpath(mktempdir(), "run.yatf")
         finish_run_state!(init_run_state(path, p))
-        @test read_run_state(path).revision == sha
+        @test read_run_state(path).meta["revision"] == sha
     end
 
     @testset "replay applies the worker configuration a run state recorded" begin
@@ -249,11 +255,79 @@ end
         prof = only(x for x in p2.profiles if x.name === :p)
         @test prof.julia_args == ["--check-bounds=yes"]
         @test prof.threads == "3"
-        @test occursin("applying the worker configuration recorded in", out)
+        @test occursin("replaying run.yatf", out)
 
         # A run state that cannot be read is an error, not a silent fallback to
         # whatever this checkout happens to say.
         @test_throws YATF.ConfigError prepare((dir,); replay=joinpath(mktempdir(), "nope.yatf"))
+    end
+
+    @testset "a run records where it ran, how it was asked for, and what each worker did" begin
+        with_runstate_dir() do dir
+            pkg = make_pkg("Recorded", "test/r_test.jl" => """
+            @testitem "a" begin
+                @test true
+            end
+            @testitem "b" begin
+                @test true
+            end
+            """)
+            run_states(pkg; workers=1, logs=:issues, monitor=false, seed=0x1234)
+            rs = read_run_state(only(readdir(dir; join=true)))
+            @test rs.meta["seed"] == "0x0000000000001234"
+            @test (rs.meta["workers"], rs.meta["machine"], rs.meta["julia"]) == ("1", Sys.MACHINE, string(VERSION))
+            @test occursin("[[deps.", rs.meta["environment_manifest"])
+            @test occursin("Recorded", rs.meta["environment_project"])
+            up, down = only(e for e in rs.events if e.kind === :worker_up), only(e for e in rs.events if e.kind === :worker_down)
+            @test down.ended_by === :close && down.pid == up.pid
+            attempts = [e for e in rs.events if e.kind === :attempt]
+            @test sort([rs.items[e.item].name for e in attempts]) == ["a", "b"]
+            @test all(e -> e.pid == up.pid && e.state === PASSED && e.t1 >= e.t0, attempts)
+            @test all(s -> s.pid == up.pid && s.peak_rss_mb > 0, rs.statuses)
+            @test occursin("run it again", sprint(show, MIME"text/plain"(), rs))
+        end
+    end
+
+    @testset "a replay runs the same items with the same settings and the same seed" begin
+        with_runstate_dir() do dir
+            with_journal() do jdir
+                pkg = make_pkg("Replayable", "test/r_test.jl" => """
+                @testitem "draws" begin
+                    write(joinpath(ENV["YATF_JOURNAL"], string(time_ns())), string(rand(UInt64)))
+                    @test true
+                end
+                """)
+                run_states(pkg; workers=1, retries=1, logs=:issues, monitor=false)
+                recorded = only(readdir(dir; join=true))
+                # An item added since is not part of the run that was recorded.
+                write(joinpath(pkg, "test", "later_test.jl"), "@testitem \"added later\" begin\n @test true\nend\n")
+                (p, _), out = capture_run(() -> prepare((pkg,); replay=recorded))
+                @test p.items.name == ["draws"]
+                @test p.cfg.retries == 1
+                @test p.cfg.seed == parse(UInt64, read_run_state(recorded).meta["seed"])
+                @test occursin("replaying ", out)
+                @test prepare((pkg,); replay=recorded, retries=0)[1].cfg.retries == 0   # the call still wins
+                _, out = capture_run(() -> run_states(pkg; replay=recorded, logs=:issues, monitor=false))
+                @test occursin("the environment matches the one the run state was recorded in", out)
+                draws = [read(f, String) for f in readdir(jdir; join=true)]
+                @test length(draws) == 2 && draws[1] == draws[2]
+            end
+        end
+    end
+
+    @testset "a manifest is read as package versions" begin
+        m = YATF.manifest_versions("""
+        manifest_format = "2.0"
+        [[deps.Foo]]
+        uuid = "7876af07-990d-54b4-ab0e-23690620f79a"
+        version = "1.2.3"
+        [[deps.Local]]
+        path = "/elsewhere"
+        uuid = "5b0c2a4e-7f3d-4e21-9c55-3a1f0e6d7b90"
+        [[deps.Test]]
+        uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+        """)
+        @test m == Dict("Foo" => "1.2.3", "Local" => "path", "Test" => "stdlib")
     end
 
     @testset "a run state lying next to the project does not change the next run" begin
