@@ -183,12 +183,13 @@ end
     # Whatever the process prints on its way down — a signal, a backtrace — is the
     # worker's, not the item's. This item prints nothing of its own, so a line
     # attributed to it would be a line attributed wrongly.
-    @test !occursin(YATF.MARK_ITEM, out)
+    @test !any(l -> startswith(l, YATF.MARK_ITEM * " w"), lines)
     @test any(l -> occursin(YATF.MARK_WORKER, l) && occursin("KILL", l), lines)
     # It is filed with the item rather than printed across the run: the only worker
     # lines left are the lifecycle words, and the rest went where the report for
     # this item will find it.
     lifecycle = l -> any(w -> occursin(w, l), ("UP", "EXIT", "KILL", "LOST"))
     @test all(lifecycle, filter(l -> occursin(YATF.MARK_WORKER, l), lines))
-    @test occursin("Captured logs", out)
+    # Windows ends a process with TerminateProcess, which prints nothing on the way.
+    Sys.iswindows() || @test occursin("Captured logs", out)
 end

@@ -201,7 +201,7 @@ end
 
         [[deps.Fixed]]
         uuid = "11111111-0000-4000-8000-000000000003"
-        path = "$(base)"
+        path = '$(base)'
         version = "0.3.0"
 
         [[deps.Itself]]

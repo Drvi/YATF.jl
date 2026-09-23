@@ -105,22 +105,23 @@ is process-level: it is visible to every task and inherited by subprocesses.
 """
 in_yatf_run() = haskey(ENV, "YATF_RUN_ID")
 
-# Adapted from Base.@time: we want compilation time separated out, because on a
-# compilation-heavy suite that is the number that explains the run.
-macro timed_with_compilation(ex)
-    quote
-        Base.Experimental.@force_compile
-        local gc0 = Base.gc_num()
-        local t0 = Base.time_ns()
-        Base.cumulative_compile_timing(true)
-        local c0 = Base.cumulative_compile_time_ns()
-        local val = Base.@__tryfinally($(esc(ex)),
-            (t0 = Base.time_ns() - t0;
-             Base.cumulative_compile_timing(false);
-             c0 = Base.cumulative_compile_time_ns() .- c0))
-        local diff = Base.GC_Diff(Base.gc_num(), gc0)
-        val, PerfStats(; elapsed_ns=t0, compile_ns=first(c0), recompile_ns=last(c0),
-                       bytes=diff.allocd, gc_ns=diff.total_time, maxrss=Sys.maxrss())
+# `f()`, with what it cost put in `stats` even when it throws: an item that errors
+# took time too, and that time is what the next run schedules it by. Compilation
+# is kept apart because on a compilation-heavy suite it is what explains the run.
+function timed!(f, stats::Base.RefValue{PerfStats})
+    gc0 = Base.gc_num()
+    t0 = Base.time_ns()
+    Base.cumulative_compile_timing(true)
+    c0 = Base.cumulative_compile_time_ns()
+    try
+        return f()
+    finally
+        elapsed = Base.time_ns() - t0
+        Base.cumulative_compile_timing(false)
+        c = Base.cumulative_compile_time_ns() .- c0
+        diff = Base.GC_Diff(Base.gc_num(), gc0)
+        stats[] = PerfStats(; elapsed_ns = elapsed, compile_ns = first(c), recompile_ns = last(c),
+                            bytes = diff.allocd, gc_ns = diff.total_time, maxrss = Sys.maxrss())
     end
 end
 
@@ -241,7 +242,7 @@ end
 # interrupt: an exception that escapes the block is an `Error` record, which is
 # what makes a crashing test item a result rather than a failure of the run.
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString)
-    stats = PerfStats()
+    stats = Ref(PerfStats())
     body = Expr(:block)
     # Through YATF, so `@test` works whether or not the test environment declares
     # `Test`.
@@ -252,11 +253,12 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     mod_expr = Expr(:module, true, gensym(modname), body)
     try
         with_testset(ts) do
-            _, stats = @timed_with_compilation capture_output(spec.logpath) do
-                with_seed(spec.seed) do
-                    with_source_path(() -> Core.eval(Main, mod_expr), spec.file)
+            timed!(stats) do
+                capture_output(spec.logpath) do
+                    with_seed(spec.seed) do
+                        with_source_path(() -> Core.eval(Main, mod_expr), spec.file)
+                    end
                 end
-                nothing
             end
         end
     catch err
@@ -272,7 +274,7 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
             end
         end
     end
-    return stats
+    return stats[]
 end
 
 function finish_testset!(ts::Test.AbstractTestSet)

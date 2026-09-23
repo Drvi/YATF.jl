@@ -32,12 +32,12 @@ using YATFWorkers: YATFWorkers
         # fixture passes.
         for l in starts
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_RUNNING) w\\d+ · " *
+                Regex("^$(YATF.MARK_RUNNING) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · RUN  · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
         end
         for l in dones
             @test occursin(
-                Regex("^$(YATF.MARK_INDENT)$(YATF.MARK_PASSED) w\\d+ · " *
+                Regex("^$(YATF.MARK_PASSED) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
             @test occursin("maxrss", l)
         end
@@ -49,7 +49,7 @@ using YATFWorkers: YATFWorkers
         # it is — which is the only reason a log of them is readable.
         heads = filter(l -> occursin(r" w\d+ · \d\d:\d\d:\d\d · ", l), lines)
         @test !isempty(heads)
-        @test all(l -> startswith(l, YATF.MARK_INDENT), heads)
+        @test all(l -> !isspace(first(l)), heads)   # from the first column
         marks = unique(first(split(strip(l))) for l in heads)
         known = Set([YATF.MARK_INFO, (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER)...])
         @test issubset(marks, known)
@@ -65,9 +65,10 @@ using YATFWorkers: YATFWorkers
     @testset "the run reports on itself when there is no terminal" begin
         status = filter(l -> occursin("· INFO ", l), lines)
         @test !isempty(status)
-        @test all(l -> startswith(l, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATF.FIELD), status)
+        @test all(l -> startswith(l, YATF.MARK_INFO * " w0" * YATF.FIELD), status)
         @test any(l -> occursin("mem ", l), status)
-        @test any(l -> occursin("load ", l), status)   # CPU load, as well as memory
+        # CPU load as well as memory, where there is one: Windows reports none.
+        Sys.iswindows() || @test any(l -> occursin("load ", l), status)
         @test any(l -> occursin("workers", l), status)
         @test any(l -> occursin("tree mem", l), status)
         @test any(l -> occursin("(max ", l), status)
@@ -89,11 +90,18 @@ using YATFWorkers: YATFWorkers
         @test occursin("@ test/b_test.jl:2", short)
         @test !occursin(root, short)
         # The stacktrace printer writes the home directory as `~`, so the same
-        # path arrives spelled two ways and both come off.
+        # path arrives spelled two ways and both come off. Not on Windows, where
+        # the home directory is never contracted, but where a path can arrive
+        # with either separator instead.
         home = homedir()
         under = joinpath(home, "proj", "MyPkg")
-        both = "a $(under)/test/x.jl:1 and ~/proj/MyPkg/test/y.jl:2"
-        @test YATF.strip_root(both, under) == "a test/x.jl:1 and test/y.jl:2"
+        if Sys.iswindows()
+            @test YATF.strip_root("a $(under)\\test\\x.jl:1 and $(under)/test/y.jl:2", under) ==
+                "a test\\x.jl:1 and test/y.jl:2"
+        else
+            both = "a $(under)/test/x.jl:1 and ~/proj/MyPkg/test/y.jl:2"
+            @test YATF.strip_root(both, under) == "a test/x.jl:1 and test/y.jl:2"
+        end
         # Nothing to strip, nothing changed.
         @test YATF.strip_root(text, "") == text
         @test YATF.strip_root("no paths here", root) == "no paths here"
@@ -230,7 +238,7 @@ using YATFWorkers: YATFWorkers
         last_line = findnext(l -> startswith(l, "└"), all_lines, first_line)
         block = all_lines[first_line:last_line]
         @test all(l -> startswith(l, "┌") || startswith(l, "│") || startswith(l, "└"), block)
-        @test startswith(last(block), "└ @ test/faults_test.jl:")
+        @test startswith(last(block), "└ @ " * joinpath("test", "faults_test.jl") * ":")
         # the item's failure, its captured output and its own log records, nested
         @test any(l -> occursin("Expression: 1 == 2", l), block)
         @test any(l -> occursin("┌ Captured logs", l), block)

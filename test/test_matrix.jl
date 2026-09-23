@@ -100,6 +100,8 @@ const MATRIX_LOGS = (:eager, :issues, :batched)
 # `Test` prints an absolute path; the run's own lines print one relative to the
 # project. Both end the same way.
 at_line(mark) = string("matrix_test.jl:", MARKS[mark])
+# The test file as a report names it: relative to the project, in the platform's own form.
+const MATRIX_FILE = joinpath("test", "matrix_test.jl")
 
 @testset "configuration matrix" begin
     @test length(MARKS) == 14   # every mark the assertions below reach for
@@ -170,7 +172,7 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
             @testset "a failure names the line it failed on" begin
                 # Not the item's line, not the file's: the line of the `@test`,
                 # and named the way the project names it.
-                @test occursin("Test Failed at test/matrix_test.jl:" *
+                @test occursin("Test Failed at " * MATRIX_FILE * ":" *
                                string(MARKS["fail_assert"]), out)
                 @test occursin(at_line("fail_assert"), out)
                 @test occursin("Expression: x == 42", out)
@@ -197,12 +199,12 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
                 # absolute location included.
                 @test !occursin("Test Failed at " * MATRIX_PKG, out)
                 @test !occursin("Error During Test at " * MATRIX_PKG, out)
-                @test occursin("Error During Test at test/matrix_test.jl:", out)
+                @test occursin("Error During Test at " * MATRIX_FILE * ":", out)
                 # Stacktrace frames as well, not just the first line.
-                @test occursin("@ test/matrix_test.jl:", out)
+                @test occursin("@ " * MATRIX_FILE * ":", out)
                 @test !occursin("@ " * MATRIX_PKG, out)
                 # ...and the footer the run draws under the block.
-                @test any(l -> startswith(l, "└ @ test/matrix_test.jl:"), lines)
+                @test any(l -> startswith(l, "└ @ " * MATRIX_FILE * ":"), lines)
             end
 
             @testset "a stacktrace stops at the test's own frames" begin
@@ -232,9 +234,9 @@ at_line(mark) = string("matrix_test.jl:", MARKS[mark])
                 # The run's own footers, not the ones `Logging` draws under an
                 # `@warn` the item raised: those carry the module and an absolute
                 # path, these carry the project-relative one.
-                footers = filter(l -> startswith(l, "└ @ test/matrix_test.jl:"), lines)
-                @test any(l -> occursin("test/matrix_test.jl:$(MARKS["fail_item"])", l), footers)
-                @test any(l -> occursin("test/matrix_test.jl:$(MARKS["error_item"])", l), footers)
+                footers = filter(l -> startswith(l, "└ @ " * MATRIX_FILE * ":"), lines)
+                @test any(l -> occursin(string(MATRIX_FILE, ":", MARKS["fail_item"]), l), footers)
+                @test any(l -> occursin(string(MATRIX_FILE, ":", MARKS["error_item"]), l), footers)
                 @test length(footers) == length(blocks)
                 if workers == 0
                     @test !any(l -> occursin(" on worker ", l), footers)

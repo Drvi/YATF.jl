@@ -118,10 +118,11 @@ const GUTTER = "  "
 #     🔵 w1 · 16:30:28 · RUN  ·  1/11 · "passes" · at test/basics_test.jl:1
 #     🟢 w1 · 16:30:29 · DONE ·  1/11 · "passes" · PASS ·   0.2s ( 3% compile) · maxrss 0.4 GiB
 #     ⚪ w0 · 16:30:29 · INFO ·  3/11 · 0 failed · 2/2 workers · tree mem 1.1G (max 1.2G) · …
-#     🧪 w1 · whatever a test item printed for itself
+#        w1 · whatever a test item printed for itself
 #
 # A circle is the framework speaking, and its colour is the news: blue in flight,
 # green passed, red not, yellow set aside, black the worker, white the run itself.
+# What an item prints has no circle, since it is not the framework speaking.
 # Every glyph is two columns wide in Unicode's tables and has no variation
 # selector, which keeps the `w1` column in place; 🛠️ and ℹ️ are width 1 in the
 # tables and width 2 in most terminals.
@@ -130,9 +131,8 @@ const MARK_PASSED = "🟢"
 const MARK_FAILED = "🔴"
 const MARK_SET_ASIDE = "🟡"
 const MARK_WORKER = "⚫"
-const MARK_ITEM = "🧪"
+const MARK_ITEM = "  "   # as wide as a glyph, and blank
 const MARK_INFO = "⚪"
-const MARK_INDENT = "   "
 
 const FIELD = " · "
 const WORKER_STATE_WIDTH = 4   # "DONE", "EXIT", "KILL", "LOST", "INFO"; "RUN" and "UP" are shorter
@@ -189,7 +189,7 @@ const NAME_OUTLIER_ALLOWANCE = 2
 # ...but covers a tail that is this close, rather than leave it to overflow.
 const NAME_TAIL_SLACK = 8
 # What the rest of a DONE line takes at its widest.
-const LINE_RESERVED = 85
+const LINE_RESERVED = 82
 
 """
     name_width(names; columns = 0) -> Int
@@ -222,7 +222,7 @@ clock_now() = Libc.strftime("%H:%M:%S", time())
 # without workers), and the time. The clock is passed in because the status line,
 # redrawn after everything the run prints, has a cheaper way to get it.
 function print_line_head(io::IO, mark::AbstractString, slot_id, clock::AbstractString)
-    print(io, MARK_INDENT, mark, " ")
+    print(io, mark, " ")
     slot_id === nothing || (print(io, "w"); print_int(io, slot_id); print(io, FIELD))
     print(io, clock, FIELD)
     return nothing
@@ -635,11 +635,14 @@ them on the way out cannot change what the item's code means.
 """
 function strip_root(text::AbstractString, root::AbstractString)
     isempty(root) && return text
-    out = replace(text, root * "/" => "")
-    # The stacktrace printer contracts the home directory, so the same path
-    # arrives spelled two ways.
-    home = Base.contractuser(root)
-    return home == root ? out : replace(out, home * "/" => "")
+    out = text
+    # The stacktrace printer contracts the home directory, so the same path can
+    # arrive spelled two ways; and on Windows with either separator, since Julia
+    # writes `\` and much else writes `/`.
+    for r in unique((root, Base.contractuser(root))), sep in PATH_SEPARATORS
+        out = replace(out, r * sep => "")
+    end
+    return out
 end
 
 function print_failures(io::IO, run, i::ItemIdx)

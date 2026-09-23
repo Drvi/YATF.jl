@@ -134,7 +134,7 @@ end
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
         line = status_line(run.monitor)
-        @test startswith(line, YATF.MARK_INDENT * YATF.MARK_INFO * " w0" * YATF.FIELD)
+        @test startswith(line, YATF.MARK_INFO * " w0" * YATF.FIELD)
         @test occursin("INFO", line)
         @test occursin("/", line)             # done/total
         @test occursin("failed", line)
@@ -195,11 +195,11 @@ end
         # Erase, the line, then the status line again — assembled whole, because
         # three separate writes are what makes a busy run flicker.
         @test startswith(out, "\r\e[2K" * "a line of output" * "\n")
-        @test occursin("\r\e[2K" * YATF.MARK_INDENT * YATF.MARK_INFO, out)
+        @test occursin("\r\e[2K" * YATF.MARK_INFO, out)
         @test endswith(out, status_line(m))
         # A line that already ends in a newline does not get a second one.
         out2 = String(take!(copy(status_update!(m, "ends in a newline\n"))))
-        @test occursin("ends in a newline\n\r\e[2K" * YATF.MARK_INDENT * YATF.MARK_INFO, out2)
+        @test occursin("ends in a newline\n\r\e[2K" * YATF.MARK_INFO, out2)
         @test !occursin("\n\n", out2)
     end
 
@@ -333,7 +333,7 @@ end
         # The glyph is still there — it is how a line is read at a glance — but
         # there is no worker to number.
         @test all(item_lines) do l
-            any(m -> startswith(l, YATF.MARK_INDENT * m * " "), (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER))
+            any(m -> startswith(l, m * " "), (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER))
         end
         @test !any(l -> occursin(r" w\d+ · ", l), item_lines)
 
@@ -341,7 +341,7 @@ end
         # lands inside a two-second run depends on how busy the machine is, and
         # what is being checked here is the shape of one, not its timing.
         info = status_line(run.monitor)
-        @test startswith(info, YATF.MARK_INDENT * YATF.MARK_INFO * " ")
+        @test startswith(info, YATF.MARK_INFO * " ")
         @test !occursin("w0", info)
         @test !occursin("workers", info)
         # One process, so one memory figure and its peak, not three names for it.
@@ -521,8 +521,8 @@ end
         rm(run.logdir; force=true, recursive=true)
         st = run.monitor.stats
         # The process doing the compiling is in the tree and counted there, in
-        # the setup stage that spawned it.
-        @test phase_stats(st, PHASE_SETUP).nprocs_at_peak >= 2
+        # the setup stage that spawned it. Windows lists no child processes.
+        Sys.iswindows() || @test phase_stats(st, PHASE_SETUP).nprocs_at_peak >= 2
         @test phase_peak(st, PHASE_SETUP) > 0
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("setup", summary)

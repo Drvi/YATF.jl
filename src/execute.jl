@@ -942,7 +942,7 @@ function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::Abstrac
         within[] = rec.how === nothing
         return printline(run, item_line(run, slot.id, rec.i, rec.attempt, rec.how))
     end
-    return printline(run, string(MARK_INDENT, within[] ? MARK_ITEM : MARK_WORKER, " w", slot.id, FIELD, line))
+    return printline(run, string(within[] ? MARK_ITEM : MARK_WORKER, " w", slot.id, FIELD, line))
 end
 
 # An item's RUN or DONE line, drawn from what this run knows about the item.

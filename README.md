@@ -83,7 +83,8 @@ YATF.retry_failed()                      # re-run what did not pass last time
 Useful keywords: `workers` (a count, or `0` to run in this process — not the
 default, and it refuses items whose sandbox a running process cannot provide),
 `threads`, `timeout`, `init_timeout`, `test_end_timeout`, `retries`, `failfast`,
-`logs` (`:issues`, `:batched`, `:eager`), `memory_threshold`, `monitor`, `replay`.
+`logs` (`:issues`, `:batched`, `:eager`), `memory_threshold`, `monitor`, `seed`,
+`replay`.
 
 ## At the REPL
 
@@ -193,21 +194,40 @@ change `Project.toml` or a manifest and rebuilds.
 
 ## Run state
 
-Every run writes a binary record: which items ran, in what order, on which worker,
-how long each took and how much of that was compilation, plus the worker
-configuration. It is written as the run goes, so a run that is killed still leaves
-a readable account of what had finished.
+Every run writes a binary record, as it goes, so a run that is killed still leaves
+a readable account of what had finished. It holds what it takes to run the same
+run again somewhere else:
 
-It also records the commit the tests ran from, read out of `.git`, so a record
-downloaded from CI says what to check out to reproduce it, and a flag saying the
-run was cancelled, which is what makes the items with no result in it mean "never
-reached" rather than "passed".
+- which items ran, how each ended, how long it took and how much of that was
+  compilation, and every attempt and every worker's start and end in order — which
+  items a worker had run before it died, and whether it exited, was killed for a
+  timeout, or was killed by a signal nobody in the run sent;
+- the commit, the Julia version and build, the machine, the settings, the
+  profiles with their preferences, and the seed every item's random numbers came
+  from;
+- the test environment's `Project.toml` and `Manifest.toml`.
+
+On CI, keep it as an artifact:
+
+```yaml
+- uses: julia-actions/julia-runtest@v1
+  env:
+    YATF_RUNSTATE_DIR: ${{ runner.temp }}/yatf
+- uses: actions/upload-artifact@v4
+  if: failure()
+  with:
+    name: yatf-run-state-${{ matrix.os }}-${{ matrix.version }}
+    path: ${{ runner.temp }}/yatf
+```
+
+Then, locally, `YATF.read_run_state("run.yatf")` shows what happened, and
+`YATF.runtests(replay="run.yatf")` runs the same items with the same settings,
+profiles and seed, naming every package whose version differs from the one CI had.
 
 Later runs use it to decide the order: recent failures and items in test files
 changed since the last run go first, then items long enough to set the length of
 the run, then the rest in file order — each worker walking its own stretch of
 files, so that neighbouring items reuse what the worker has already compiled.
-`YATF.runtests(replay="…/run.yatf")` re-creates the worker configuration a run
-recorded — only when asked: a run state lying next to the project is not a request
-to run differently, and an explicit keyword always wins. The path is printed at the
-end of every run; set `YATF_RUNSTATE_DIR` to control where it goes.
+A replay happens only when asked: a run state lying next to the project is not a
+request to run differently, and an explicit keyword always wins. The path is
+printed at the end of every run; set `YATF_RUNSTATE_DIR` to control where it goes.

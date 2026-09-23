@@ -159,9 +159,13 @@ matches_tags(want::Vector{Symbol}, have::Vector{Symbol}) = all(in(have), want)
 matches_tags(e::TagExpr, have::Vector{Symbol}) =
     any(alt -> all(((tag, present),) -> (tag in have) == present, alt), e.alternatives)
 
-# A selected path is either the file itself or a directory holding it.
+# A selected path is either the file itself or a directory holding it. Both come
+# from `abspath` and `walkdir`, so both use the platform's own separator.
 matches_path(paths::Vector{String}, file::AbstractString) =
-    isempty(paths) || any(p -> file == p || startswith(file, endswith(p, '/') ? p : p * "/"), paths)
+    isempty(paths) || any(p -> file == p || startswith(file, joinpath(p, "")), paths)
+
+# What separates the parts of a path here: `/`, and on Windows `\` as well.
+const PATH_SEPARATORS = Sys.iswindows() ? ('\\', '/') : ('/',)
 
 # A test item the filter did not select. Names must be unique across the suite,
 # not just across one run's selection.

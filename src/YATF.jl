@@ -275,7 +275,7 @@ function resolve_target(args)
     return Target(t.root, t.project, t.testdir, narrowing, line)
 end
 
-rstrip_path(p::AbstractString) = rstrip(p, '/')
+rstrip_path(p::AbstractString) = rstrip(p, PATH_SEPARATORS)
 
 _pkgdir(m::Module) = something(pkgdir(m), throw(ArgumentError("could not find a directory for module $m")))
 

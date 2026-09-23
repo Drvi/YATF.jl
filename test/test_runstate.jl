@@ -271,6 +271,9 @@ end
             @testitem "b" begin
                 @test true
             end
+            @testitem "throws" begin
+                error("thrown outside any @test")
+            end
             """)
             run_states(pkg; workers=1, logs=:issues, monitor=false, seed=0x1234)
             rs = read_run_state(only(readdir(dir; join=true)))
@@ -281,9 +284,11 @@ end
             up, down = only(e for e in rs.events if e.kind === :worker_up), only(e for e in rs.events if e.kind === :worker_down)
             @test down.ended_by === :close && down.pid == up.pid
             attempts = [e for e in rs.events if e.kind === :attempt]
-            @test sort([rs.items[e.item].name for e in attempts]) == ["a", "b"]
-            @test all(e -> e.pid == up.pid && e.state === PASSED && e.t1 >= e.t0, attempts)
-            @test all(s -> s.pid == up.pid && s.peak_rss_mb > 0, rs.statuses)
+            @test sort([rs.items[e.item].name for e in attempts]) == ["a", "b", "throws"]
+            @test all(e -> e.pid == up.pid && e.t1 >= e.t0, attempts)
+            @test [e.state for e in attempts if rs.items[e.item].name != "throws"] == [PASSED, PASSED]
+            # An item that throws took time and memory like any other.
+            @test all(s -> s.pid == up.pid && s.peak_rss_mb > 0 && s.elapsed > 0, rs.statuses)
             @test occursin("run it again", sprint(show, MIME"text/plain"(), rs))
         end
     end

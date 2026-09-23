@@ -54,7 +54,8 @@
         # goes green on a test that never finished running.
         r = run_snippet("""@testset "aborts" begin\n    @test true\n    ccall(:abort, Cvoid, ())\nend\n""")
         @test !r.ok
-        @test occursin("killed by signal", r.status)
+        # Windows has no signals: `abort` ends the process with exit code 3.
+        @test occursin(Sys.iswindows() ? "exit code 3" : "killed by signal", r.status)
     end
 
     @testset "the summary names every file that failed, and throws" begin
