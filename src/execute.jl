@@ -869,16 +869,32 @@ end
 """
     start_watchdog(run, limit) -> Timer
 
-Stop the run as hung once no test item has finished for `limit` seconds. A timer on
-the coordinator, where a timer is free to run: the tasks there yield.
+Stop the run as hung once no test item has finished for `limit` seconds. Closing the
+returned timer ends the watchdog.
 """
 function start_watchdog(run::Run, limit::Real)
     every = min(STALL_CHECK_S, limit / 4)
-    return Timer(every; interval = every) do _
-        (@atomic run.stalled) && return
-        time() - (@atomic run.last_finish) > limit || return
-        stall!(run, limit)
+    timer = Timer(every; interval = every)
+    main = current_task()
+    # On the run's own thread, so that interrupting the run's task, which a stall does
+    # under `workers=0`, happens only while that task waits. Julia 1.12 throws Ctrl-C
+    # into whichever task that thread ran last, and that can be this one: the loop is
+    # its own rather than a timer's callback, so the interrupt can be caught here and
+    # passed on to the run's task. In a timer's task it would end the task, unseen.
+    @async try
+        while true
+            wait(timer)
+            (@atomic run.stalled) && continue
+            time() - (@atomic run.last_finish) > limit && stall!(run, limit)
+        end
+    catch e
+        if e isa InterruptException
+            istaskdone(main) || schedule(main, e; error = true)
+        elseif !(e isa EOFError)   # EOFError: the timer was closed, so the run is over
+            @error "YATF: the stall watchdog stopped" exception = (e, catch_backtrace())
+        end
     end
+    return timer
 end
 
 # Everything the run started comes down: nothing more is handed out, the tasks
@@ -891,8 +907,7 @@ function stall!(run::Run, limit::Real)
     cancel!(run.queues)
     interrupt_slots!(@lock run.lock copy(run.tasks))
     kill_workers!(run, "stopped as hung")
-    m = run.monitor
-    m === nothing || (@atomic m.stop = true)
+    stop_monitor!(run.monitor)
     return nothing
 end
 

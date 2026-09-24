@@ -289,6 +289,10 @@ Sys.iswindows() ||
         sleep(0.5)
     end
     @test running()
+    # A real interrupt comes long after the stall watchdog first looked, and on 1.12
+    # it lands in whichever task last ran on the run's thread: the interrupt has to
+    # reach the run whatever has run by then.
+    sleep(YATF.STALL_CHECK_S + 1)
     t0 = time()
     kill(proc, Base.SIGINT)
     wait(proc)

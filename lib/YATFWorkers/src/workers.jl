@@ -453,7 +453,13 @@ function Worker(;
     cmd = `$(Base.julia_cmd()) --threads=$threads --startup-file=no --history-file=no
            --color=$color $julia_args -e $(worker_startup_code(connect_timeout))`
     proc = track!(open(detach(setenv(addenv(cmd, env), dir=dir)), "r+"))
-    pid = getpid(proc)
+    # A process that fails at startup can be gone already, and a process that has
+    # exited has no pid to give; `read_port` below then says how it ended.
+    pid = try
+        getpid(proc)
+    catch
+        Int32(0)
+    end
     cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
     local sock, w
     try

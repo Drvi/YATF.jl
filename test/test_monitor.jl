@@ -695,6 +695,36 @@ end
         end
     end
 
+    @testset "what is written once the monitor stops starts its own row" begin
+        # A stopped monitor draws nothing, so `printline` no longer erases before it
+        # writes: stopping has to take the line down in the same step. A writer that
+        # goes the moment it sees the stop is what a slow machine's warning did.
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        _, out = capture_run() do
+            with(YATF.TTY_OVERRIDE => true) do
+                m = run.monitor = Monitor(run)
+                start_monitor!(m)
+                timedwait(() -> m.last_print > 0, 30.0)   # the line is up
+                writer = Threads.@spawn begin
+                    while !(@atomic m.stop)
+                        yield()
+                    end
+                    printline(run, "WRITTEN")
+                end
+                stop_monitor!(m)
+                wait(writer)
+            end
+        end
+        at = findfirst("WRITTEN", out)
+        @test at !== nothing
+        if at !== nothing
+            row = out[something(findprev(==('\n'), out, at.start), 0) + 1:prevind(out, at.start)]
+            @test isempty(replace(last(split(row, "\r\e[2K")), r"\e\[[0-9;]*m" => "", r"\s" => ""))
+        end
+    end
+
     @testset "nothing is drawn while the line is withdrawn" begin
         # The drawing path exists only on a terminal, and a test suite's output is
         # a pipe; `TTY_OVERRIDE` is how it is reached without arranging one.

@@ -241,14 +241,19 @@ end
 
 function stop_monitor!(m::Union{Nothing, Monitor})
     m === nothing && return nothing
-    @atomic m.stop = true
+    # Stopped and erased in one step under the lock every writer takes. A stopped
+    # monitor is not drawing, so `printline` writes without erasing; with the line
+    # still up, what the monitor's own task says on its way out would continue it.
+    @lock run_of(m).printer begin
+        @atomic m.stop = true
+        clear_status_line(m)
+    end
     m.task === nothing || (
         try
             wait(m.task)
         catch
         end
     )
-    clear_status_line(m)
     return nothing
 end
 
@@ -716,8 +721,12 @@ Sampling continues; only the drawing stops.
 """
 function with_status_line_off(f, m::Union{Nothing, Monitor})
     m === nothing && return f()
-    @atomic m.quiet = true
-    clear_status_line(m)
+    # Under the printer lock, as `stop_monitor!` does: a redraw already under way
+    # would otherwise land after the erase.
+    @lock run_of(m).printer begin
+        @atomic m.quiet = true
+        clear_status_line(m)
+    end
     try
         return f()
     finally

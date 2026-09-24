@@ -121,8 +121,7 @@ function bump_marker(dir::AbstractString, name::AbstractString)
 end
 
 live_worker_processes() = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
-live_worker_pids() = @lock YATFWorkers.LIVE_LOCK Set(Base.getpid(p) for p in YATFWorkers.LIVE_PROCESSES
-                                                     if Base.process_running(p))
+live_worker_pids() = Set(YATFWorkers.live_worker_pids())
 
 # Run states live under the depot by default, keyed by project. A test that reads
 # one back, or that must not see an earlier run's history, gets a directory of
