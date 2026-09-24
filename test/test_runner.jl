@@ -107,5 +107,12 @@
         # A file's own line: its peak, and how full the machine got while it ran.
         memory.machine_while["a_test.jl"] = 32 * 2^30
         @test memory_text(memory, "a_test.jl") == "peak 2.0G · machine 50%"
+        # And how busy the CPUs were, the other thing more files at once would need.
+        @test !occursin("cpu:", printed)   # not measured, not said
+        memory.cpus, memory.cpu_busy = 4, 0.93
+        _, printed = capture_run(() -> report_files(results; memory, jobs = 4))
+        @test occursin("cpu: the machine's 4 threads were 93% busy over the run", printed)
+        busy, total = cpu_times()
+        @test 0 < busy <= total
     end
 end

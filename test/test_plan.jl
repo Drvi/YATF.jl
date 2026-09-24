@@ -227,7 +227,7 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         # The tags start in one column, just after the longest location and the
         # separator.
         tags_at = column(header, "tags")
-        longest = maximum(l -> length(match(r"test/\S+:\d+", l).match), rows)
+        longest = maximum(l -> length(match(r"test[/\\]\S+:\d+", l).match), rows)   # `\` on Windows
         @test tags_at == column(header, "at ") + longest + length(YATF.FIELD)
         # Every row's separators fall where the header's do, up to where the row ends.
         dots = findall(==('·'), collect(header))

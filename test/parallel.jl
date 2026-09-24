@@ -19,7 +19,8 @@ end
 
 # Memory while the files run, sampled twice a second: each file's process tree (its
 # process and every worker it starts) at its largest, and the suite's and the
-# machine's at theirs. What it takes to choose how many files run at once.
+# machine's at theirs. With how busy the CPUs were over the run, the other limit,
+# it is what it takes to choose how many files run at once.
 mutable struct MemoryLog
     const lock::ReentrantLock
     const pids::Dict{Int32, String}   # a running file's process -> the file
@@ -29,9 +30,23 @@ mutable struct MemoryLog
     suite_files::Int                  # how many files were running then
     machine::Int64                    # the machine's memory in use, at the largest
     total::Int64
+    cpus::Int                         # the machine's CPU threads; 0 until the run has ended
+    cpu_busy::Float64                 # the share of their time they spent busy over the run
     @atomic done::Bool
 end
-MemoryLog() = MemoryLog(ReentrantLock(), Dict{Int32, String}(), Dict{String, Int64}(), Dict{String, Int64}(), 0, 0, 0, 0, false)
+MemoryLog() = MemoryLog(ReentrantLock(), Dict{Int32, String}(), Dict{String, Int64}(), Dict{String, Int64}(), 0, 0, 0, 0, 0, 0.0, false)
+
+# Busy and total milliseconds since boot, summed over every CPU thread: two readings
+# give the share of the time in between that the machine spent busy.
+function cpu_times()
+    busy = total = UInt64(0)
+    for c in Sys.cpu_info()
+        b = c.var"cpu_times!user" + c.var"cpu_times!nice" + c.var"cpu_times!sys" + c.var"cpu_times!irq"
+        busy += b
+        total += b + c.var"cpu_times!idle"
+    end
+    return busy, total
+end
 
 function sample!(log::MemoryLog)
     used, total = YATF.Platform.machine_memory()
@@ -166,6 +181,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
         sample!(memory)
         sleep(0.5)
     end
+    busy0, total0 = cpu_times()
     @sync for _ in 1:jobs
         Threads.@spawn for i in queue
             # Said when a file starts, so a run that stalls shows what is in flight.
@@ -200,6 +216,8 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
             end
         end
     end
+    busy1, total1 = cpu_times()
+    total1 > total0 && ((memory.cpus, memory.cpu_busy) = (length(Sys.cpu_info()), (busy1 - busy0) / (total1 - total0)))
     @atomic memory.done = true
     wait(sampler)
     return FileResult[r for r in results if r !== nothing], memory
@@ -229,7 +247,8 @@ function report_files(results::Vector{FileResult}; memory::Union{Nothing, Memory
 end
 
 # What the files needed, to choose `YATF_TEST_JOBS` from: the largest one, and all
-# that were running at once at the suite's peak, against what the machine had.
+# that were running at once at the suite's peak, against what the machine had; and
+# how busy its CPUs were, since memory to spare is no use to a machine without time.
 function print_memory(memory::MemoryLog, jobs::Int)
     largest = isempty(memory.peak) ? nothing : argmax(memory.peak)
     parts = String[]
@@ -241,8 +260,9 @@ function print_memory(memory::MemoryLog, jobs::Int)
     memory.total > 0 && push!(parts, string(
         "the machine at ", YATF.fmt_bytes(memory.machine), " of ", YATF.fmt_bytes(memory.total),
         " (", percent(memory.machine, memory.total), ")"))
-    isempty(parts) && return nothing
-    println("  memory: ", join(parts, " · "))
+    isempty(parts) || println("  memory: ", join(parts, " · "))
     memory.suite > 0 && println("  (a file's figure is its process and its workers, summed: shared pages count twice)")
+    memory.cpus > 0 && println("  cpu: the machine's ", memory.cpus, " threads were ",
+        round(Int, 100 * memory.cpu_busy), "% busy over the run")
     return nothing
 end
