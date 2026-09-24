@@ -278,16 +278,18 @@ end
 ### Driver #################################################################
 
 """
-    scan(files, filter, known_setups; ntasks, strays) -> Vector{RawItem}
+    scan(files, filter, known_setups; ntasks, strays, suite_names) -> Vector{RawItem}
 
 Read every file, in parallel, and return the items that pass `filter` sorted by
 (file, line). Throws a `ScanFailure` listing every problem, the `strays` among
-them, so one run surfaces every broken file.
+them, so one run surfaces every broken file. `suite_names`, when given, gets the
+name of every item read, the filter's rejects included.
 """
 function scan(
         files::Vector{String}, filter::Filter, known_setups::Dict{Symbol, String};
         ntasks::Int = default_scan_tasks(),
-        strays::Vector{String} = String[]
+        strays::Vector{String} = String[],
+        suite_names::Union{Nothing, Vector{String}} = nothing
     )
     nt = clamp(ntasks, 1, max(1, length(files)))
     chunks = [(sizehint!(RawItem[], 64), ScanError[], sizehint!(ItemName[], 64)) for _ in 1:nt]
@@ -315,6 +317,10 @@ function scan(
     sort!(items; by = i -> (i.file, i.line))
     rejected = reduce(vcat, (c[3] for c in chunks); init = ItemName[])
     check_unique_names(items, rejected)
+    if suite_names !== nothing
+        append!(suite_names, (it.name for it in items))
+        append!(suite_names, (r.name for r in rejected))
+    end
     filter.line > 0 && (items = select_by_line(items, filter.line))
     return items
 end

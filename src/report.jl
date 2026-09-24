@@ -1,40 +1,9 @@
 # Human-facing output for a plan. `--dry-run` prints this and stops.
 
 function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
-    cfg = p.cfg
-    n = nitems(p)
-    println(
-        io, "YATF plan: ", plural(n, "test item"), " in ", plural(length(p.units), "unit"),
-        " on ", plural(nslots(p), "worker")
-    )
-    println(io)
-    println(io, "configuration")
-    for (k, v) in (
-            ("workers", cfg.workers == 0 ? "0 (single process)" : string(cfg.workers)),
-            ("threads", cfg.threads), ("timeout", "$(cfg.timeout_s)s"),
-            ("retries", string(cfg.retries)), ("logs", string(cfg.logs)),
-            ("failfast", string(cfg.failfast)),
-            ("memory_threshold", string(cfg.memory_threshold)),
-        )
-        println(io, "  ", rpad(k, 17), v)
-    end
-    if !isempty(p.setups)
-        println(io, "  ", rpad("setups", 17), join(p.setups, ", "))
-    end
-    for (k, pool) in enumerate(p.pools)
-        prof = p.profiles[pool.profile]
-        slots = [s for s in 1:nslots(p) if p.slot_pool[s] == k]
-        println(io)
-        print(io, "profile ", prof.name)
-        isempty(prof.julia_args) || print(io, "  ", join(prof.julia_args, " "))
-        println(io, "  ", isempty(slots) ? "waiting for a free worker" : plural(length(slots), "worker"))
-        print_units(io, p, pool.head, "first, to whichever worker asks")
-        for s in slots
-            print_units(io, p, p.slot_units[s], "worker $s walks")
-        end
-        isempty(slots) && print_units(io, p, pool.body, "then, in file order")
-        print_units(io, p, pool.tail, "last, to whichever worker asks")
-    end
+    order = run_order(p)
+    print(io, plan_block(p, order))
+    print_plan_table(io, p, order)
     if !isempty(show_excluded)
         println(io)
         println(io, "excluded: ", length(show_excluded), " items")
@@ -45,44 +14,263 @@ function print_plan(io::IO, p::Plan; show_excluded::Vector{String} = String[])
     return nothing
 end
 
-function print_units(io::IO, p::Plan, units::UnitRange{UnitIdx}, what::AbstractString)
-    isempty(units) && return nothing
-    est = sum(u -> p.units.est_s[u], units; init = 0.0)
-    println(io, "  ", what, ": ", plural(length(units), "unit"), est > 0 ? string(", est ", fmt_seconds(est)) : "")
-    for u in units
-        print_unit(io, p, u, "    ")
+# What the plan is for and what it was made from, in the bracket a run's header is
+# drawn in: the table below it is the plan.
+function plan_block(p::Plan, order)
+    cfg = p.cfg
+    head = sprint() do io
+        print(io, "dry run · ")
+        print_work(io, p, single_process(p) ? 0 : nslots(p))
+    end
+    body = sprint() do io
+        print_startup(io, p.startup)
+        isempty(p.setups) || println(io, "setups: ", join(("`$s`" for s in p.setups), ", "))
+        println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
+                " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
+        print_profiles(io, p)
+        estimated = any(>(0), p.units.est_s)
+        if !single_process(p)
+            estimated && println(io, "estimated work: ",
+                                 join(("w$s $(est_text(w))" for (s, w) in enumerate(order.work)), " · "))
+            println(io, "order and workers: predicted ",
+                    estimated ? "from the recorded durations, an item without one counting as a typical one" :
+                        "as if every item took as long, since no durations are recorded yet")
+        end
+    end
+    return bracket(body, "[YATF]", head, "", :white)
+end
+
+# The opening words of a run's header and of a dry run's: which YATF and Julia, how
+# much work, and on how many processes.
+function print_work(io::IO, p::Plan, nworkers::Integer; seed::Union{Nothing, UInt64} = nothing)
+    print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
+          " in ", plural(length(p.files), "file"))
+    isempty(p.selection) || print(io, " matching ", p.selection)
+    # The commit, so a CI log says what to check out to reproduce this run.
+    rev = project_revision(p.root)
+    isempty(rev) || print(io, " · rev ", first(rev, 10))
+    seed === nothing || print(io, " · seed ", seed_text(seed))
+    p.cfg.workers == 0 ? print(io, " · in this process") :
+        print(io, " · ", plural(nworkers, "worker"), " · threads ", p.profiles[1].threads)
+    return nothing
+end
+
+# Only profiles that actually change something are worth a line.
+function print_profiles(io::IO, p::Plan)
+    for prof in p.profiles
+        parts = String[]
+        isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
+        prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
+        isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
+        isempty(prof.init.args) || push!(parts, "init expression")
+        isempty(prof.test_end.args) || push!(parts, "test end expression")
+        isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
     end
     return nothing
 end
 
-function print_unit(io::IO, p::Plan, u::UnitIdx, indent::AbstractString)
-    span = p.units.span[u]
-    chain = p.units.chain[u]
-    return if chain !== NO_CHAIN
-        println(io, indent, "chain :", chain, " (", length(span), " items, sequential)")
-        for i in span
-            print_item(io, p, i, indent * "  ")
-        end
-    else
-        for i in span
-            print_item(io, p, i, indent)
+"""
+    run_order(p) -> (; items, work)
+
+The order the run is expected to start the items in, and where: its own dispatch
+(`claim!`) played out with each unit taking as long as the recorded runs say, and a
+unit nothing is recorded for counting as a typical one. `items` holds `(start,
+worker, item)` in that order, a chain's members spread over its time; `work` is each
+worker's estimated seconds. A run without workers takes the units in plan order.
+"""
+function run_order(p::Plan)
+    est = [e > 0 ? e : typical_estimate(p.units.est_s) for e in p.units.est_s]
+    items = Tuple{Float64, Int, ItemIdx}[]
+    function started!(t, s, u)
+        span = p.units.span[u]
+        for (k, i) in enumerate(span)
+            push!(items, (t + (k - 1) * est[u] / length(span), s, i))
         end
     end
+    if single_process(p)
+        t = 0.0
+        for u in UnitIdx(1):UnitIdx(length(p.units))
+            started!(t, 1, u)
+            t += est[u]
+        end
+        return (; items, work = [t])
+    end
+    q = Queues(p)
+    free = zeros(nslots(p))
+    done = falses(nslots(p))
+    while !all(done)
+        # The next worker to ask is the first free, and the lowest numbered of those.
+        s = argmin(k -> (done[k], free[k], k), 1:nslots(p))
+        claim = claim!(q, s)
+        claim.kind === :done && (done[s] = true; continue)
+        claim.kind === :rebind && continue
+        started!(free[s], s, claim.unit)
+        free[s] += est[claim.unit]
+    end
+    return (; items = sort!(items; by = x -> (x[1], x[2])), work = free)
 end
 
-function print_item(io::IO, p::Plan, i::ItemIdx, indent::AbstractString)
+# An estimate as the dry run gives it: to a tenth of a second like every other
+# duration, but a sub-second one to two figures, which a tenth would round to 0.0s.
+est_text(s::Real) = s < 1 ? string(round(s; sigdigits = 2), "s") : fmt_seconds(s)
+
+"""
+    why_text(p, u) -> String
+
+Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
+worker's stretch, where file order put it.
+"""
+function why_text(p::Plan, u::UnitIdx)
+    why = p.units.why[u]
+    why === PINNED_FIRST && return "[order] first"
+    why === PINNED_LAST && return "[order] last"
+    why === SANDBOXED && return "sandbox"
+    why === LONG && return string("long, est ", est_text(p.units.est_s[u]))
+    why === RECENT || return ""
+    ago = p.units.failed_ago[u]
+    failed = ago < 0 ? "" : ago == 0 ? "failed in the last run" : string("failed ", ago + 1, " runs ago")
+    changed = p.units.changed[u] ? "file changed since the last run" : ""
+    return join(filter(!isempty, [failed, changed]), ", ")
+end
+
+# What an item row says about the item itself: the keywords it was declared with,
+# the chain it belongs to, and the setups it loads.
+function details_text(p::Plan, i::Integer)
     it = p.items
-    est = p.units.est_s[it.unit[i]]
-    print(
-        io, indent, rpad(repr(it.name[i]), 34), " ",
-        p.relfiles[it.fileidx[i]], ":", it.line[i]
-    )
-    tags = tags_of(it, i)
-    isempty(tags) || print(io, "  [", join(tags, ","), "]")
-    it.timeout_s[i] == USE_RUN_DEFAULT || print(io, "  timeout=", it.timeout_s[i], "s")
+    u = it.unit[i]
+    parts = String[]
+    chain = p.units.chain[u]
+    if chain !== NO_CHAIN
+        span = p.units.span[u]
+        push!(parts, string("chain `", chain, "` ", i - first(span) + 1, "/", length(span)))
+    end
+    # A sandbox is the reason it goes early, unless something else put it there.
+    p.units.exclusive[u] && p.units.why[u] !== SANDBOXED && push!(parts, "sandbox")
+    prof = p.profiles[p.units.profile[u]]
+    prof.name === DEFAULT_PROFILE || push!(parts, string("profile `", prof.name, "`"))
+    it.timeout_s[i] == USE_RUN_DEFAULT || push!(parts, string("timeout ", it.timeout_s[i], "s"))
+    it.retries[i] == USE_RUN_DEFAULT || push!(parts, string("retries ", it.retries[i]))
     setups = setups_of(it, i)
-    isempty(setups) || print(io, "  setups=", join(setups, ","))
+    isempty(setups) || push!(parts, string(length(setups) == 1 ? "setup " : "setups ",
+                                           join(("`$s`" for s in setups), ", ")))
+    return join(parts, ", ")
+end
+
+"""
+    shown_names(names, width; among = names) -> Vector{String}
+
+Each of `names` as a column `width` wide shows it. A name that fits is quoted as it
+is. One that does not becomes `r"^…"`: a prefix of it as long as fits, and never
+shorter than the shortest prefix no other name in `among` starts with, so that
+passed to `name=` it picks out that item and no other. `among` is every name in the
+suite, since a filter can leave out the item whose name a prefix would also match. When even that prefix does
+not fit, the name overruns the column with it; when no prefix is its own (the name
+begins another), it overruns the column whole. With any name shortened, every name
+gets a column in front of its opening quote, `r` or a space, so the quotes line up.
+"""
+function shown_names(names::Vector{String}, width::Integer; among::Vector{String} = names)
+    quoted = [repr(n) for n in names]
+    all(q -> textwidth(q) <= width, quoted) && return quoted
+    # In sorted order, a name shares its longest prefix with one of its neighbours.
+    pool = sort!(unique!(vcat(among, names)))
+    common(a, b) = (k = 0; for (x, y) in zip(a, b); x == y || break; k += 1; end; k)
+    need = map(names) do n
+        j = searchsortedfirst(pool, n)
+        before = j > 1 ? common(n, pool[j - 1]) : 0
+        after = j < length(pool) ? common(n, pool[j + 1]) : 0
+        max(before, after) + 1
+    end
+    shortened = map(eachindex(names)) do i
+        n = names[i]
+        textwidth(quoted[i]) <= width && return nothing
+        need[i] >= length(n) && return nothing   # no prefix of its own, or none shorter
+        # The longest prefix whose `"^…"` fits, but no shorter than `need`.
+        k = need[i]
+        while k + 1 < length(n) && textwidth(regex_prefix(n, k + 1)) - 1 <= width
+            k += 1
+        end
+        return regex_prefix(n, k)
+    end
+    any(!isnothing, shortened) || return quoted
+    return [s === nothing ? " " * q : s for (s, q) in zip(shortened, quoted)]
+end
+
+# `r"^…"` for the first `k` characters of `name`, written as Julia source for a
+# regular expression that matches those characters literally.
+function regex_prefix(name::AbstractString, k::Integer)
+    io = IOBuffer()
+    print(io, "r\"^")
+    for c in first(name, k)
+        if c in "\\^\$.|?*+()[]{}"
+            print(io, '\\', c)
+        elseif c == '"'
+            print(io, "\\\"")
+        elseif !isprint(c)
+            print(io, escape_string(string(c)))   # `\n`, `\x01`: escapes the regex reads too
+        else
+            print(io, c)
+        end
+    end
+    print(io, '"')
+    return String(take!(io))
+end
+
+"""
+    print_plan_table(io, p, order)
+
+Every test item, a row each, in the order the run is expected to start them (see
+[`run_order`](@ref)): the worker expected to run it, where it is, its tags, why it
+goes where it does when that is not file order, and what it was declared with.
+Columns are separated as the fields of the run's lines are, and each is as wide as
+the widest thing in it; a column nothing fills is left out. The name column is as
+wide as the run's, and a name far longer than the rest is shortened to fit it, as
+[`shown_names`](@ref) does.
+"""
+function print_plan_table(io::IO, p::Plan, order)
+    it = p.items
+    n = nitems(p)
+    solo = single_process(p)
+    rows = [i for (_, _, i) in order.items]
+    workers = [string("w", s) for (_, s, _) in order.items]
+    width = name_width(it.name)
+    names = shown_names([it.name[i] for i in rows], width; among = p.suite_names)
+    locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
+    tags = [join(tags_of(it, i), ", ") for i in rows]
+    # A chain's reason is its first item's: the unit is placed, not each member.
+    whys = [i == first(p.units.span[it.unit[i]]) ? why_text(p, it.unit[i]) : "" for i in rows]
+    details = [details_text(p, i) for i in rows]
+    columns = Tuple{String, Vector{String}}[]
+    push!(columns, ("#", [string(i) for i in 1:n]))
+    solo || push!(columns, ("worker", workers))
+    push!(columns, ("test item", names))
+    push!(columns, ("at", locations))
+    any(!isempty, tags) && push!(columns, ("tags", tags))
+    any(!isempty, whys) && push!(columns, ("why here", whys))
+    any(!isempty, details) && push!(columns, ("details", details))
+    # A name wider than the column overruns it; the column is as wide as the rest,
+    # and the place in front of the quotes when a name is shortened.
+    prefixed = any(startswith('r'), names)
+    widths = map(columns) do (title, cells)
+        title == "test item" ? max(length(title), width + prefixed) :
+            max(length(title), maximum(textwidth, cells; init = 0))
+    end
     println(io)
+    for r in 0:n
+        print(io, GUTTER)
+        # A row ends at its last filled column: the empty ones after it are left
+        # off, separators and all, while an empty one before it keeps its place.
+        cells = [r == 0 ? title : col[r] for (title, col) in columns]
+        last_ = something(findlast(!isempty, cells), 1)
+        for c in 1:last_
+            c == 1 || print(io, FIELD)
+            # The number and the worker are right-aligned, the rest left, and the
+            # last column is not padded.
+            text = columns[c][1] in ("#", "worker") ? lpad(cells[c], widths[c]) :
+                c == last_ ? cells[c] : rpad(cells[c], widths[c])
+            r == 0 ? print_bold(io, text) : print(io, text)
+        end
+        println(io)
+    end
     return nothing
 end
 
@@ -318,29 +506,11 @@ processes with what given to them, and the environment it resolved to.
 """
 function print_run_header(run)
     p = run.plan
-    head = sprint() do io
-        print(io, "v", pkgversion(@__MODULE__), " · julia ", VERSION, " · ", plural(nitems(p), "test item"),
-              " in ", plural(length(p.files), "file"))
-        # The commit, so a CI log says what to check out to reproduce this run.
-        rev = project_revision(p.root)
-        isempty(rev) || print(io, " · rev ", first(rev, 10))
-        print(io, " · seed ", seed_text(p.cfg.seed))
-        p.cfg.workers == 0 ? print(io, " · in this process") :
-            print(io, " · ", plural(length(run.slots), "worker"), " · threads ", p.profiles[1].threads)
-    end
+    head = sprint(io -> print_work(io, p, length(run.slots); seed = p.cfg.seed))
     body = sprint() do io
         println(io, "env: ", something(Base.active_project(), "none"))
         print_startup(io, p.startup)
-        # Only profiles that actually change something are worth a line.
-        for prof in p.profiles
-            parts = String[]
-            isempty(prof.julia_args) || push!(parts, join(prof.julia_args, " "))
-            prof.threads == p.profiles[1].threads || push!(parts, string("threads ", prof.threads))
-            isempty(prof.env) || push!(parts, join(("$k=$v" for (k, v) in prof.env), " "))
-            isempty(prof.init.args) || push!(parts, "init expression")
-            isempty(prof.test_end.args) || push!(parts, "test end expression")
-            isempty(parts) || println(io, "profile `", prof.name, "`: ", join(parts, " · "))
-        end
+        print_profiles(io, p)
     end
     print_yatf_block(run, head, body)
     return nothing
@@ -409,21 +579,23 @@ end
 print_failfast(run, i::ItemIdx) = say(run, "stopping after ", repr(run.plan.items.name[i]), " failed (failfast)")
 
 """
-    print_conclusion(run)
+    print_conclusion(run, ended = :finished)
 
 The block that closes a run. On a terminal it lands where the progress line was,
 so the last thing on screen says how the run went rather than which items
-happened to finish last.
+happened to finish last. `ended` is `:interrupted` or `:stalled` for a run that was
+stopped, which then says how far it got.
 """
-function print_conclusion(run, interrupted::Bool = false)
+function print_conclusion(run, ended::Symbol = :finished)
     p = run.plan
     st = run.statuses
     elapsed = fmt_seconds(time() - run.t0)
     tally = state_tally(st.state)
-    # An interrupted run got through some of its items, and how many is the news.
+    # A run that was stopped got through some of its items, and how many is the news.
     head = string(
-        interrupted ?
-            string("interrupted after ", count(s -> s !== UNSEEN && s !== CANCELLED, st.state), " of ",
+        ended !== :finished ?
+            string(ended === :stalled ? "stopped as hung after " : "interrupted after ",
+                   count(s -> s !== UNSEEN && s !== CANCELLED, st.state), " of ",
                    plural(nitems(p), "test item"), " in ", elapsed) :
             string("ran ", plural(nitems(p), "test item"), " in ", elapsed,
                    single_process(p) ? " in this process" : string(" on ", plural(length(run.slots), "worker"))),

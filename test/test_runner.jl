@@ -91,4 +91,21 @@
         @test value === nothing
         @test occursin("a_test.jl", printed)
     end
+
+    @testset "the summary says what memory the files needed" begin
+        memory = MemoryLog()
+        memory.peak["a_test.jl"] = 2 * 2^30
+        memory.peak["b_test.jl"] = 2^30
+        memory.suite, memory.suite_files = 3 * 2^30, 2
+        memory.machine, memory.total = 40 * 2^30, 64 * 2^30
+        results = [FileResult("a_test.jl", true, "", 1.0, ""), FileResult("b_test.jl", true, "", 2.0, "")]
+        _, printed = capture_run(() -> report_files(results; memory, jobs = 4))
+        @test occursin(r"a_test\.jl\s+1\.0s\s+2\.0G\s+passed", printed)
+        @test occursin("the files peaked at 3.0G together, with 2 of 4 running", printed)
+        @test occursin("the largest alone at 2.0G (a_test.jl)", printed)
+        @test occursin("the machine at 40.0G of 64.0G (62%)", printed)
+        # A file's own line: its peak, and how full the machine got while it ran.
+        memory.machine_while["a_test.jl"] = 32 * 2^30
+        @test memory_text(memory, "a_test.jl") == "peak 2.0G · machine 50%"
+    end
 end

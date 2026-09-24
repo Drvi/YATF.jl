@@ -23,8 +23,8 @@ end
 
 # Built by field name, with a plain default for every field not given, so that a
 # field added to `ItemSpec` does not break these tests.
-function probe_spec(code::Expr; name="probe")
-    given = (; name, code, file=@__FILE__, location=string(@__FILE__, ":1"), skip=false)
+function probe_spec(code::Expr; name="probe", skip=false)
+    given = (; name, code, file=@__FILE__, location=string(@__FILE__, ":1"), skip)
     default(T) = T === Int32 ? Int32(1) : T === Int8 ? Int8(1) : T === String ? "" : T === UInt64 ? UInt64(1) :
                  T === Bool ? false : T === Symbol ? :default : T === Expr ? Expr(:block) : nothing
     return ItemSpec((haskey(given, f) ? given[f] : default(fieldtype(ItemSpec, f))
@@ -120,6 +120,64 @@ end
         @test process_exited(w.process)
         @test w.process.exitcode == 0
         @test_throws WorkerTerminatedException remote_eval(w, :(1 + 1))
+    end
+
+    @testset "what an item's globals hold is let go when it ends" begin
+        # The item's module outlives the item: it is bound in Main, and the methods
+        # and types it defines are rooted for the life of the process. What its
+        # globals refer to need not: item after item, it would pile up in the worker.
+        probes = Core.eval(Main, :(const YATF_RELEASE_PROBES = WeakRef[]))
+        shared = Core.eval(Main, :(const YATF_RELEASE_SHARED = [1, 2, 3]))
+        res = YATFWorkers.run_item(probe_spec(quote
+            global big = zeros(UInt8, 10^7)
+            push!(Main.YATF_RELEASE_PROBES, WeakRef(big))
+            # One that cannot hold `nothing` is given an empty container instead.
+            global typed_big::Vector{UInt8} = zeros(UInt8, 10^7)
+            push!(Main.YATF_RELEASE_PROBES, WeakRef(typed_big))
+            const kept = 1          # a constant stays, and does not stop the rest
+            global typed::Int = 2   # nor does a global with no empty value
+            # What an item shares with the rest of the process is dropped, not emptied:
+            # the next item on the worker may need it.
+            global alias::Vector{Int} = Main.YATF_RELEASE_SHARED
+            const also = Main.YATF_RELEASE_SHARED
+            @test length(big) == 10^7
+        end))
+        @test res.state === PASSED
+        GC.gc(true)
+        @test [p.value for p in probes] == [nothing, nothing]
+        @test shared == [1, 2, 3]
+    end
+
+    @testset "what an item defines is shown the way the item defines it" begin
+        # The worker's loop was entered before the item ran, so a method the item
+        # defines is newer than the loop: showing the item's values from there needs
+        # the latest world, or a custom `show` is passed over for the default one.
+        # A pass is kept, and so shown, only when Test is asked to keep passes, which
+        # Julia 1.12 cannot be.
+        keeps_passes = isdefined(Test, :TEST_RECORD_PASSES)
+        with_worker(; threads="1", redirect_io=IOBuffer(),
+                    extra_env=["JULIA_TEST_RECORD_PASSES" => "true"]) do w
+            res = fetch(remote_run(w, probe_spec(quote
+                struct Boom <: Exception end
+                Base.show(io::IO, ::Boom) = print(io, "a custom Boom")
+                @test_throws Boom throw(Boom())
+            end)))
+            @test res.state === PASSED
+            keeps_passes && @test only(res.testset.results).value == "a custom Boom"
+            # A `skip` that is not a Bool is reported with its value as it prints.
+            odd = quote
+                struct Maybe end
+                Base.show(io::IO, ::Maybe) = print(io, "a custom Maybe")
+                Maybe()
+            end
+            err = try
+                fetch(remote_run(w, probe_spec(:(begin end); name="odd skip", skip=odd)))
+            catch e
+                e
+            end
+            @test err isa RemoteException
+            @test occursin("a custom Maybe", sprint(showerror, err))
+        end
     end
 
     @testset "a worker that dies before it is ready is reported at once" begin

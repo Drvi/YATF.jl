@@ -91,7 +91,8 @@ Every keyword can also be set in `test/TestItems.toml`, which additionally
 declares sandbox profiles and forced ordering; an explicit keyword wins.
 """
 function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false, kwargs...)
-    p, target = prepare(args; name, tags, kwargs...)
+    # A dry run says what it found in its own block, with the plan.
+    p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
     if dry_run
         print_plan(stdout, p)
         return p
@@ -105,7 +106,8 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
 end
 
 # Everything up to starting a process, so a plan can be inspected, printed or run.
-function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs...)
+# `announce` prints what is being read and what was found, as it happens.
+function prepare(args; name = nothing, tags = nothing, replay = nothing, announce::Bool = true, kwargs...)
     target = resolve_target(args)
     PROJECT_ROOT[] = target.root
     rs = replay === nothing ? nothing : read_replay(String(replay), target)
@@ -118,7 +120,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs.
     filter = Filter(; name, tags, paths = target.paths, line = target.line)
     setups = setup_modules(target.testdir)
     # Printed directly: there is no printer yet, and nothing else writes this early.
-    println(
+    announce && println(
         stdout, yatf_prefix(), "reading test files under ",
         relpath_or_path(target.testdir, target.root),
         is_full_run(filter, target) ? "" : string(" matching ", describe(filter, target))
@@ -137,9 +139,10 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs.
         )
     end
     # Every file, whatever the selection: a broken suite is broken, not smaller.
-    items = scan(files, filter, setups; strays)
+    suite_names = String[]
+    items = scan(files, filter, setups; strays, suite_names)
     isempty(items) && throw(NoTestsError("no test items matched " * describe(filter, target)))
-    println(
+    announce && println(
         stdout, yatf_prefix(), "found ", plural(length(items), "test item"), " in ",
         plural(length(unique(i -> i.file, items)), "file"),
         length(files) == length(unique(i -> i.file, items)) ? "" :
@@ -153,7 +156,7 @@ function prepare(args; name = nothing, tags = nothing, replay = nothing, kwargs.
     p = plan(
         items, cfg; history = history(target.root), root = target.root,
         strict_order = is_full_run(filter, target),
-        selection = is_full_run(filter, target) ? "" : describe(filter, target)
+        selection = is_full_run(filter, target) ? "" : describe(filter, target), suite_names
     )
     p.startup.files = files_seconds
     p.startup.plan = time() - t_plan

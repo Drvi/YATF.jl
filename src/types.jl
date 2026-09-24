@@ -64,6 +64,22 @@ end
 Base.showerror(io::IO, e::ConfigError) = print(io, "YATF: ", e.msg)
 
 """
+    RunStalled
+
+Thrown when no test item finished for longer than one attempt at any of them may
+take (see [`stall_limit`](@ref)): something that should have stopped did not, and
+the run was stopped as hung.
+"""
+struct RunStalled <: Exception
+    limit::Float64
+end
+Base.showerror(io::IO, e::RunStalled) = print(
+    io, "YATF: no test item finished in ", fmt_seconds(e.limit),
+    ", longer than one attempt at any of them may take, so the run was stopped as hung; ",
+    "the items that were running are recorded as timed out"
+)
+
+"""
     TagExpr
 
 A tag selection written in Julia's own syntax — `"!slow"`, `"fast && !slow"`,

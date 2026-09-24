@@ -59,7 +59,8 @@ const TEST_FILES = [
 
 # Four is where this stops paying: the longest file takes about as long as a
 # quarter of the suite, so more processes only add memory. Each of these starts
-# worker processes of its own.
+# worker processes of its own; the run ends with each file's peak memory, and the
+# suite's, to choose from.
 default_jobs() = something(tryparse(Int, get(ENV, "YATF_TEST_JOBS", "")), 4)
 
 """
@@ -95,5 +96,6 @@ elseif default_jobs() <= 1
     end
 else
     print_environment()
-    report_files(run_in_parallel(@__FILE__, TEST_FILES, default_jobs()))
+    results, memory = run_in_parallel(@__FILE__, TEST_FILES, default_jobs())
+    report_files(results; memory, jobs = default_jobs())
 end

@@ -306,7 +306,7 @@ end
         limit = p.cfg.memory_threshold
         function reading(pressure)
             m.samples[1] = YATF.Sample(
-                1.0f0, PHASE_TEST, Int16(1), 0, 0, Int32(0),
+                1.0f0, PHASE_TEST, Int16(1), Int16(0), 0, 0, Int32(0),
                 round(Int64, pressure * 2^30), Int64(2^30), 0.0f0
             )
             m.ring_head = 1
@@ -401,12 +401,12 @@ end
         for ps in st.phases
             ps.peak_total = 0; ps.peak_single = 0; ps.nprocs_at_peak = 0; ps.starts = 0
         end
-        sample(phase, total, largest, n) =
-            YATF.Sample(1.0f0, phase, Int16(n), Int64(total), Int64(largest), Int32(1),
-                        Int64(0), Int64(0), 1.0f0)
+        sample(phase, total, largest, n, workers = 0) =
+            YATF.Sample(1.0f0, phase, Int16(n), Int16(workers), Int64(total), Int64(largest),
+                        Int32(1), Int64(0), Int64(0), 1.0f0)
         YATF.update_stats!(m, sample(PHASE_SETUP, 800, 500, 2))
-        YATF.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9))
-        YATF.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5))
+        YATF.update_stats!(m, sample(PHASE_TEST, 3000, 700, 9, 8))
+        YATF.update_stats!(m, sample(PHASE_TEST, 2000, 900, 5, 4))
         @test phase_peak(st, PHASE_SETUP) == 800
         @test phase_peak(st, PHASE_TEST) == 3000        # the larger of the two
         @test phase_stats(st, PHASE_TEST).peak_single == 900
@@ -414,13 +414,25 @@ end
         # together. A later sample with more processes and a smaller total is a
         # different moment and does not contribute its count to this one.
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
-        YATF.update_stats!(m, sample(PHASE_TEST, 2500, 400, 40))
+        @test phase_stats(st, PHASE_TEST).workers_at_peak == 8
+        YATF.update_stats!(m, sample(PHASE_TEST, 2500, 400, 40, 8))
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 9
-        # ...and a larger total brings its own count with it.
-        YATF.update_stats!(m, sample(PHASE_TEST, 4000, 400, 3))
+        # ...and a larger total brings its own counts with it.
+        YATF.update_stats!(m, sample(PHASE_TEST, 4000, 400, 3, 2))
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak == 3
+        @test phase_stats(st, PHASE_TEST).workers_at_peak == 2
         # A stage that saw no sample keeps nothing from the others.
         @test phase_peak(st, PHASE_REPORT) == 0
+    end
+
+    @testset "a stage's processes are the coordinator, its workers and what they spawned" begin
+        text(n, workers) = YATF.procs_text(YATF.PhaseStats(; nprocs_at_peak = n, workers_at_peak = workers))
+        @test text(12, 8) == "coordinator + 8 workers + 3 spawned"
+        @test text(9, 8) == "coordinator + 8 workers"
+        @test text(2, 1) == "coordinator + 1 worker"
+        # Setup has no workers; what it spawns is the precompiling.
+        @test text(1, 0) == "coordinator"
+        @test text(2, 0) == "coordinator + 1 spawned"
     end
 
     @testset "the summary reports each stage the run went through" begin
@@ -444,6 +456,10 @@ end
         @test phase_peak(st, PHASE_TEST) >= phase_peak(st, PHASE_SETUP)
         @test phase_stats(st, PHASE_TEST).nprocs_at_peak >=
             phase_stats(st, PHASE_SETUP).nprocs_at_peak
+        # The workers are counted as workers, in the stage that ran them.
+        testing = only(filter(l -> occursin("testing", l), collect(eachsplit(summary, '\n'))))
+        @test occursin("coordinator + 2 workers", testing)
+        @test !occursin(r"over \d+ process", summary)
 
         # The single run-wide peak it used to lead with is gone: the stages say it.
         @test !occursin("largest single process", summary)
@@ -496,7 +512,7 @@ end
         # two of the monitor's, and what is under test here is the shape of the
         # line, not whether one happened to land.
         YATF.update_stats!(run.monitor,
-            YATF.Sample(1.0f0, PHASE_TEST, Int16(1), Int64(500_000_000), Int64(500_000_000),
+            YATF.Sample(1.0f0, PHASE_TEST, Int16(1), Int16(0), Int64(500_000_000), Int64(500_000_000),
                         Int32(getpid()), Int64(0), Int64(0), 1.0f0))
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("testing", summary)
@@ -505,12 +521,15 @@ end
         @test !occursin("tree max", summary)
         @test !occursin("child max", summary)
         @test !occursin("processes", summary)
+        @test !occursin("coordinator", summary)
         @test !occursin("over-count", summary)
     end
 
     @testset "precompiling a setup is measured as its own stage" begin
         # A module nothing has compiled before, so the stage actually runs and
-        # spawns the process that does the compiling.
+        # spawns the process that does the compiling. Its top level runs while it
+        # compiles, and the pause there keeps that process alive for several of the
+        # monitor's samples: compiling it alone can take less than one interval.
         dir = make_pkg("ColdStage")
         setup = string("Cold", string(hash(dir); base=16))
         mkpath(joinpath(dir, "test", "testsetups"))
@@ -518,6 +537,7 @@ end
               "module $setup
 " * join(["f$i(x) = x + $i" for i in 1:200], "
 ") * "
+sleep(1)
 end
 ")
         write(joinpath(dir, "test", "a_test.jl"), """
@@ -531,8 +551,10 @@ end
         rm(run.logdir; force=true, recursive=true)
         st = run.monitor.stats
         # The process doing the compiling is in the tree and counted there, in
-        # the setup stage that spawned it. Windows lists no child processes.
-        Sys.iswindows() || @test phase_stats(st, PHASE_SETUP).nprocs_at_peak >= 2
+        # the setup stage that spawned it: some sample of that stage has it, though
+        # not necessarily the one that set the stage's peak, which can come after it
+        # has gone. Windows lists no child processes.
+        Sys.iswindows() || @test any(s -> s.phase === PHASE_SETUP && s.nprocs >= 2, run.monitor.samples)
         @test phase_peak(st, PHASE_SETUP) > 0
         summary = sprint(io -> print_memory_summary(io, run.monitor))
         @test occursin("setup", summary)
@@ -642,6 +664,35 @@ end
         # Taking the monitor down erases what it had drawn, so the last thing on
         # the terminal is the erase and not half a status line.
         @test endswith(out, "\r\e[2K")
+    end
+
+    @testset "a warning from the monitor's own task gets a line of its own" begin
+        # The monitor's task warns when memory runs short, and the run starts it
+        # before its own logger is in place. Written as the process's logger writes,
+        # the warning went to stderr and continued the status line just drawn.
+        p, target = prepare((fixture("Basic.jl"),); workers=0, logs=:issues, monitor=false,
+                            memory_threshold=0.001)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        _, out = capture_run() do
+            with(YATF.TTY_OVERRIDE => true) do
+                m = run.monitor = Monitor(run)
+                # Every machine has more than a thousandth of its memory in use, so
+                # the first sample warns.
+                start_monitor!(m)
+                timedwait(() -> m.stats.guard_actions > 0, 30.0)
+                stop_monitor!(m)
+            end
+        end
+        at = findfirst("Warning: YATF: memory pressure", out)
+        @test at !== nothing
+        if at !== nothing
+            # What is on the warning's row before it: the status line was drawn
+            # there, and it must have been erased, leaving nothing visible.
+            row = out[something(findprev(==('\n'), out, at.start), 0) + 1:prevind(out, at.start)]
+            left = last(split(row, "\r\e[2K"))
+            @test isempty(replace(left, r"\e\[[0-9;]*m" => "", "┌ " => "", r"\s" => ""))
+        end
     end
 
     @testset "nothing is drawn while the line is withdrawn" begin

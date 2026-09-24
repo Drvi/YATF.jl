@@ -221,6 +221,27 @@ end
 
 untrack!(proc::Base.Process) = @lock LIVE_LOCK (delete!(LIVE_PROCESSES, proc); nothing)
 
+"""
+    live_worker_pids() -> Vector{Int32}
+
+The worker processes this process has started and not yet seen end, from the moment
+each is spawned: one still connecting or shutting down is among them.
+"""
+function live_worker_pids()
+    pids = Int32[]
+    @lock LIVE_LOCK for proc in LIVE_PROCESSES
+        process_running(proc) || continue
+        # It can end between the check and the lookup, which then throws.
+        pid = try
+            getpid(proc)
+        catch
+            continue
+        end
+        push!(pids, pid)
+    end
+    return pids
+end
+
 function kill_leftovers()
     @lock LIVE_LOCK begin
         for proc in LIVE_PROCESSES

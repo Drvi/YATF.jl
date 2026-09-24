@@ -193,3 +193,49 @@ end
     # Windows ends a process with TerminateProcess, which prints nothing on the way.
     Sys.iswindows() || @test occursin("Captured logs", out)
 end
+
+@testset "a run in which nothing finishes for too long is stopped as hung" begin
+    # An item that outlasts the stall limit before its own timeout would fire stands
+    # in for what the limit is there for: something that should have stopped and did
+    # not. A real limit is half an hour or more, so the test sets a short one.
+    dir = make_pkg("Stalls", "test/s_test.jl" => """
+    @testitem "quick" begin
+        @test true
+    end
+    @testitem "outlasts the limit" timeout=600 begin
+        sleep(120)
+        @test true
+    end
+    """)
+    for workers in (1, 0)
+        with_runstate_dir() do _
+            t0 = time()
+            err, out = capture_run() do
+                Base.ScopedValues.with(YATF.STALL_LIMIT_OVERRIDE => 3.0) do
+                    p, target = YATF.prepare((dir,); workers, logs=:issues, monitor=true, announce=false)
+                    try
+                        YATF.execute(p, target)
+                        nothing
+                    catch e
+                        e
+                    end
+                end
+            end
+            # Seconds after the last item finished, not the two minutes the other sleeps.
+            @test err isa YATF.RunStalled
+            @test time() - t0 < 60
+            @test occursin("stopping the run as hung", out)
+            @test occursin("stopped as hung after", out)
+            # What was running is timed out, and says why; what finished stands.
+            rs = YATF.read_run_state(only(YATF.runstate_files(dir)))
+            state(name) = rs.statuses[findfirst(it -> it.name == name, rs.items)].state
+            @test state("quick") === PASSED
+            @test state("outlasts the limit") === TIMEDOUT
+            @test rs.cancelled
+            # Nothing it started is left running, and how the worker ended is on record:
+            # the run waited for the process it killed.
+            @test isempty(YATFWorkers.live_worker_pids())
+            workers == 0 || @test any(e -> e.kind === :worker_down && e.ended_by === :interrupt, rs.events)
+        end
+    end
+end

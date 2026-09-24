@@ -17,6 +17,55 @@ struct FileResult
     output::String
 end
 
+# Memory while the files run, sampled twice a second: each file's process tree (its
+# process and every worker it starts) at its largest, and the suite's and the
+# machine's at theirs. What it takes to choose how many files run at once.
+mutable struct MemoryLog
+    const lock::ReentrantLock
+    const pids::Dict{Int32, String}   # a running file's process -> the file
+    const peak::Dict{String, Int64}   # file -> its tree's largest summed resident size
+    const machine_while::Dict{String, Int64}   # file -> the machine's memory in use, at its largest while the file ran
+    suite::Int64                      # every running file's tree together, at the largest
+    suite_files::Int                  # how many files were running then
+    machine::Int64                    # the machine's memory in use, at the largest
+    total::Int64
+    @atomic done::Bool
+end
+MemoryLog() = MemoryLog(ReentrantLock(), Dict{Int32, String}(), Dict{String, Int64}(), Dict{String, Int64}(), 0, 0, 0, 0, false)
+
+function sample!(log::MemoryLog)
+    used, total = YATF.Platform.machine_memory()
+    @lock log.lock begin
+        log.total = total
+        log.machine = max(log.machine, used)
+        for file in values(log.pids)
+            used > get(log.machine_while, file, 0) && (log.machine_while[file] = used)
+        end
+        # Without per-process figures there is only the machine to go by.
+        YATF.Platform.PER_PROCESS_OK[] || return nothing
+        suite = Int64(0)
+        for (pid, file) in log.pids
+            tree = sum((max(YATF.Platform.process_rss(p), 0) for p in YATF.Platform.process_tree([pid])); init = Int64(0))
+            suite += tree
+            tree > get(log.peak, file, 0) && (log.peak[file] = tree)
+        end
+        suite > log.suite && ((log.suite, log.suite_files) = (suite, length(log.pids)))
+    end
+    return nothing
+end
+
+peak_of(log::MemoryLog, file) = @lock log.lock get(log.peak, file, 0)
+
+# A share of the machine's memory, as a percentage.
+percent(used, total) = total > 0 ? string(round(Int, 100 * used / total), "%") : "-"
+
+# What a file's line says about memory: its own peak, and how full the machine got
+# while it ran.
+memory_text(log::MemoryLog, file) = @lock log.lock string(
+    "peak ", YATF.fmt_bytes(get(log.peak, file, 0)),
+    " · machine ", percent(get(log.machine_while, file, 0), log.total)
+)
+
 # The environment a child needs to be this process with one file in it: the same
 # load path (YATF's own checkout is on it under `Pkg.test`), the same depot, and
 # the same project.
@@ -70,7 +119,10 @@ function exit_status(proc::Base.Process)
     return ""
 end
 
-function run_file_in_subprocess(runner::AbstractString, file::AbstractString; limit::Real = FILE_LIMIT_SECONDS)
+function run_file_in_subprocess(
+        runner::AbstractString, file::AbstractString;
+        limit::Real = FILE_LIMIT_SECONDS, memory::Union{Nothing, MemoryLog} = nothing
+    )
     log = tempname()
     t0 = time()
     # One open file for both streams. Given the path twice, the child would get two
@@ -83,9 +135,16 @@ function run_file_in_subprocess(runner::AbstractString, file::AbstractString; li
         # It could not be started at all; that is this file's failure too.
         return FileResult(file, false, "could not start", time() - t0, sprint(showerror, e))
     end
+    pid = try
+        Int32(getpid(proc))
+    catch
+        Int32(0)   # it has already exited
+    end
+    memory === nothing || pid == 0 || @lock memory.lock (memory.pids[pid] = file)
     hung = timedwait(() -> process_exited(proc), limit; pollint = 1.0) === :timed_out
     hung && stop_hung(proc)
     wait(proc)
+    memory === nothing || @lock memory.lock delete!(memory.pids, pid)
     close(io)
     seconds = time() - t0
     output = isfile(log) ? read(log, String) : ""
@@ -101,6 +160,12 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
     foreach(i -> put!(queue, i), eachindex(files))
     close(queue)
     printer = ReentrantLock()
+    memory = MemoryLog()
+    YATF.Platform.ensure_checked!()
+    sampler = Threads.@spawn while !(@atomic memory.done)
+        sample!(memory)
+        sleep(0.5)
+    end
     @sync for _ in 1:jobs
         Threads.@spawn for i in queue
             # Said when a file starts, so a run that stalls shows what is in flight.
@@ -108,7 +173,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
                 println(stdout, rpad(files[i], 52), "running")
                 flush(stdout)
             end
-            r = run_file_in_subprocess(runner, files[i])
+            r = run_file_in_subprocess(runner, files[i]; memory)
             results[i] = r
             # A file that passed says so in one line: twenty files' worth of
             # passing output is what buries the few lines that matter. A file that
@@ -119,7 +184,8 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
                 if r.ok
                     printstyled(
                         stdout, rpad(r.file, 52), "passed  ",
-                        round(r.seconds; digits = 1), "s\n"; color = :green
+                        lpad(string(round(r.seconds; digits = 1), "s"), 6), "  ",
+                        memory_text(memory, r.file), "\n"; color = :green
                     )
                 else
                     printstyled(
@@ -134,20 +200,24 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
             end
         end
     end
-    return FileResult[r for r in results if r !== nothing]
+    @atomic memory.done = true
+    wait(sampler)
+    return FileResult[r for r in results if r !== nothing], memory
 end
 
-function report_files(results::Vector{FileResult})
+function report_files(results::Vector{FileResult}; memory::Union{Nothing, MemoryLog} = nothing, jobs::Int = 0)
     failed = filter(r -> !r.ok, results)
     println("\n", "="^78)
     printstyled(stdout, "YATF test files\n"; bold = true)
     for r in sort(results; by = r -> -r.seconds)
         printstyled(
             stdout, "  ", rpad(r.file, 24), lpad(round(r.seconds; digits = 1), 7), "s  ",
+            memory === nothing ? "" : string(lpad(YATF.fmt_bytes(peak_of(memory, r.file)), 6), "  "),
             r.ok ? "passed" : "FAILED (" * r.status * ")", "\n";
             color = r.ok ? :green : :red
         )
     end
+    memory === nothing || print_memory(memory, jobs)
     println("="^78)
     isempty(failed) && return nothing
     # Each file's own detail is above, in its own block. What this adds is which
@@ -156,4 +226,23 @@ function report_files(results::Vector{FileResult})
         "YATF: ", length(failed), " of ", length(results), " test files failed: ",
         join((string(r.file, " (", r.status, ")") for r in failed), ", ")
     )
+end
+
+# What the files needed, to choose `YATF_TEST_JOBS` from: the largest one, and all
+# that were running at once at the suite's peak, against what the machine had.
+function print_memory(memory::MemoryLog, jobs::Int)
+    largest = isempty(memory.peak) ? nothing : argmax(memory.peak)
+    parts = String[]
+    memory.suite > 0 && push!(parts, string(
+        "the files peaked at ", YATF.fmt_bytes(memory.suite), " together, with ",
+        memory.suite_files, " of ", jobs, " running"))
+    largest === nothing || push!(parts, string(
+        "the largest alone at ", YATF.fmt_bytes(memory.peak[largest]), " (", largest, ")"))
+    memory.total > 0 && push!(parts, string(
+        "the machine at ", YATF.fmt_bytes(memory.machine), " of ", YATF.fmt_bytes(memory.total),
+        " (", percent(memory.machine, memory.total), ")"))
+    isempty(parts) && return nothing
+    println("  memory: ", join(parts, " · "))
+    memory.suite > 0 && println("  (a file's figure is its process and its workers, summed: shared pages count twice)")
+    return nothing
 end

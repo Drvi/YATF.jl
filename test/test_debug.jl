@@ -58,6 +58,34 @@ const STEPPED = make_pkg(
         @test ENV["YATF_FROM_PROFILE"] == "env"
         @test Main.YATF_FROM_INIT == 7
     end
+
+    @testitem "imports and submodules" begin
+        using Helpers
+        import Base: show
+        struct Q end
+        show(io::IO, ::Q) = print(io, "Q!")
+        module Sub
+            export inner
+            inner() = 7
+        end
+        using .Sub
+        if true
+            using Random: Xoshiro
+        end
+        @test @double(helper()) == 42
+        @test sprint(print, Q()) == "Q!"
+        @test inner() == 7
+        @test rand(Xoshiro(1), 1:3) in 1:3
+    end
+    """,
+    "test/testsetups/Helpers.jl" => """
+    module Helpers
+    export helper, @double
+    helper() = 21
+    macro double(ex)
+        :(2 * \$(esc(ex)))
+    end
+    end
     """,
     "test/TestItems.toml" => """
     [profiles.flagged]
@@ -101,6 +129,16 @@ call(body) = body()
             @test entered[].nargs == 1
             @test endswith(String(entered[].file), joinpath("test", "s_test.jl"))
             @test entered[].line == line_of("@testitem \"declares and tests\"")
+        end
+
+        @testset "every kind of `using` and `import` runs first, as in a run" begin
+            # A setup and the macro it exports, a submodule the body defines, a
+            # `using` inside an `if`, and a Base function extended under the name an
+            # `import` gave it, which is a method on `Base.show` and not a local
+            # function that `print` would never call.
+            ts = YATF.debug_item(call, "imports and submodules", nothing)
+            @test ts.n_passed == 4
+            @test isempty(ts.results)
         end
 
         @testset "a failure and an error are the item's, at the test file's lines" begin

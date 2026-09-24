@@ -254,9 +254,10 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     # worker does not load YATF, the whole coordinator, to reach it.
     prelude = Any[Expr(:const, Expr(:(=), :Test, Test)), :(using .Test)]
     isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
+    modsym = gensym(modname)
     evaluate = if enter === nothing
         body = softscope_all!(Expr(:block, prelude..., code.args...))
-        () -> Core.eval(Main, Expr(:module, true, gensym(modname), body))
+        () -> Core.eval(Main, Expr(:module, true, modsym, body))
     else
         () -> enter_item(enter, prelude, code, modname, spec)
     end
@@ -282,8 +283,48 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
                 is_failfast_error(err2) || rethrow()
             end
         end
+    finally
+        # Under a debugger the item's module is the user's to look at afterwards.
+        enter === nothing && release_globals!(Main, modsym)
     end
     return stats[]
+end
+
+"""
+    release_globals!(parent, name)
+
+Let go of what the globals of module `parent.name` refer to, once its item has
+finished. The module outlives the item: it is bound where it was defined, and the
+methods and types it defines are rooted for the life of the process. Without this,
+so would every array and object its globals hold, item after item, until the worker
+exits. A global whose declared type cannot hold `nothing` gets a new empty container
+of its type instead, where `empty` makes one. What a global refers to is dropped,
+never emptied, because the item need not own it (a test setup's data, say); so a
+constant, which cannot be rebound, keeps its value.
+"""
+function release_globals!(parent::Module, name::Symbol)
+    # In the latest world: the module was made after this function's caller began.
+    return Base.invokelatest(_release_globals!, parent, name)
+end
+
+function _release_globals!(parent::Module, name::Symbol)
+    isdefined(parent, name) || return nothing   # the item failed before its module existed
+    mod = getglobal(parent, name)
+    mod isa Module || return nothing
+    for n in names(mod; all = true)
+        (n === name || !isdefined(mod, n) || isconst(mod, n)) && continue
+        try
+            setglobal!(mod, n, nothing)
+        catch
+            # Declared with a type that `nothing` is not.
+            try
+                setglobal!(mod, n, empty(getglobal(mod, n)))
+            catch
+                # Not a container, or its empty one is not of the declared type.
+            end
+        end
+    end
+    return nothing
 end
 
 """
@@ -299,15 +340,19 @@ first, in the order written. The function holds the rest.
 function enter_item(enter, prelude::Vector{Any}, code::Expr, modname::AbstractString, spec::ItemSpec)
     at = LineNumberNode(Int(spec.line), Symbol(spec.file))
     mod = Core.eval(Main, Expr(:module, true, gensym(modname), Expr(:block, prelude...)))
-    defined = Set{Symbol}(Base.invokelatest(names, mod; all = true))
+    # Its own names and the ones it imports by name (`import Base: show`), which a
+    # definition then extends rather than shadows.
+    owned() = Base.invokelatest(names, mod; all = true, imported = true)
+    defined = Set{Symbol}(owned())
     line = at
     body = Any[at]   # the method is the item's, so it is where the item is declared
     for ex in code.args
         if ex isa LineNumberNode
             line = ex
         elseif Base.invokelatest(needs_top_level, mod, ex, defined)
-            Core.eval(mod, Expr(:block, line, ex))
-            union!(defined, Base.invokelatest(names, mod; all = true))
+            # `:toplevel` rather than a block: a `module` may only be defined there.
+            Core.eval(mod, Expr(:toplevel, line, ex))
+            union!(defined, owned())
         else
             push!(body, line, ex)
         end
@@ -331,7 +376,8 @@ const TOP_LEVEL_HEADS = (:using, :import, :export, :public, :struct, :abstract, 
 
 # Whether a statement of the body has to be evaluated at the item module's top level
 # rather than inside a function. Asked of the module as it is by then, so a macro can
-# come from a `using` above it, and `defined` holds the names the module owns so far.
+# come from a `using` above it, and `defined` holds the names the module owns or has
+# imported by name so far.
 function needs_top_level(mod::Module, @nospecialize(ex), defined::Set{Symbol})
     ex isa Expr || return false
     ex.head in TOP_LEVEL_HEADS && return true
@@ -340,10 +386,11 @@ function needs_top_level(mod::Module, @nospecialize(ex), defined::Set{Symbol})
     return adds_method_to_global(ex, defined)
 end
 
-# `Base.show(io::IO, p::Point) = ...`, `(p::Point)(x) = ...`, or `Point() = Point(0)`
-# once `Point` is the module's: a method on a function or type that lives in a
-# module, which only a top-level definition can add. A definition under a name the
-# module does not own is a local function, and may close over the body's variables.
+# `Base.show(io::IO, p::Point) = ...`, `(p::Point)(x) = ...`, `Point() = Point(0)` once
+# `Point` is the module's, or `show(io::IO, p::Point) = ...` after `import Base: show`:
+# a method on a function or type that lives in a module, which only a top-level
+# definition can add. A definition under any other name is a local function, and may
+# close over the body's variables.
 function adds_method_to_global(ex::Expr, defined::Set{Symbol})
     ex.head === :function || ex.head === :(=) || return false
     sig = ex.args[1]
@@ -375,7 +422,9 @@ function should_skip(spec::ItemSpec)
     body = softscope_all!(Expr(:block, deepcopy(spec.skip)))
     mod = Module(Symbol("skip_", spec.name))
     skip = Core.eval(mod, body)
-    skip isa Bool || error("test item $(repr(spec.name)): `skip` must evaluate to a Bool, got $(repr(skip))")
+    # Shown in the latest world: the expression may have defined how its value prints.
+    skip isa Bool || error("test item $(repr(spec.name)): `skip` must evaluate to a Bool, " *
+                           "got $(Base.invokelatest(repr, skip))")
     return skip
 end
 
@@ -521,8 +570,10 @@ function transferrable(ts::Test.AbstractTestSet)
 end
 
 function transferrable(res::Test.Pass)
+    # In the latest world: this runs after the item, in a function entered before it,
+    # and the item (or the package it loaded) may have defined how its exception prints.
     res.test_type === :test_throws &&
-        return Test.Pass(:test_throws, nothing, nothing, string(res.value))
+        return Test.Pass(:test_throws, nothing, nothing, Base.invokelatest(string, res.value))
     return Test.Pass(res.test_type, res.orig_expr, nothing, res.value, res.source, res.message_only)
 end
 

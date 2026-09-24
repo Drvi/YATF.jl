@@ -20,7 +20,8 @@ phase_name(p::RunPhase) =
 struct Sample
     t::Float32     # seconds since the run started
     phase::RunPhase
-    nprocs::Int16
+    nprocs::Int16    # the whole tree: this process, its workers, and what they started
+    nworkers::Int16  # of those, the live workers
     total_rss::Int64       # summed over our whole process tree
     largest_rss::Int64
     largest_pid::Int32
@@ -29,7 +30,7 @@ struct Sample
     load1::Float32     # one-minute load average
 end
 
-Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, -1.0f0)
+Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, 0, -1.0f0)
 
 # What one stage of a run cost. Per stage because the stages are different
 # machines: one process resolving, a few short-lived ones precompiling, and the
@@ -41,6 +42,7 @@ Base.@kwdef mutable struct PhaseStats
     # Processes alive at the sample that set `peak_total`, not the most ever alive:
     # maxima from different instants, printed side by side, contradict each other.
     nprocs_at_peak::Int = 0
+    workers_at_peak::Int = 0   # of those, the live workers
     # Processes started during this stage. A stage that replaces a worker per item
     # churns through many more than are ever alive together.
     starts::Int = 0
@@ -221,7 +223,11 @@ function start_monitor!(m::Monitor)
     catch e
         @warn "YATF: per-process memory accounting is unavailable here" exception = e maxlog = 1
     end
-    m.task = Threads.@spawn begin
+    # A task keeps the logger of the scope that started it, and the monitor starts
+    # before the run's own is in place: its warnings go through `printline` whoever
+    # starts it, or they land on the status line it draws.
+    logger = RunLogger(current_logger(), run_of(m))
+    m.task = Threads.@spawn with_logger(logger) do
         try
             monitor_loop(m)
         catch e
@@ -257,15 +263,13 @@ function monitor_loop(m::Monitor)
     return nothing
 end
 
-# Roots of our process tree: this process, plus every live worker. Their children
-# — `Pkg`'s precompilation workers, anything a test item starts — are found from
-# there, because they spend the same memory budget.
-function tree_roots(m::Monitor)
+# Roots of our process tree: this process, plus every worker it has started and
+# not seen end, including one still connecting or shutting down, which no slot holds.
+# Their children — `Pkg`'s precompilation workers, anything a test item starts — are
+# found from there, because they spend the same memory budget.
+function tree_roots(::Monitor)
     roots = Int32[Int32(getpid())]
-    for slot in run_of(m).slots
-        w = slot.worker
-        w === nothing || push!(roots, Int32(w.pid))
-    end
+    append!(roots, YATFWorkers.live_worker_pids())
     return roots
 end
 
@@ -273,12 +277,15 @@ function sample!(m::Monitor)
     t = Float32(time() - run_of(m).t0)
     phase = @atomic m.phase
     used, total = machine_memory()
-    total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0
+    total_rss = Int64(0); largest = Int64(0); largest_pid = Int32(0); nprocs = 0; nworkers = 0
     if PER_PROCESS_OK[]
-        for pid in process_tree(tree_roots(m))
+        roots = tree_roots(m)
+        for pid in process_tree(roots)
             rss = process_rss(pid)
             rss <= 0 && continue
             nprocs += 1
+            # Every root but this process is a worker.
+            pid != first(roots) && pid in roots && (nworkers += 1)
             total_rss += rss
             rss > largest && ((largest, largest_pid) = (rss, Int32(pid)))
         end
@@ -290,7 +297,7 @@ function sample!(m::Monitor)
         end
     end
     load1 = Float32(cpu_load())
-    s = Sample(t, phase, Int16(nprocs), total_rss, largest, largest_pid, used, total, load1)
+    s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1)
     m.ring_head = mod1(m.ring_head + 1, RING_SAMPLES)
     m.samples[m.ring_head] = s
     update_stats!(m, s)
@@ -320,6 +327,7 @@ function update_stats!(m::Monitor, s::Sample)
     if s.total_rss > ps.peak_total
         ps.peak_total = s.total_rss
         ps.nprocs_at_peak = Int(s.nprocs)
+        ps.workers_at_peak = Int(s.nworkers)
     end
     s.largest_rss > ps.peak_single && (ps.peak_single = s.largest_rss)
     return nothing
@@ -412,7 +420,16 @@ end
 # How long the reporting stage has to take before it is worth a line of its own.
 const REPORT_WORTH_SAYING = 1.0
 
-procs_text(n::Integer) = string("over ", plural(n, "process", "processes"))
+# Who a stage's peak was summed over: this process, its workers, and whatever they
+# started (the processes precompiling, or anything a test ran), each counted apart.
+function procs_text(ps::PhaseStats)
+    spawned = ps.nprocs_at_peak - 1 - ps.workers_at_peak
+    return string(
+        "coordinator",
+        ps.workers_at_peak > 0 ? string(" + ", plural(ps.workers_at_peak, "worker")) : "",
+        spawned > 0 ? string(" + ", spawned, " spawned") : ""
+    )
+end
 # Four holds every figure up to `9.9G`; a bigger tree shifts the line by a column
 # rather than every redraw carrying a blank one.
 const TOTAL_WIDTH = 4     # "1.1G", "612M"
@@ -759,7 +776,7 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
             name_width = max(name_width, length(phase_name(phase)))
             time_width = max(time_width, length(fmt_seconds(phase_seconds(st, phase, finish))))
             (solo || ps.peak_total <= 0) && continue
-            procs_width = max(procs_width, length(procs_text(ps.nprocs_at_peak)))
+            procs_width = max(procs_width, length(procs_text(ps)))
         end
         for phase in instances(RunPhase)
             shown(phase) || continue
@@ -775,7 +792,7 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
                 if !solo
                     print(io, FIELD, "child max ")
                     print_bytes(io, ps.peak_single, BYTES_WIDTH)
-                    text = procs_text(ps.nprocs_at_peak)
+                    text = procs_text(ps)
                     print(io, FIELD, text)
                     # Padded only to line up a field that follows; a line that ends
                     # here ends at its last character.

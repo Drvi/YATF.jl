@@ -169,6 +169,16 @@ mutable struct Run
     # declare preferences have one; everything else uses the test environment.
     const profile_projects::Dict{Symbol, String}
     @atomic ndone::Int
+    # When an item last finished, or testing started: what the watchdog measures from.
+    @atomic last_finish::Float64
+    # Set when the watchdog stopped the run because nothing finished in time.
+    @atomic stalled::Bool
+    # The tasks running items, for the watchdog to interrupt.
+    const tasks::Vector{Task}
+    # Workers `kill_workers!` took from their slots, for `shutdown!` to wait for.
+    const killed::Vector{YATFWorkers.Worker}
+    # Guards `tasks` and `killed`, which the watchdog's timer uses as well.
+    const lock::ReentrantLock
 end
 
 """
@@ -188,7 +198,8 @@ function execute(p::Plan, target)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"),
         name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)),
-        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0
+        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0.0, false, Task[],
+        YATFWorkers.Worker[], ReentrantLock()
     )
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
     for s in 1:nslots(p)
@@ -229,19 +240,27 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                 interrupted = false
                 ensure_exit_report()
                 LIVE_RUN[] = run
+                limit = stall_limit(p)
+                @atomic run.last_finish = time()
+                watchdog = start_watchdog(run, limit)
                 try
                     if cfg.workers == 0
                         run_in_process(run, target)
                     else
                         run_on_workers(run, target)
                     end
+                    # Stopped with nothing in flight to interrupt: the slots saw their
+                    # workers go and ended on their own.
+                    (@atomic run.stalled) && throw(RunStalled(limit))
                 catch e
-                    if e isa InterruptException
+                    stalled = @atomic run.stalled
+                    if e isa InterruptException || stalled
                         interrupted = true
                         kill_workers!(run)
                     end
-                    rethrow()
+                    stalled ? throw(RunStalled(limit)) : rethrow()
                 finally
+                    close(watchdog)
                     # Reaching here at all means the run unwound, so the exit hook
                     # has nothing left to close.
                     LIVE_RUN[] = nothing
@@ -253,7 +272,7 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                     prune_runstates(p.root)
                     # The exception on its way out stops the report from being
                     # made, so what the run got through is said here or nowhere.
-                    interrupted && print_conclusion(run, true)
+                    interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
                 end
                 run
             end
@@ -708,30 +727,26 @@ end
 ### Workers ################################################################
 
 function run_on_workers(run::Run, target)
-    original_logger = current_logger()
     tasks = map(run.slots) do slot
         Threads.@spawn begin
             s = $slot
-            # The logger in force before any user code was evaluated: logging from
-            # a task that inherited a later world age can hit world-age errors.
-            with_logger(original_logger) do
-                try
-                    run_slot(run, s, target)
-                catch e
-                    if e isa InterruptException
-                        cancel!(run.queues)
-                        record_stopped_item!(run, s)
-                        rethrow()
-                    end
-                    # This slot is finished, not the run: its units stay in its
-                    # queue for the others to steal, so one bad item does not stop
-                    # a suite.
-                    @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
-                        "left for the other workers" exception = (e, catch_backtrace())
+            try
+                run_slot(run, s, target)
+            catch e
+                if e isa InterruptException
+                    cancel!(run.queues)
+                    record_stopped_item!(run, s)
+                    rethrow()
                 end
+                # This slot is finished, not the run: its units stay in its
+                # queue for the others to steal, so one bad item does not stop
+                # a suite.
+                @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
+                    "left for the other workers" exception = (e, catch_backtrace())
             end
         end
     end
+    @lock run.lock append!(run.tasks, tasks)
     try
         foreach(wait, tasks)
     catch e
@@ -783,7 +798,11 @@ function record_stopped_item!(run::Run, slot::Slot)
     # failed for a reason of its own.
     run.statuses.state[i] === UNSEEN || return nothing
     attempt = max(run.statuses.attempt[i], Int8(1))
-    record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+    if @atomic run.stalled
+        record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
+    else
+        record_error!(run, i, slot, attempt, CANCELLED, "the run was stopped")
+    end
     return nothing
 end
 
@@ -805,6 +824,75 @@ function interrupt_slots!(tasks)
             # is nothing left in it to interrupt.
         end
     end
+    return nothing
+end
+
+### Watchdog #################################################################
+
+# What one attempt may spend besides its timeout and its profile's `init` and
+# `test_end`: starting a worker, handing the result back, and reporting it.
+const STALL_MARGIN_S = 5 * 60
+# How often the watchdog looks, at most: the limit is half an hour or more.
+const STALL_CHECK_S = 5.0
+
+const STALLED_NOTE = "the run was stopped as hung while this item was running: no test item " *
+    "had finished for longer than one attempt at any of them may take"
+
+"""
+    STALL_LIMIT_OVERRIDE
+
+What [`stall_limit`](@ref) answers when a test has decided: a real limit is half an
+hour or more, and a test cannot wait that long for a run to be declared hung.
+"""
+const STALL_LIMIT_OVERRIDE = ScopedValue{Union{Nothing, Float64}}(nothing)
+
+"""
+    stall_limit(p) -> Float64
+
+The longest a run may go with no test item finishing, in seconds: one attempt at
+the item with the largest timeout, on a worker whose profile's `init` and `test_end`
+take all they are allowed, after the longest memory hold, with `STALL_MARGIN_S` for
+everything around it. An item that runs past its timeout is killed, which ends its
+attempt too, so nothing finishing for longer means something that should have
+stopped did not.
+"""
+function stall_limit(p::Plan)
+    forced = STALL_LIMIT_OVERRIDE[]
+    forced === nothing || return forced
+    cfg = p.cfg
+    item = maximum(t -> t == USE_RUN_DEFAULT ? cfg.timeout_s : Int(t), p.items.timeout_s; init = cfg.timeout_s)
+    init = any(prof -> !isempty(prof.init.args), p.profiles) ? cfg.init_timeout_s : 0
+    test_end = any(prof -> !isempty(prof.test_end.args), p.profiles) ? cfg.test_end_timeout_s : 0
+    return Float64(item + init + test_end + MAX_BACKPRESSURE_SECONDS + STALL_MARGIN_S)
+end
+
+"""
+    start_watchdog(run, limit) -> Timer
+
+Stop the run as hung once no test item has finished for `limit` seconds. A timer on
+the coordinator, where a timer is free to run: the tasks there yield.
+"""
+function start_watchdog(run::Run, limit::Real)
+    every = min(STALL_CHECK_S, limit / 4)
+    return Timer(every; interval = every) do _
+        (@atomic run.stalled) && return
+        time() - (@atomic run.last_finish) > limit || return
+        stall!(run, limit)
+    end
+end
+
+# Everything the run started comes down: nothing more is handed out, the tasks
+# waiting on an item are interrupted (they record it as timed out, with why), the
+# workers are killed, and the monitor stops printing.
+function stall!(run::Run, limit::Real)
+    @atomic run.stalled = true
+    say(run, "no test item has finished in ", fmt_seconds(limit),
+        ", longer than one attempt at any of them may take; stopping the run as hung")
+    cancel!(run.queues)
+    interrupt_slots!(@lock run.lock copy(run.tasks))
+    kill_workers!(run, "stopped as hung")
+    m = run.monitor
+    m === nothing || (@atomic m.stop = true)
     return nothing
 end
 
@@ -1085,7 +1173,7 @@ function report_unfinished_run()
         finish_run_state!(run.runstate; cancelled = true)
         if trylock(run.printer)
             try
-                print_conclusion(run, true)
+                print_conclusion(run, :interrupted)
             finally
                 unlock(run.printer)
             end
@@ -1100,18 +1188,19 @@ end
 
 Kill every worker this run has, now: the orderly teardown takes most of a minute
 across a pool, a long time to hold a terminal someone has asked for back. Nothing
-is reported for what they were running.
+is reported for what they were running. `shutdown!` waits for them to be gone.
 """
-function kill_workers!(run::Run)
+function kill_workers!(run::Run, why::AbstractString = "interrupted")
     live = 0
     for slot in run.slots
         w = slot.worker
         w === nothing && continue
+        @lock run.lock push!(run.killed, w)
         slot.worker = nothing
         live += 1
         YATFWorkers.kill!(w)
     end
-    live == 0 || say(run, "interrupted; killed ", plural(live, "worker"))
+    live == 0 || say(run, why, "; killed ", plural(live, "worker"))
     return nothing
 end
 
@@ -1119,6 +1208,10 @@ function shutdown!(run::Run)
     for slot in run.slots
         stop_worker!(run, slot)
     end
+    # A killed worker is the run's until its process is reaped and the tasks relaying
+    # it have ended, and `kill!` returns before either. The run ends with nothing it
+    # started still going, and with how each worker ended in its run state.
+    foreach(wait, @lock run.lock copy(run.killed))
     return nothing
 end
 
@@ -1254,7 +1347,10 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
         printline(run, item_line(run, nothing, i, attempt, outcome(r)))
         with_test_end(r, spec, slot.profile.test_end)
     catch e
-        e isa InterruptException && rethrow()
+        if e isa InterruptException
+            (@atomic run.stalled) && record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
+            rethrow()
+        end
         record_error!(
             run, i, slot, attempt, ERRORED,
             string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)))
@@ -1457,6 +1553,7 @@ function record!(
         peak_rss_mb = stats.maxrss / 2^20, pid = st.pid[i]
     )
     append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0; item = i, attempt)
+    @atomic run.last_finish = time()
     report_item!(run, i, state, count_done!(run, i), note)
     return nothing
 end
@@ -1530,6 +1627,7 @@ end
 
 function run_in_process(run::Run, target)
     p = run.plan
+    @lock run.lock push!(run.tasks, current_task())
     isempty(p.profiles[1].init.args) ||
         @warn "YATF: the profile's `init` expression is evaluated in this process (workers=0)"
     Core.eval(Main, Expr(:block, p.profiles[1].init.args...))

@@ -28,6 +28,21 @@ tags_of(it::Items, i) = view(it.tags, it.tag_span[i])
 setups_of(it::Items, i) = view(it.setups, it.setup_span[i])
 
 """
+    Why
+
+The class [`order_pool!`](@ref) sorts a unit into, in the order the classes are
+handed out: what the dry run says about why an item runs where it does.
+"""
+@enum Why::UInt8 begin
+    PINNED_FIRST    # `[order] first`
+    SANDBOXED       # needs a process of its own
+    RECENT          # failed in a recorded run, or its file changed since the newest one
+    LONG            # long enough to decide how long the run takes
+    IN_FILE_ORDER   # everything else
+    PINNED_LAST     # `[order] last`
+end
+
+"""
     Units
 
 The schedulable thing: a chain of items, or a single item. Chain membership is
@@ -40,6 +55,9 @@ struct Units
     exclusive::Vector{Bool}
     chain::Vector{Symbol}
     est_s::Vector{Float64}
+    why::Vector{Why}            # where `order_pool!` put it, and so why
+    failed_ago::Vector{Int32}   # runs since a member last did not pass, -1 for none recorded
+    changed::Vector{Bool}       # a member's file was written since the newest recorded run
 end
 
 Base.length(u::Units) = length(u.span)
@@ -92,6 +110,7 @@ struct Plan
     root::String
     startup::Startup
     selection::String   # how the items were chosen, as the run says it; empty for all of them
+    suite_names::Vector{String}   # every item's name in the suite, chosen or not, sorted
 end
 
 nslots(p::Plan) = length(p.slot_pool)
@@ -120,14 +139,15 @@ end
 History() = History(Dict{String, Float64}(), Dict{String, Int}(), 0.0)
 
 """
-    plan(raw, cfg; history, root, strict_order) -> Plan
+    plan(raw, cfg; history, root, strict_order, selection, suite_names) -> Plan
 
 Validate, group into units, put each profile's units in the order they are handed
 out, and cut each pool's body into one stretch per slot.
 """
 function plan(
         raw::Vector{RawItem}, cfg::RunConfig; history::History = History(),
-        root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = ""
+        root::AbstractString = "", strict_order::Bool = true, selection::AbstractString = "",
+        suite_names::Vector{String} = String[it.name for it in raw]
     )
     isempty(raw) && throw(NoTestsError("no test items to run"))
     validate_profiles(raw, cfg)
@@ -143,7 +163,7 @@ function plan(
     for (k, pool) in enumerate(pools)
         order_pool!(pool, units, slots[k], cfg, history, changed)
     end
-    return materialize(units, pools, slots, profiles, cfg, root, selection)
+    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names))
 end
 
 function validate_profiles(raw, cfg)
@@ -215,12 +235,16 @@ mutable struct UnitDraft
     const chain::Symbol
     const est_s::Float64
     key::Tuple{Int, Int, Float64, String, Int32}   # its place in its pool; see `order_pool!`
+    why::Why
+    failed_ago::Int32
+    changed::Bool
 end
 
 function build_units(raw::Vector{RawItem}, profile_idx, history::History)
     draft(its, exclusive, chain) = UnitDraft(
         its, profile_idx[its[1].profile], exclusive, chain,
-        sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0))
+        sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
+        IN_FILE_ORDER, Int32(-1), false
     )
     chains = Dict{Symbol, Vector{RawItem}}()
     units = UnitDraft[]
@@ -286,8 +310,12 @@ function changed_files(units::Vector{UnitDraft}, since::Float64)
     return Set(f for f in unique(it.file for d in units for it in d.items) if mtime(f) > since)
 end
 
-const HEAD_CLASSES = 0:3
-const TAIL_CLASS = 5
+const HEAD_CLASSES = Int(PINNED_FIRST):Int(LONG)
+const TAIL_CLASS = Int(PINNED_LAST)
+
+# Under this many seconds a unit is never long, whatever its share: started last, it
+# ends the run a moment later, and a suite of quick items would otherwise be all head.
+const LONG_FLOOR_S = 3.0
 
 """
     order_pool!(pool, units, nslots, cfg, history, changed)
@@ -303,12 +331,13 @@ it:
    newest run and a changed file come first, then older failures, the more recent
    first; file order within each;
 3. units long enough to decide how long the run takes — more than a quarter of
-   one slot's share of the pool's work — longest first;
+   one slot's share of the pool's work, and at least `LONG_FLOOR_S` — longest first;
 4. everything else, in file order, where neighbours share compiled code;
 5. `[order] last`, in the order listed.
 
 Classes 0–3 are the pool's head, 4 its body and 5 its tail. A chain goes where
-its most urgent member would.
+its most urgent member would. The class is recorded as a [`Why`](@ref), whose
+values are these numbers.
 """
 function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, cfg, history::History, changed)
     pin = Dict{String, Int}()
@@ -323,14 +352,26 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, c
         d = units[u]
         p = minimum(it -> get(pin, it.name, 0), d.items)
         at = (d.items[1].file, d.items[1].line)
-        urgency = minimum(it -> it.file in changed ? 0 : get(history.failed, it.name, typemax(Int)), d.items)
-        d.key = p < 0 ? (0, p, 0.0, at...) :
-            p > 0 ? (TAIL_CLASS, p, 0.0, at...) :
-            d.exclusive ? (1, 0, 0.0, at...) :
-            urgency < typemax(Int) ? (2, urgency, 0.0, at...) :
-            d.est_s > share / 4 ? (3, 0, -d.est_s, at...) : (4, 0, 0.0, at...)
+        ago = minimum(it -> get(history.failed, it.name, typemax(Int)), d.items)
+        d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
+        d.changed = any(it -> it.file in changed, d.items)
+        urgency = d.changed ? 0 : ago
+        d.why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : d.exclusive ? SANDBOXED :
+            urgency < typemax(Int) ? RECENT :
+            d.est_s >= LONG_FLOOR_S && d.est_s > share / 4 ? LONG : IN_FILE_ORDER
+        d.key = (
+            Int(d.why), d.why === RECENT ? urgency : p, d.why === LONG ? -d.est_s : 0.0, at...,
+        )
     end
     return sort!(pool; by = u -> units[u].key)
+end
+
+# What a unit without an estimate counts as: the median of the estimates there are,
+# or a second when there are none, so that units with nothing known still count
+# the same as one another.
+function typical_estimate(est::AbstractVector{Float64})
+    known = sort!(filter(>(0), est))
+    return isempty(known) ? 1.0 : known[(end + 1) ÷ 2]
 end
 
 """
@@ -343,8 +384,7 @@ estimate counts as a typical one.
 """
 function stretches(body::UnitRange{UnitIdx}, est::Vector{Float64}, file::Vector{Int32}, n::Int)
     m = length(body)
-    known = sort!(filter(>(0), est[body]))
-    guess = isempty(known) ? 1.0 : known[(end + 1) ÷ 2]
+    guess = typical_estimate(est[body])
     cum = cumsum([e > 0 ? e : guess for e in est[body]])
     at = [j for j in 1:(m - 1) if file[body[j]] != file[body[j + 1]]]
     isempty(at) && (at = collect(1:(m - 1)))
@@ -355,7 +395,8 @@ end
 
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
-        profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString
+        profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString,
+        suite_names::Vector{String}
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -368,6 +409,7 @@ function materialize(
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
     uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
+    uwhy = Why[]; uago = Int32[]; uchanged = Bool[]
     all_setups = Symbol[]
     ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
     for (k, pool) in enumerate(pools)
@@ -392,6 +434,7 @@ function materialize(
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
             push!(uchain, d.chain); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
+            push!(uwhy, d.why); push!(uago, d.failed_ago); push!(uchanged, d.changed)
         end
         nhead = count(u -> units[u].key[1] in HEAD_CLASSES, pool)
         ntail = count(u -> units[u].key[1] == TAIL_CLASS, pool)
@@ -411,10 +454,10 @@ function materialize(
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uchain, uest), files, relfiles,
+        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, uchanged), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
         profiles, ps, slot_pool, slot_units, pending, sort!(unique!(all_setups)), cfg,
-        String(root), Startup(), String(selection)
+        String(root), Startup(), String(selection), suite_names
     )
 end
 
