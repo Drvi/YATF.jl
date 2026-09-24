@@ -30,11 +30,14 @@ jobs:
         include:
           - os: ubuntu-latest
             arch: x64
+            jobs: 3
           - os: windows-latest
             arch: x64
+            jobs: 3
           # The hosted macOS runners are Apple silicon.
           - os: macos-latest
             arch: aarch64
+            jobs: 2
     steps:
       - uses: actions/checkout@v5
       - uses: julia-actions/setup-julia@v2
@@ -52,10 +55,12 @@ jobs:
           # `yes`, which forces them on everywhere regardless of `@inbounds`.
           check_bounds: auto
         env:
-          # The runners have 3-4 vCPUs and each test file starts worker processes
-          # of its own; the suite's own default of 4 files in flight oversubscribes
-          # them, which shows up as timeout assertions failing.
-          YATF_TEST_JOBS: 2
+          # Test files in flight at once. Each starts worker processes of its own,
+          # and a runner short of CPU for them fails timeout assertions, as four at
+          # once did. With two, the 4-thread Linux and Windows runners were about
+          # half busy and the 3-thread macOS ones 70-95%; the summary's `cpu:` line
+          # says how busy a run kept its runner.
+          YATF_TEST_JOBS: ${{ matrix.jobs }}
           # Every test-file child is started with the thread count of the process
-          # that starts it, so this is what each of the two in flight gets.
+          # that starts it, so this is what each file in flight gets.
           JULIA_NUM_THREADS: 2

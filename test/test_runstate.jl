@@ -199,6 +199,60 @@ end
             @test length(runstate_files(p.root)) == 20
         end
     end
+
+    @testset "a run state recorded on another machine is never pruned" begin
+        dir = mktempdir()
+        withenv("YATF_RUNSTATE_DIR" => dir) do
+            p = a_plan()
+            for i in 1:25
+                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.yatf")), p))
+            end
+            # A CI artifact downloaded among them, older than any: the same file, but
+            # recorded on another machine. Rewritten byte for byte, so it stays valid.
+            here = gethostname()
+            elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
+            artifact = joinpath(dir, "999999-1.yatf")
+            write(artifact, replace(read(joinpath(dir, "1000001-1.yatf"), String), here => elsewhere))
+            @test read_run_state(artifact).meta["host"] == elsewhere
+            before = read(artifact)
+            prune_runstates(p.root, 20)
+            @test isfile(artifact) && read(artifact) == before
+            @test length(runstate_files(p.root)) == 21   # this machine's twenty, and the artifact
+        end
+    end
+
+    @testset "a replay changes and deletes no run state, the one it runs among them" begin
+        with_runstate_dir() do dir
+            pkg = make_pkg("ReplayKeeps", "test/r_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
+            run_states(pkg; workers=0, logs=:issues, monitor=false)
+            recorded = only(runstate_files(pkg))
+            # The oldest of as many as are kept: the run a replay adds would push it out.
+            stamp = parse(Int, first(split(basename(recorded), '-')))
+            for k in 1:(YATF.KEEP_RUNS - 1)
+                cp(recorded, joinpath(dir, string(stamp + k, "-1.yatf")))
+            end
+            before = Dict(f => read(f) for f in runstate_files(pkg))
+            capture_run(() -> run_states(pkg; workers=0, logs=:issues, monitor=false, replay=recorded))
+            @test all(f -> isfile(f) && read(f) == before[f], keys(before))
+            @test length(runstate_files(pkg)) == YATF.KEEP_RUNS + 1
+        end
+    end
+
+    @testset "a new run state never takes an existing file's name" begin
+        dir = mktempdir()
+        withenv("YATF_RUNSTATE_DIR" => dir) do
+            # Whichever second the name is made in, a file already has it.
+            now_ = round(Int, time())
+            taken = [joinpath(dir, string(now_ + k, "-", getpid(), ".yatf")) for k in 0:3]
+            foreach(f -> write(f, "someone else's"), taken)
+            path = new_runstate_path(dir)
+            @test !ispath(path) && endswith(path, ".yatf")
+            # ...and it sorts after the file whose name it would have had.
+            had = joinpath(dir, first(split(basename(path), '_')) * ".yatf")
+            @test had in taken && sort([path, had]) == [had, path]
+            @test all(f -> read(f, String) == "someone else's", taken)
+        end
+    end
     @testset "the commit is read straight out of .git" begin
         sha = "0123456789abcdef0123456789abcdef01234567"
         dir = mktempdir()

@@ -400,9 +400,11 @@ run again somewhere else:
   from;
 - the test environment's `Project.toml` and `Manifest.toml`.
 
-The path is printed at the end of every run. The 20 most recent runs of a project
-are kept in a scratch space; set `YATF_RUNSTATE_DIR` to put them elsewhere. On CI,
-keep them as an artifact:
+The path is printed at the end of every run. Run states live in a scratch space,
+or in the directory `YATF_RUNSTATE_DIR` names, and the 20 most recent that this
+machine recorded are kept. One recorded elsewhere, such as a run state downloaded
+from CI, is never changed or deleted, wherever it is, and a replay deletes
+nothing. On CI, keep them as an artifact:
 
 ```yaml
 - uses: julia-actions/julia-runtest@v1

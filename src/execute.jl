@@ -269,7 +269,8 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                     shutdown!(run)
                     run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
                     finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
-                    prune_runstates(p.root)
+                    # A replay deletes no run state, the one it runs least of all.
+                    isempty(p.cfg.replayed_from) && prune_runstates(p.root)
                     # The exception on its way out stops the report from being
                     # made, so what the run got through is said here or nowhere.
                     interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)

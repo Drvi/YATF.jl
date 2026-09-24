@@ -721,11 +721,20 @@ function runstate_dir(root::AbstractString)
     return joinpath(first(DEPOT_PATH), "scratchspaces", "yatf", key, "runs")
 end
 
-new_runstate_path(root::AbstractString) =
-    joinpath(
-    runstate_dir(root),
-    string(round(Int, time()), "-", getpid(), ".yatf")
-)
+# Named for when the run started, so that names sort oldest first. A file already
+# there, a run state downloaded from CI say, is never written over: the new name
+# takes a suffix instead, one that sorts after it.
+function new_runstate_path(root::AbstractString)
+    dir = runstate_dir(root)
+    stem = string(round(Int, time()), "-", getpid())
+    path = joinpath(dir, stem * ".yatf")
+    n = 1
+    while ispath(path)
+        n += 1
+        path = joinpath(dir, string(stem, "_", n, ".yatf"))
+    end
+    return path
+end
 
 function runstate_files(root::AbstractString)
     dir = runstate_dir(root)
@@ -736,9 +745,16 @@ end
 
 const KEEP_RUNS = 20
 
+# Only the run states this machine recorded are pruned, and the newest `keep` of
+# them stay. One recorded elsewhere, a CI artifact downloaded into the directory
+# say, and one that cannot be read are never deleted: nothing shows they are ours.
 function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
-    files = runstate_files(root)
-    for f in files[1:max(0, length(files) - keep)]
+    here = gethostname()
+    ours = filter(runstate_files(root)) do f
+        rs = read_run_state(f)
+        rs !== nothing && get(rs.meta, "host", "") == here
+    end
+    for f in ours[1:max(0, length(ours) - keep)]
         try
             rm(f; force = true)
         catch

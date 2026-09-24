@@ -207,7 +207,8 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord)
         profiles[name] = Profile(prof.name, prof.julia_args, prof.threads, prof.env, prof.init, prof.test_end, path)
     end
     fields = NamedTuple{fieldnames(RunConfig)}(ntuple(i -> getfield(cfg, i), fieldcount(RunConfig)))
-    return RunConfig(; merge(fields, (; profiles, replayed_manifest = get(rs.meta, "environment_manifest", "")))...)
+    return RunConfig(; merge(fields, (; profiles, replayed_manifest = get(rs.meta, "environment_manifest", ""),
+                                        replayed_from = rs.path))...)
 end
 
 """

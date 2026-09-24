@@ -56,6 +56,8 @@ Base.@kwdef struct RunConfig
     # The manifest a replayed run state was recorded against, or empty: the run
     # says how its own environment differs.
     replayed_manifest::String = ""
+    # The run state a replay runs, or empty for a run that is not one.
+    replayed_from::String = ""
 end
 
 const RUN_KEYS = (
