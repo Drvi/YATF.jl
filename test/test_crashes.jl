@@ -251,12 +251,22 @@ coordinator of its own started with `julia_args`, and send it SIGINT `delay` sec
 after every item is running. With `repl`, the coordinator raises the interrupt as a
 REPL does; without, it exits on it, as a script and `Pkg.test` do. Returns whether
 the items got running, how long the coordinator took to end, what it printed and
-said on stderr, the pids of the workers it started, and how many times Ctrl-C was
-pressed.
+said on stderr, and the pids of the workers it started.
 """
 function interrupted_run(; items = 4, julia_args = String[], monitor = false, delay, repl = true)
-    ready = joinpath(mktempdir(), "ready")
+    tmp = mktempdir()
+    ready = joinpath(tmp, "ready")
+    ignored = joinpath(tmp, "sigint_ignored")
     script = """
+    # Julia 1.12 on macOS can come up ignoring SIGINT: its signal thread sets it to
+    # SIG_IGN, racing the handler the main thread installs, and when it lands second
+    # the runtime drops every Ctrl-C before any Julia code sees it (fixed in 1.13 by
+    # JuliaLang/julia#62471). Looked at before YATF is loaded, so nothing of YATF's
+    # can be what set it.
+    let act = zeros(UInt8, 256)   # a `struct sigaction`, whose first field is the handler
+        ccall(:sigaction, Cint, (Cint, Ptr{Cvoid}, Ptr{UInt8}), 2, C_NULL, act) == 0 || error("sigaction")
+        reinterpret(UInt, act[1:sizeof(UInt)])[1] == 1 && (touch($(repr(ignored))); exit())
+    end
     # A script exits on SIGINT unless told otherwise; a REPL raises it.
     $(repl ? "Base.exit_on_sigint(false)" : "")
     using YATF
@@ -287,44 +297,46 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     path, io = mktemp()
     write(io, script)
     close(io)
-    err = Base.BufferStream()
-    log = Base.BufferStream()
-    proc = run(pipeline(
-        setenv(`$(Base.julia_cmd()) $julia_args --project=$(REPO_ROOT) --startup-file=no $path`,
-               "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
-        stdout = log, stderr = err,
-    ); wait = false)
     # The items say when they are running, so the interrupt lands with all of them
     # mid-item: not during an environment build that can take minutes, and not
     # while a worker is still starting and has yet to print the pid looked for below.
     running() = all(i -> isfile(ready * string(i)), 1:items)
     deadline = time() + 300
-    while time() < deadline && process_running(proc) && !running()
-        sleep(0.1)
+    # A coordinator that came up ignoring SIGINT is started again: the runtime, not
+    # the run, is what would lose its Ctrl-C.
+    local proc, err, log
+    for attempt in 1:5
+        err = Base.BufferStream()
+        log = Base.BufferStream()
+        proc = run(pipeline(
+            setenv(`$(Base.julia_cmd()) $julia_args --project=$(REPO_ROOT) --startup-file=no $path`,
+                   "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
+            stdout = log, stderr = err,
+        ); wait = false)
+        while time() < deadline && process_running(proc) && !running()
+            sleep(0.1)
+        end
+        isfile(ignored) || break
+        wait(proc)
+        rm(ignored)
+        attempt == 5 && error("Julia $VERSION came up ignoring SIGINT five times running: JuliaLang/julia#62471")
     end
     got_running = running()
     sleep(delay)
     t0 = time()
     kill(proc, Base.SIGINT)
-    # A script's Ctrl-C is Julia's to act on, by ending the process, and Julia 1.12
-    # can pass one by while the run's own tasks all wait. Pressed again, as a person
-    # would. A REPL's Ctrl-C is the run's to handle, and there one that is lost is
-    # the failure under test.
-    presses = 1
-    while !repl && presses < 3 && timedwait(() -> process_exited(proc), 10) !== :ok
-        kill(proc, Base.SIGINT)
-        presses += 1
-    end
     # Bounded: an interrupt that is lost would hold the test for the items' ten
     # minutes, and the time it took is what is checked. SIGQUIT first, on which Julia
     # prints every task's backtrace to stderr, which is said below. The workers go
-    # too: each is in a process group of its own, holds the coordinator's stderr, and
-    # would keep the output from ending until its item did.
+    # too, by process group: each is in a group of its own, holds the coordinator's
+    # stderr, and would keep the output from ending until its item did. They are
+    # found as the coordinator's children, so while it is still there.
     hung = timedwait(() -> process_exited(proc), 120) !== :ok
     if hung
+        workers = [parse(Cint, l) for l in readlines(ignorestatus(`pgrep -P $(getpid(proc))`))]
         kill(proc, 3)
         timedwait(() -> process_exited(proc), 5)
-        run(ignorestatus(`pkill -9 -P $(getpid(proc))`))
+        foreach(w -> ccall(:kill, Cint, (Cint, Cint), -w, 9), workers)
         process_running(proc) && kill(proc, Base.SIGKILL)
     end
     wait(proc)
@@ -333,10 +345,10 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     close(log)
     out = read(err, String)
     printed = read(log, String)
-    hung && @warn "the coordinator did not end after $presses Ctrl-C; its stderr:\n$out"
+    hung && @warn "the coordinator did not end on Ctrl-C; its stderr:\n$out"
     started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
     rm(path; force=true)
-    return (; got_running, elapsed, out, printed, started, presses)
+    return (; got_running, elapsed, out, printed, started)
 end
 
 # What the coordinator catches: an `InterruptException`, or from 1.14 the
