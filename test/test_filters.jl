@@ -2,7 +2,7 @@
 # and none of them may quietly change what the items that do run mean — a chain is
 # still a chain, and forced order still holds over whatever survived.
 
-using YATF: PASSED, prepare, nitems, NoTestsError
+using YATF.Private: PASSED, prepare, nitems, NoTestsError
 
 const SUITE = string(
     """

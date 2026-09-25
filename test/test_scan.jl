@@ -1,4 +1,4 @@
-using YATF: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
+using YATF.Private: RawItem, ScanError, ScanFailure, Filter, scan, discover, setup_modules,
             is_test_file, NO_CHAIN, DEFAULT_PROFILE,
             USE_RUN_DEFAULT, select_by_line
 
@@ -184,8 +184,8 @@ end
         write(script, """
         push!(LOAD_PATH, $(repr(dirname(@__DIR__))))
         using YATF
-        files = YATF.discover($(repr(dir)))
-        counts = [length(YATF.scan(files, YATF.Filter(), Dict{Symbol,String}(); ntasks=16)) for _ in 1:10]
+        files = YATF.Private.discover($(repr(dir)))
+        counts = [length(YATF.Private.scan(files, YATF.Private.Filter(), Dict{Symbol,String}(); ntasks=16)) for _ in 1:10]
         println(join(unique(counts), ","))
         """)
         out = read(ignorestatus(`$(Base.julia_cmd()) --startup-file=no -t4 $script`), String)

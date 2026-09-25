@@ -239,13 +239,84 @@ function _run_item(spec::ItemSpec, enter=nothing)
     finally
         finish_testset!(ts)
     end
+    spec.full_stacktraces || trim_recorded_errors!(ts)
     return ItemResult(spec.index, state_of(ts), transferrable(ts), stats)
+end
+
+"""
+    trim_recorded_errors!(ts)
+
+Cut the backtrace of every error the item's testsets recorded at the item's entry
+frame, `__repl_entry_item`. `Test` cuts each at the last frame of a function named
+`__repl_entry…`, which in a worker is that one. In a run without workers started at
+the REPL, the REPL's own entry frame lies beneath it and is the one cut at, and what
+is between the two is the run's machinery. `Test` keeps the backtrace as text, so it
+is cut as text.
+"""
+function trim_recorded_errors!(ts::Test.DefaultTestSet)
+    for (i, res) in enumerate(ts.results)
+        if res isa Test.AbstractTestSet
+            trim_recorded_errors!(res)
+        elseif res isa Test.Error
+            bt = cut_at_item_frame(res.backtrace)
+            bt === res.backtrace || (ts.results[i] = with_backtrace(res, bt))
+        end
+    end
+    return ts
+end
+
+trim_recorded_errors!(ts) = ts
+
+const ITEM_FRAME = r"^\s*\[\d+\] __repl_entry_item\("
+# A frame's own line, its location's, or a run of frames folded into one.
+const FRAME_LINE = r"^\s*(\[\d+\] |@ |⋮ )"
+const ANSI_CODE = r"\e\[[0-9;]*m"
+
+# From the item's entry frame to the end of the frames listed with it. What follows
+# a listing stays: the error of a task that was waited on, printed after the frames
+# of the wait, and the exception the next `caused by:` names.
+function cut_at_item_frame(bt::String)
+    occursin("__repl_entry_item", bt) || return bt
+    lines = split(bt, '\n')
+    plain = [replace(l, ANSI_CODE => "") for l in lines]
+    keep = trues(length(lines))
+    i = 1
+    while i <= length(lines)
+        if occursin(ITEM_FRAME, plain[i])
+            j = i + 1
+            while j <= length(lines) && occursin(FRAME_LINE, plain[j])
+                j += 1
+            end
+            keep[i:(j - 1)] .= false
+            i = j
+        else
+            i += 1
+        end
+    end
+    all(keep) && return bt
+    return join(lines[keep], '\n')
+end
+
+# `e` with the backtrace text `bt`. `Test.Error`'s constructor takes an exception
+# stack and formats it, so the fields are put in place directly.
+function with_backtrace(e::Test.Error, bt::String)
+    fields = Any[getfield(e, f) for f in fieldnames(Test.Error)]
+    fields[Base.fieldindex(Test.Error, :backtrace)] = bt
+    return ccall(:jl_new_structv, Any, (Any, Ptr{Any}, UInt32), Test.Error, fields, length(fields))::Test.Error
 end
 
 # Evaluate one block of a test item's user code in a fresh module, recording into
 # `ts` and capturing its output into the item's log. Never throws except on an
 # interrupt: an exception that escapes the block is an `Error` record, which is
 # what makes a crashing test item a result rather than a failure of the run.
+# An item's code is evaluated from a function named as Julia names its REPL's own:
+# `Base.scrub_repl_backtrace`, which `Test` applies to the backtrace of every error it
+# records, cuts a stack at the last frame of such a function. An error a testset in
+# the item records then shows the item's frames, not the worker's beneath them.
+# `full_stacktraces` evaluates it from `eval_item`, which keeps them.
+@noinline __repl_entry_item(item::Expr) = Core.eval(Main, item)
+@noinline eval_item(item::Expr) = Core.eval(Main, item)
+
 function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modname::AbstractString,
                      enter=nothing)
     stats = Ref(PerfStats())
@@ -256,8 +327,8 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
     isempty(spec.project_name) || push!(prelude, :(using $(Symbol(spec.project_name))))
     modsym = gensym(modname)
     evaluate = if enter === nothing
-        body = softscope_all!(Expr(:block, prelude..., code.args...))
-        () -> Core.eval(Main, Expr(:module, true, modsym, body))
+        item = Expr(:module, true, modsym, softscope_all!(Expr(:block, prelude..., code.args...)))
+        spec.full_stacktraces ? () -> eval_item(item) : () -> __repl_entry_item(item)
     else
         () -> enter_item(enter, prelude, code, modname, spec)
     end

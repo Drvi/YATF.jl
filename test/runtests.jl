@@ -55,6 +55,7 @@ const TEST_FILES = [
     "test_precompile.jl",
     "test_debug.jl",
     "test_interactive.jl",
+    "test_chores.jl",
 ]
 
 # Four is where this stops paying: the longest file takes about as long as a

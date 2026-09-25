@@ -195,6 +195,20 @@ function shown_names(names::Vector{String}, width::Integer; among::Vector{String
     return [s === nothing ? " " * q : s for (s, q) in zip(shortened, quoted)]
 end
 
+"""
+    item_names(p, width) -> (names, column)
+
+Every item's name as the run writes it in the name column, and the column's width:
+one too long for `width` is shortened as [`shown_names`](@ref) does, unless the run
+asked for `full_names`.
+"""
+function item_names(p::Plan, width::Integer)
+    p.cfg.full_names && return [repr(n) for n in p.items.name], width
+    names = shown_names(p.items.name, width; among = p.suite_names)
+    # With any name shortened, every name has a column in front of its opening quote.
+    return names, width + any(n -> !startswith(n, '"'), names)
+end
+
 # `r"^…"` for the first `k` characters of `name`, written as Julia source for a
 # regular expression that matches those characters literally.
 function regex_prefix(name::AbstractString, k::Integer)
@@ -222,9 +236,8 @@ Every test item, a row each, in the order the run is expected to start them (see
 [`run_order`](@ref)): the worker expected to run it, where it is, its tags, why it
 goes where it does when that is not file order, and what it was declared with.
 Columns are separated as the fields of the run's lines are, and each is as wide as
-the widest thing in it; a column nothing fills is left out. The name column is as
-wide as the run's, and a name far longer than the rest is shortened to fit it, as
-[`shown_names`](@ref) does.
+the widest thing in it; a column nothing fills is left out. The names are written
+as the run's lines write them (see [`item_names`](@ref)).
 """
 function print_plan_table(io::IO, p::Plan, order)
     it = p.items
@@ -232,8 +245,8 @@ function print_plan_table(io::IO, p::Plan, order)
     solo = single_process(p)
     rows = [i for (_, _, i) in order.items]
     workers = [string("w", s) for (_, s, _) in order.items]
-    width = name_width(it.name)
-    names = shown_names([it.name[i] for i in rows], width; among = p.suite_names)
+    shown, column = item_names(p, name_width(it.name))
+    names = [shown[i] for i in rows]
     locations = [string(p.relfiles[it.fileidx[i]], ":", it.line[i]) for i in rows]
     tags = [join(tags_of(it, i), ", ") for i in rows]
     # A chain's reason is its first item's: the unit is placed, not each member.
@@ -247,11 +260,9 @@ function print_plan_table(io::IO, p::Plan, order)
     any(!isempty, tags) && push!(columns, ("tags", tags))
     any(!isempty, whys) && push!(columns, ("why here", whys))
     any(!isempty, details) && push!(columns, ("details", details))
-    # A name wider than the column overruns it; the column is as wide as the rest,
-    # and the place in front of the quotes when a name is shortened.
-    prefixed = any(startswith('r'), names)
+    # A name wider than the column overruns it rather than widening it for all.
     widths = map(columns) do (title, cells)
-        title == "test item" ? max(length(title), width + prefixed) :
+        title == "test item" ? max(length(title), column) :
             max(length(title), maximum(textwidth, cells; init = 0))
     end
     println(io)
@@ -347,14 +358,8 @@ state_mark(state::ItemState) =
     state === PASSED ? MARK_PASSED : state === SKIPPED || state === CANCELLED ? MARK_SET_ASIDE :
     is_non_pass(state) ? MARK_FAILED : MARK_RUNNING
 
-# A string as `repr` writes it, returning the width written; `repr` builds a copy,
-# and almost no item name needs escaping.
-function print_quoted(io::IO, s::AbstractString)
-    needs_escaping(s) || (print(io, '"', s, '"'); return textwidth(s) + 2)
-    quoted = repr(s)
-    print(io, quoted)
-    return textwidth(quoted)
-end
+# The width of a name as `repr` writes it, without building the copy when there is
+# nothing to escape, which is almost every name.
 needs_escaping(s::AbstractString) = any(c -> c == '"' || c == '\\' || c == '$' || !isprint(c), s)
 quoted_width(name::AbstractString) = needs_escaping(name) ? textwidth(repr(name)) : textwidth(name) + 2
 
@@ -441,21 +446,23 @@ print_worker_line(run, slot_id, state::AbstractString, text::AbstractString) = p
 end)
 
 """
-    item_line(slot_id, i, total, name, width, attempt, attempts, how) -> String
+    item_line(slot_id, i, total, shown, width, attempt, attempts, how) -> String
 
 An item's RUN line when `how` is where it is, and its DONE line when `how` is how
-it went: `(; state, elapsed_ns, compile_ns, maxrss)`. A retry is the same item
-again, so it gets the same line with a field of its own; `total` is 0 when there
-is no count to give.
+it went: `(; state, elapsed_ns, compile_ns, maxrss)`. `shown` is its name as the
+line writes it, quoted or shortened (see [`item_names`](@ref)), in a column `width`
+wide. A retry is the same item again, so it gets the same line with a field of its
+own; `total` is 0 when there is no count to give.
 """
-item_line(slot_id, i, total, name, width, attempt, attempts, how) = styled() do io
+item_line(slot_id, i, total, shown, width, attempt, attempts, how) = styled() do io
     done = !(how isa AbstractString)
     print_line_head(io, done ? state_mark(how.state) : MARK_RUNNING, slot_id, clock_now())
     print_word(io, done ? "DONE" : "RUN")
     total > 0 && print(io, lpad(i, ndigits(total)), "/", total, FIELD)
-    # A name longer than the column pushes the rest out rather than being cut:
-    # the name is what identifies the item.
-    pad_to(io, width, print_quoted(io, name))
+    # A name longer than the column pushes the rest out rather than being cut: the
+    # name is what identifies the item, and a shortened one still does.
+    print(io, shown)
+    pad_to(io, width, textwidth(shown))
     attempt > 1 && print(io, FIELD, "retry ", attempt - 1, " of ", max(attempts - 1, 1))
     print(io, FIELD)
     if done
@@ -683,7 +690,7 @@ function report(run)
     # `Test` prints `time_end - time_start` in its own Time column, so the run's
     # times are put where it already looks rather than into a column of our own.
     # The root's clock starts when the run did, so its row is the run's wall time.
-    root = started_testset("YATF"; verbose = true, at = run.t0)
+    root = started_testset(p.cfg.testset_name; verbose = true, at = run.t0)
     byfile = Dict{Int32, Test.DefaultTestSet}()
     for fid in sort!(unique(p.items.fileidx))
         byfile[fid] = file_testset(run, fid)
@@ -700,6 +707,57 @@ function report(run)
     print_conclusion(run)
     Test.finish(root)
     return root
+end
+
+"""
+    RunTestSet
+
+What [`runtests`](@ref) returns: a testset that prints as one line. Everything else
+it hands to the `Test.DefaultTestSet` it holds, `ts.testset`, whose fields also
+read through it, so it records, finishes, counts and summarizes as that testset
+does. Recorded into a parent or finished inside one, it is the `DefaultTestSet`
+that goes into the parent, so no testset tree ever holds anything else.
+"""
+struct RunTestSet <: Test.AbstractTestSet
+    testset::Test.DefaultTestSet
+end
+
+# `@testset RunTestSet "name" begin … end`, which names the type to make.
+RunTestSet(description::AbstractString; kwargs...) = RunTestSet(Test.DefaultTestSet(description; kwargs...))
+
+Base.getproperty(ts::RunTestSet, f::Symbol) =
+    f === :testset ? getfield(ts, :testset) : getproperty(getfield(ts, :testset), f)
+Base.propertynames(ts::RunTestSet, private::Bool = false) =
+    (:testset, propertynames(getfield(ts, :testset), private)...)
+
+Test.record(ts::RunTestSet, res; kwargs...) = Test.record(ts.testset, res; kwargs...)
+Test.record(parent::Test.DefaultTestSet, ts::RunTestSet) = Test.record(parent, ts.testset)
+function Test.finish(ts::RunTestSet; kwargs...)
+    Test.finish(ts.testset; kwargs...)
+    return ts
+end
+Test.results(ts::RunTestSet) = Test.results(ts.testset)
+Test.print_verbose(ts::RunTestSet) = Test.print_verbose(ts.testset)
+Test.get_test_counts(ts::RunTestSet) = Test.get_test_counts(ts.testset)
+Test.get_alignment(ts::RunTestSet, depth::Int) = Test.get_alignment(ts.testset, depth)
+Test.format_duration(ts::RunTestSet) = Test.format_duration(ts.testset)
+Test.filter_errors(ts::RunTestSet) = Test.filter_errors(ts.testset)
+Test.get_rng(ts::RunTestSet) = Test.get_rng(ts.testset)
+Test.set_rng!(ts::RunTestSet, rng::Random.AbstractRNG) = Test.set_rng!(ts.testset, rng)
+Test.print_test_results(ts::RunTestSet, depth_pad = 0) = Test.print_test_results(ts.testset, depth_pad)
+@static if isdefined(Test, :anynonpass)
+    Test.anynonpass(ts::RunTestSet) = Test.anynonpass(ts.testset)
+end
+
+# One line: the testset's name and what it counted, inside other output too.
+function Base.show(io::IO, ts::RunTestSet)
+    tc = Test.get_test_counts(ts.testset)
+    counts = (tc.passes + tc.cumulative_passes => "passed", tc.fails + tc.cumulative_fails => "failed",
+              tc.errors + tc.cumulative_errors => "errored", tc.broken + tc.cumulative_broken => "broken")
+    shown = [string(n, " ", what) for (n, what) in counts if n > 0]
+    print(io, repr(ts.testset.description), " testset: ", isempty(shown) ? "no tests" : join(shown, ", "))
+    ts.testset.time_end > 0 && print(io, " · ", Test.format_duration(ts.testset))
+    return nothing
 end
 
 # An item that never ran is not an item that passed. A run cut short (an `init`

@@ -1,7 +1,7 @@
 # Shared machinery for the tests that run a whole suite: building a throwaway
 # package, running it, and reading back what happened and what was printed.
 
-using YATF: prepare, execute, report, nitems
+using YATF.Private: prepare, execute, report, nitems
 using YATFWorkers: YATFWorkers
 
 # Fixture packages are written to a tempdir rather than checked in when their

@@ -40,6 +40,13 @@ end
 
 Base.show(io::IO, e::ScanError) = print(io, relpath_or_path(e.file), ":", e.line, ": ", e.msg)
 
+"""
+    ScanFailure
+
+Thrown when test files cannot be read as a suite: a syntax error, a name declared
+twice, a Julia file that is not a test file. `errors` holds every problem found,
+each with its `file`, `line` and `msg`, so one run reports them all.
+"""
 struct ScanFailure <: Exception
     errors::Vector{ScanError}
 end
@@ -53,11 +60,24 @@ function Base.showerror(io::IO, e::ScanFailure)
     return
 end
 
+"""
+    NoTestsError
+
+Thrown when there is nothing to run: no test files, no item the selection matched,
+or no failures left to re-run. `msg` says which.
+"""
 struct NoTestsError <: Exception
     msg::String
 end
 Base.showerror(io::IO, e::NoTestsError) = print(io, "YATF: ", e.msg)
 
+"""
+    ConfigError
+
+Thrown when a run cannot be set up as asked: a keyword or `TestItems.toml` setting
+it does not accept, a profile or run state it cannot use, a test setup that does not
+precompile. `msg` says what and where.
+"""
 struct ConfigError <: Exception
     msg::String
 end

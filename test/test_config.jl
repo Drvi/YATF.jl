@@ -1,4 +1,4 @@
-using YATF: read_config, ConfigError, Profile, DEFAULT_PROFILE, auto_workers
+using YATF.Private: read_config, ConfigError, Profile, DEFAULT_PROFILE, auto_workers
 
 function with_toml(f, contents::AbstractString)
     dir = mktempdir()
@@ -13,6 +13,8 @@ end
         @test cfg.timeout_s == 30 * 60
         @test cfg.retries == 0
         @test cfg.memory_threshold == 0.9
+        @test !cfg.full_names   # a name too long for its column is shortened
+        @test cfg.testset_name == "YATF"
         @test haskey(cfg.profiles, DEFAULT_PROFILE)
         @test isempty(cfg.order_first) && isempty(cfg.order_last)
     end
@@ -24,6 +26,8 @@ end
         timeout = 120
         retries = 2
         logs = "eager"
+        full_names = true
+        testset_name = "unit"
 
         [order]
         first = ["a"]
@@ -41,6 +45,8 @@ end
             @test cfg.timeout_s == 120
             @test cfg.retries == 2
             @test cfg.logs === :eager
+            @test cfg.full_names
+            @test cfg.testset_name == "unit"
             @test cfg.order_first == ["a"] && cfg.order_last == ["z"]
             p = cfg.profiles[:bounds]
             @test p.julia_args == ["--check-bounds=yes"]
@@ -55,6 +61,15 @@ end
         with_toml("[run]\nworkers = 3\n") do dir
             @test read_config(dir; workers=7).workers == 7
             @test read_config(dir).workers == 3
+        end
+    end
+
+    @testset "a testset name is a non-empty string" begin
+        @test read_config(mktempdir(); testset_name = "integration").testset_name == "integration"
+        for bad in ("", 3)
+            err = try; read_config(mktempdir(); testset_name = bad); catch e; e; end
+            @test err isa ConfigError
+            @test occursin("`testset_name` must be a non-empty string", sprint(showerror, err))
         end
     end
 
@@ -113,11 +128,11 @@ end
     # One worker prints as it goes; several would interleave more than a reader can
     # follow, so only the items with something wrong say anything. `:batched` is
     # never chosen for you.
-    @test YATF.default_logs(1, true) === :eager
-    @test YATF.default_logs(0, true) === :eager
-    @test YATF.default_logs(2, true) === :issues
-    @test YATF.default_logs(8, true) === :issues
+    @test YATF.Private.default_logs(1, true) === :eager
+    @test YATF.Private.default_logs(0, true) === :eager
+    @test YATF.Private.default_logs(2, true) === :issues
+    @test YATF.Private.default_logs(8, true) === :issues
     # Nothing is watching a non-interactive run as it goes.
-    @test YATF.default_logs(1, false) === :issues
-    @test YATF.default_logs(8, false) === :issues
+    @test YATF.Private.default_logs(1, false) === :issues
+    @test YATF.Private.default_logs(8, false) === :issues
 end

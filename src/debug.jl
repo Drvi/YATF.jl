@@ -30,7 +30,7 @@ end
 # The extension's entry point. Debugger.jl is a weak dependency, loaded by a session
 # that wants to step through an item and by nothing else.
 function debugger_entry()
-    ext = Base.get_extension(@__MODULE__, :YATFDebuggerExt)
+    ext = Base.get_extension(Base.moduleroot(@__MODULE__), :YATFDebuggerExt)
     ext === nothing && throw(
         ConfigError(
             "YATF.debug steps through the item with Debugger.jl, which is not loaded: " *

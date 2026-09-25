@@ -3,7 +3,7 @@
 # chain, at a fixed point in the queue — and a suite normally uses more than one
 # of them at once.
 
-using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
+using YATF.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
 
 @testset "sandboxes, chains and order" begin
     @testset "a sandboxed item has its process to itself" begin
@@ -64,11 +64,10 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
     end
 
     @testset "a slot that has drained its sandboxes takes ordinary work" begin
-        # A profile's exclusive units are pooled apart from its ordinary ones, so a
-        # slot can be bound to a pool holding a single sandbox. Having run it, that
-        # slot has the same configuration as every other and must keep working;
-        # going home for good with the rest of the suite still queued is a worker
-        # the run paid for and did not use.
+        # A sandbox leads its profile's pool, in a process of its own that is torn
+        # down after it. The slot that ran it has to go on to the pool's ordinary
+        # work: going home with the rest of the suite still queued is a worker the
+        # run paid for and did not use.
         ordinary_names = ["ordinary $i" for i in 1:6]
         dir = make_pkg(
             "SandboxThenSteal",
@@ -96,17 +95,19 @@ using YATF: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         @test length(unique(ordinary)) == 2
     end
 
-    @testset "a stolen sandbox is still alone in its process" begin
-        # The reverse direction: a slot serving ordinary work drains first and
-        # steals from the tail of the sandbox pool, holding a worker that has
-        # already run other items. A sandbox that inherits that process is not the
-        # test that was declared, however green it comes out.
+    @testset "a sandbox reached with a used worker still gets a process of its own" begin
+        # The reverse direction: a slot arrives at a sandbox holding a worker that
+        # has already run another item. `[order] first` puts the ordinary item ahead
+        # of the sandboxes at the head of the pool, so the slot that runs it takes a
+        # sandbox next. A sandbox that inherits that process is not the test that
+        # was declared, however green it comes out.
         dir = make_pkg(
-            "StealSandbox",
+            "SandboxAfterWork",
             "test/a_test.jl" => journal_item("ordinary"),
             ("test/b_$(i)_test.jl" => journal_item(
                 "solo $i"; opts="sandbox=true", body="sleep(0.3)\n@test true"
             ) for i in 1:4)...,
+            "test/TestItems.toml" => "[order]\nfirst = [\"ordinary\"]\n",
         )
         rows = with_journal() do path
             states, _, _ = run_states(dir; workers=2, logs=:issues, monitor=false)

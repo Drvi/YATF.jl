@@ -228,7 +228,7 @@ function run_meta(p::Plan)
     meta = Pair{String, String}[
         "julia" => string(VERSION), "julia_commit" => Base.GIT_VERSION_INFO.commit,
         "yatf" => string(pkgversion(@__MODULE__)), "yatf_revision" => project_revision(pkgdir(@__MODULE__)),
-        "host" => gethostname(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
+        "host" => run_host(), "machine" => Sys.MACHINE, "cpu_threads" => string(Sys.CPU_THREADS),
         "memory_bytes" => string(Sys.total_memory()),
         "coordinator_threads" => string(Threads.nthreads(:default), ",", Threads.nthreads(:interactive)),
         "environment_variables" => environment_variables(),
@@ -708,24 +708,52 @@ end
 ### Where run states live ##################################################
 
 """
+    run_host() -> String
+
+The machine a run state is recorded as coming from, and whose run states are this
+machine's to prune: `\$YATF_HOST` when set, otherwise the hostname. A CI runner has
+a new hostname every run, so run states restored from one run's cache into the next
+would count as another machine's and never be pruned; naming the machine keeps them
+this machine's.
+"""
+function run_host()
+    host = get(ENV, "YATF_HOST", "")
+    return isempty(host) ? gethostname() : host
+end
+
+"""
     runstate_dir(root) -> String
 
-`\$YATF_RUNSTATE_DIR` when set, otherwise a scratch space keyed by the project
-path, so nothing lands in the repository. The path is printed at the end of a
-run so CI can upload it.
+`\$YATF_RUNSTATE_DIR` when set, otherwise a directory of the depot's own keyed by
+the project path, so nothing lands in the repository. Not under `scratchspaces/`:
+`Pkg.gc`, which `Pkg` also runs after its own operations, deletes every directory
+there that no package has registered, and with it the history that orders the
+next run. The path is printed at the end of a run so CI can upload it.
 """
 function runstate_dir(root::AbstractString)
     dir = get(ENV, "YATF_RUNSTATE_DIR", "")
     isempty(dir) || return dir
-    key = string(crc32c(abspath(root)); base = 16, pad = 8)
-    return joinpath(first(DEPOT_PATH), "scratchspaces", "yatf", key, "runs")
+    return joinpath(runstate_root(), string(crc32c(abspath(root)); base = 16, pad = 8))
 end
+
+# Where each project's directory of run states goes, when `YATF_RUNSTATE_DIR` does
+# not say. Read as the run starts: the depot is the session's, not the build's.
+runstate_root() = joinpath(first(DEPOT_PATH), "yatf", "runs")
+
+# Beside a project's run states in the default location: the project's path, which
+# tells `sweep_runstate_dirs` whether the project is still there.
+const PROJECT_MARK = "project"
 
 # Named for when the run started, so that names sort oldest first. A file already
 # there, a run state downloaded from CI say, is never written over: the new name
 # takes a suffix instead, one that sorts after it.
 function new_runstate_path(root::AbstractString)
     dir = runstate_dir(root)
+    if isempty(get(ENV, "YATF_RUNSTATE_DIR", ""))
+        mkpath(dir)
+        mark = joinpath(dir, PROJECT_MARK)
+        isfile(mark) || write(mark, abspath(root))
+    end
     stem = string(round(Int, time()), "-", getpid())
     path = joinpath(dir, stem * ".yatf")
     n = 1
@@ -745,11 +773,14 @@ end
 
 const KEEP_RUNS = 20
 
+# How many of the newest run states `history` reads durations and failures from.
+const HISTORY_RUNS = 5
+
 # Only the run states this machine recorded are pruned, and the newest `keep` of
 # them stay. One recorded elsewhere, a CI artifact downloaded into the directory
 # say, and one that cannot be read are never deleted: nothing shows they are ours.
 function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
-    here = gethostname()
+    here = run_host()
     ours = filter(runstate_files(root)) do f
         rs = read_run_state(f)
         rs !== nothing && get(rs.meta, "host", "") == here
@@ -758,6 +789,35 @@ function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
         try
             rm(f; force = true)
         catch
+        end
+    end
+    return nothing
+end
+
+"""
+    sweep_runstate_dirs(base = runstate_root())
+
+Clear the default location of projects that are gone: in each directory whose
+recorded project path no longer exists, delete this machine's run states, and then
+the directory once nothing else is left in it. A run state recorded elsewhere, one
+that cannot be read, and a directory without a recorded project stay: nothing shows
+they are this machine's to delete.
+"""
+function sweep_runstate_dirs(base::AbstractString = runstate_root())
+    isdir(base) || return nothing
+    here = run_host()
+    for dir in readdir(base; join = true)
+        mark = joinpath(dir, PROJECT_MARK)
+        try
+            isfile(mark) || continue
+            ispath(strip(read(mark, String))) && continue
+            for f in filter!(endswith(".yatf"), readdir(dir; join = true))
+                rs = read_run_state(f)
+                rs !== nothing && get(rs.meta, "host", "") == here && rm(f; force = true)
+            end
+            readdir(dir) == [PROJECT_MARK] && rm(dir; recursive = true, force = true)
+        catch
+            # A directory another process is writing or deleting is left for next time.
         end
     end
     return nothing
@@ -772,7 +832,7 @@ Per-item durations and last-run failures, taken from the most recent runs, and
 when the newest of them started. Only items that actually ran contribute; a name
 that has never been seen simply has no estimate and is scheduled as if it were new.
 """
-function history(root::AbstractString; nruns::Int = 5)
+function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
     seconds = Dict{String, Float64}()
     failed = Dict{String, Int}()
     since = 0.0
@@ -791,7 +851,7 @@ function history(root::AbstractString; nruns::Int = 5)
             if st.state === UNSEEN
                 # A cancelled run stopped before reaching these. They did not pass,
                 # and after a run that stopped early, what did not pass is exactly
-                # what `retry_failed` should run again.
+                # what `runtestsf` should run again.
                 ago == 0 && rs.cancelled && (failed[it.name] = 0)
                 continue
             end

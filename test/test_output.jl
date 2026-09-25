@@ -32,12 +32,12 @@ using YATFWorkers: YATFWorkers
         # fixture passes.
         for l in starts
             @test occursin(
-                Regex("^$(YATF.MARK_RUNNING) w\\d+ · " *
+                Regex("^$(YATF.Private.MARK_RUNNING) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · RUN  · \\d/6 · \".+\"\\s+· at \\S+:\\d+\$"), l)
         end
         for l in dones
             @test occursin(
-                Regex("^$(YATF.MARK_PASSED) w\\d+ · " *
+                Regex("^$(YATF.Private.MARK_PASSED) w\\d+ · " *
                       "\\d\\d:\\d\\d:\\d\\d · DONE · \\d/6 · \".+\"\\s+· PASS · "), l)
             @test occursin("maxrss", l)
         end
@@ -51,12 +51,12 @@ using YATFWorkers: YATFWorkers
         @test !isempty(heads)
         @test all(l -> !isspace(first(l)), heads)   # from the first column
         marks = unique(first(split(strip(l))) for l in heads)
-        known = Set([YATF.MARK_INFO, (YATF.MARK_RUNNING, YATF.MARK_PASSED, YATF.MARK_FAILED, YATF.MARK_SET_ASIDE, YATF.MARK_ITEM, YATF.MARK_WORKER)...])
+        known = Set([YATF.Private.MARK_INFO, (YATF.Private.MARK_RUNNING, YATF.Private.MARK_PASSED, YATF.Private.MARK_FAILED, YATF.Private.MARK_SET_ASIDE, YATF.Private.MARK_ITEM, YATF.Private.MARK_WORKER)...])
         @test issubset(marks, known)
         # This fixture starts workers, runs items that pass, and reports.
-        @test YATF.MARK_WORKER in marks
-        @test YATF.MARK_RUNNING in marks
-        @test YATF.MARK_PASSED in marks
+        @test YATF.Private.MARK_WORKER in marks
+        @test YATF.Private.MARK_RUNNING in marks
+        @test YATF.Private.MARK_PASSED in marks
         # ...and the column `w<n>` starts in is the same on all of them.
         cols = unique(length(SubString(l, 1, prevind(l, first(findfirst(r" w\d+ · ", l))))) for l in heads)
         @test length(cols) == 1
@@ -65,10 +65,10 @@ using YATFWorkers: YATFWorkers
     @testset "the run reports on itself when there is no terminal" begin
         status = filter(l -> occursin("· INFO ", l), lines)
         @test !isempty(status)
-        @test all(l -> startswith(l, YATF.MARK_INFO * " w0" * YATF.FIELD), status)
+        @test all(l -> startswith(l, YATF.Private.MARK_INFO * " w0" * YATF.Private.FIELD), status)
         @test any(l -> occursin("mem ", l), status)
-        # CPU load as well as memory, where there is one: Windows reports none.
-        Sys.iswindows() || @test any(l -> occursin("load ", l), status)
+        # The load average as well as memory, where there is one: Windows reports none.
+        Sys.iswindows() || @test any(l -> occursin(r" · cpu +\d+\.\d/\d+ · ", l), status)
         @test any(l -> occursin("workers", l), status)
         @test any(l -> occursin("tree mem", l), status)
         @test any(l -> occursin("(max ", l), status)
@@ -85,7 +85,7 @@ using YATFWorkers: YATFWorkers
     @testset "a path is shortened on the way out, not on the way in" begin
         root = "/some/where/MyPkg"
         text = "Error During Test at $root/test/a_test.jl:7\n  @ $root/test/b_test.jl:2\n"
-        short = YATF.strip_root(text, root)
+        short = YATF.Private.strip_root(text, root)
         @test occursin("at test/a_test.jl:7", short)
         @test occursin("@ test/b_test.jl:2", short)
         @test !occursin(root, short)
@@ -96,15 +96,15 @@ using YATFWorkers: YATFWorkers
         home = homedir()
         under = joinpath(home, "proj", "MyPkg")
         if Sys.iswindows()
-            @test YATF.strip_root("a $(under)\\test\\x.jl:1 and $(under)/test/y.jl:2", under) ==
+            @test YATF.Private.strip_root("a $(under)\\test\\x.jl:1 and $(under)/test/y.jl:2", under) ==
                 "a test\\x.jl:1 and test/y.jl:2"
         else
             both = "a $(under)/test/x.jl:1 and ~/proj/MyPkg/test/y.jl:2"
-            @test YATF.strip_root(both, under) == "a test/x.jl:1 and test/y.jl:2"
+            @test YATF.Private.strip_root(both, under) == "a test/x.jl:1 and test/y.jl:2"
         end
         # Nothing to strip, nothing changed.
-        @test YATF.strip_root(text, "") == text
-        @test YATF.strip_root("no paths here", root) == "no paths here"
+        @test YATF.Private.strip_root(text, "") == text
+        @test YATF.Private.strip_root("no paths here", root) == "no paths here"
     end
 
     @testset "a worker's last line says what it did, not what the slot did" begin
@@ -125,8 +125,8 @@ using YATFWorkers: YATFWorkers
     end
 
     @testset "the name column is chosen from the names the run will print" begin
-        nw(names; columns=0) = YATF.name_width(names; columns)
-        qw = YATF.quoted_width
+        nw(names; columns=0) = YATF.Private.name_width(names; columns)
+        qw = YATF.Private.quoted_width
         widest(names) = maximum(qw, names)
 
         short = ["item $i" for i in 1:100]
@@ -148,22 +148,44 @@ using YATFWorkers: YATFWorkers
         for names in (short, outliers, tight, vcat(short, ["x"^150]),
                       vcat(short[1:90], ["slightly longer name $i" for i in 1:10]))
             over = count(n -> qw(n) > nw(names), names)
-            @test over <= max(YATF.NAME_OUTLIER_ALLOWANCE,
-                              length(names) ÷ YATF.NAME_OUTLIER_SHARE)
+            @test over <= max(YATF.Private.NAME_OUTLIER_ALLOWANCE,
+                              length(names) ÷ YATF.Private.NAME_OUTLIER_SHARE)
         end
 
         # A terminal narrows the column; a narrow one does not squeeze it away.
         long = ["a considerably longer test item name $i" for i in 1:100]
         @test nw(long; columns=200) > nw(long; columns=120) > nw(long; columns=80)
-        @test nw(long; columns=40) >= YATF.MIN_NAME_WIDTH
-        @test nw(long) <= YATF.MAX_NAME_WIDTH
-        @test nw(String[]) >= YATF.MIN_NAME_WIDTH
+        @test nw(long; columns=40) >= YATF.Private.MIN_NAME_WIDTH
+        @test nw(long) <= YATF.Private.MAX_NAME_WIDTH
+        @test nw(String[]) >= YATF.Private.MIN_NAME_WIDTH
         @test nw(["just the one"]) == qw("just the one")
 
         # The width it counts on is the width the line actually takes.
-        for n in ["plain", "with \"quotes\"", "emoji 🎉", "tab\there", "dollar \$x", ""]
-            @test qw(n) == textwidth(sprint(YATF.print_quoted, n))
+        for n in ["plain", "with \"quotes\"", "back\\slash", "emoji 🎉", "unicode é", "tab\there",
+                  "newline\nhere", "dollar \$x", "", "\e[1mnot an escape sequence"]
+            @test qw(n) == textwidth(repr(n))
         end
+    end
+
+    @testset "a name too long for the column is written as a prefix of its own" begin
+        # As the plan writes it: `r"^…"`, which passed to `name=` picks out that item.
+        names = ["one", "two", "three", "an item whose name runs on and on, far past the others",
+                 "another item whose name runs on and on, far past the others"]
+        dir = make_pkg("ShortNames", "test/s_test.jl" => join(
+            (string("@testitem ", repr(n), " begin\n    @test true\nend\n") for n in names), "\n"))
+        dones(; kw...) = filter(l -> occursin("DONE", l), split(last(capture_run(() ->
+            run_states(dir; workers=0, logs=:issues, monitor=false, kw...))), '\n'))
+        short = dones()
+        @test length(short) == 5
+        @test count(l -> occursin("r\"^an", l), short) == 2
+        # The quotes line up, and so does everything after the names.
+        column(l, text) = length(l[1:prevind(l, findfirst(text, l).start)])
+        @test length(unique(column.(short, "\""))) == 1
+        @test length(unique(column.(short, "PASS"))) == 1
+        # Asked for, every name is written whole.
+        whole = dones(full_names = true)
+        @test all(n -> any(l -> occursin(repr(n), l), whole), names)
+        @test !any(l -> occursin("r\"^", l), whole)
     end
 
     @testset "a log path is built exactly as `string` would build it" begin
@@ -171,7 +193,7 @@ using YATFWorkers: YATFWorkers
         # if it cannot disagree with the obvious way of writing it.
         prefix = "/tmp/yatf_abcdef/item_"
         for index in (1, 9, 10, 99, 100, 2000, 12345), attempt in (1, 2, 9, 10, 127)
-            @test YATF.item_log_path(prefix, index, attempt) ==
+            @test YATF.Private.item_log_path(prefix, index, attempt) ==
                 string(prefix, index, "_", attempt, ".log")
         end
     end
@@ -184,7 +206,7 @@ using YATFWorkers: YATFWorkers
         column(l) = length(SubString(l, 1, prevind(l, first(findfirst("[YATF]", l))))) + 1
         cols = unique(column(l) for l in lines if occursin("[YATF]", l))
         @test length(cols) == 1
-        @test only(cols) == length(YATF.GUTTER) + 1
+        @test only(cols) == length(YATF.Private.GUTTER) + 1
         # ...and the multi-line ones really are drawn as blocks.
         @test any(l -> startswith(l, "┌ [YATF] "), lines)
         @test count(l -> startswith(l, "└"), lines) >= 1
@@ -200,7 +222,7 @@ using YATFWorkers: YATFWorkers
                 if marker == "[YATF]"
                     # At the start of its line, after the gutter or after a
                     # bracket's corner. Anywhere else is two writers on one line.
-                    @test startswith(l, YATF.GUTTER * "[YATF]") ||
+                    @test startswith(l, YATF.Private.GUTTER * "[YATF]") ||
                         occursin(r"^[┌│└] \[YATF\]", l)
                 end
             end
@@ -250,21 +272,6 @@ using YATFWorkers: YATFWorkers
         @test !any(l -> occursin("Expression: 1 == 2", l), others)
     end
 
-    @testset "a name is written exactly as `repr` would write it" begin
-        # The item line skips `repr` when a name holds nothing to escape, which is
-        # almost every name. The two must not disagree, or a name with a quote in it
-        # comes out wrong in every line that mentions it.
-        for name in ["plain", "with space", "has \"quotes\"", "back\\slash", "dollar \$x",
-                     "tab\there", "newline\nhere", "unicode é", "emoji 🎉", "",
-                     "\e[1mnot an escape sequence"]
-            io = IOBuffer()
-            width = YATF.print_quoted(io, name)
-            written = String(take!(io))
-            @test written == repr(name)
-            @test width == textwidth(written)
-        end
-    end
-
     @testset "no terminal control sequences when there is no terminal" begin
         @test !occursin("\e[2K", log)
         @test !occursin("\e[", log)
@@ -291,16 +298,16 @@ using YATFWorkers: YATFWorkers
         dir = mktempdir()
         path = joinpath(dir, "item_1_1.log")
         write(path, "what the item printed\n")     # the worker's own capture
-        slot = YATF.Slot(
-            YATF.SlotIdx(1),
-            YATF.Profile(YATF.DEFAULT_PROFILE), nothing, 0.0, 0, YATF.ItemIdx(0),
+        slot = YATF.Private.Slot(
+            YATF.Private.SlotIdx(1),
+            YATF.Private.Profile(YATF.Private.DEFAULT_PROFILE), nothing, 0.0, 0, YATF.Private.ItemIdx(0),
             path, String[]
         )
         for i in 1:3
-            YATF.keep_dying_line!(slot, "signal $i")
+            YATF.Private.keep_dying_line!(slot, "signal $i")
         end
         @test read(path, String) == "what the item printed\n"     # nothing yet
-        YATF.flush_dying_log!(slot)
+        YATF.Private.flush_dying_log!(slot)
         @test readlines(path) == ["what the item printed", "signal 1", "signal 2", "signal 3"]
         # ...and the slot is ready for the process that replaces this one.
         @test isempty(slot.dying_lines)
@@ -308,17 +315,17 @@ using YATFWorkers: YATFWorkers
 
         # A process can print without limit on its way down.
         slot.dying_log = path
-        for i in 1:(YATF.MAX_DYING_LINES + 50)
-            YATF.keep_dying_line!(slot, "line $i")
+        for i in 1:(YATF.Private.MAX_DYING_LINES + 50)
+            YATF.Private.keep_dying_line!(slot, "line $i")
         end
-        @test length(slot.dying_lines) == YATF.MAX_DYING_LINES
-        YATF.flush_dying_log!(slot)
-        @test length(readlines(path)) == 4 + YATF.MAX_DYING_LINES
+        @test length(slot.dying_lines) == YATF.Private.MAX_DYING_LINES
+        YATF.Private.flush_dying_log!(slot)
+        @test length(readlines(path)) == 4 + YATF.Private.MAX_DYING_LINES
 
         # A log that cannot be written is a lost backtrace, never a failed run.
         slot.dying_log = joinpath(dir, "no", "such", "dir", "x.log")
-        YATF.keep_dying_line!(slot, "x")
-        @test YATF.flush_dying_log!(slot) === nothing
+        YATF.Private.keep_dying_line!(slot, "x")
+        @test YATF.Private.flush_dying_log!(slot) === nothing
         @test isempty(slot.dying_lines)
     end
 end

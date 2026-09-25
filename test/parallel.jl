@@ -49,7 +49,7 @@ function cpu_times()
 end
 
 function sample!(log::MemoryLog)
-    used, total = YATF.Platform.machine_memory()
+    used, total = YATF.Private.Platform.machine_memory()
     @lock log.lock begin
         log.total = total
         log.machine = max(log.machine, used)
@@ -57,10 +57,10 @@ function sample!(log::MemoryLog)
             used > get(log.machine_while, file, 0) && (log.machine_while[file] = used)
         end
         # Without per-process figures there is only the machine to go by.
-        YATF.Platform.PER_PROCESS_OK[] || return nothing
+        YATF.Private.Platform.PER_PROCESS_OK[] || return nothing
         suite = Int64(0)
         for (pid, file) in log.pids
-            tree = sum((max(YATF.Platform.process_rss(p), 0) for p in YATF.Platform.process_tree([pid])); init = Int64(0))
+            tree = sum((max(YATF.Private.Platform.process_rss(p), 0) for p in YATF.Private.Platform.process_tree([pid])); init = Int64(0))
             suite += tree
             tree > get(log.peak, file, 0) && (log.peak[file] = tree)
         end
@@ -77,7 +77,7 @@ percent(used, total) = total > 0 ? string(round(Int, 100 * used / total), "%") :
 # What a file's line says about memory: its own peak, and how full the machine got
 # while it ran.
 memory_text(log::MemoryLog, file) = @lock log.lock string(
-    "peak ", YATF.fmt_bytes(get(log.peak, file, 0)),
+    "peak ", YATF.Private.fmt_bytes(get(log.peak, file, 0)),
     " · machine ", percent(get(log.machine_while, file, 0), log.total)
 )
 
@@ -176,7 +176,7 @@ function run_in_parallel(runner::AbstractString, files::Vector{String}, jobs::In
     close(queue)
     printer = ReentrantLock()
     memory = MemoryLog()
-    YATF.Platform.ensure_checked!()
+    YATF.Private.Platform.ensure_checked!()
     sampler = Threads.@spawn while !(@atomic memory.done)
         sample!(memory)
         sleep(0.5)
@@ -230,7 +230,7 @@ function report_files(results::Vector{FileResult}; memory::Union{Nothing, Memory
     for r in sort(results; by = r -> -r.seconds)
         printstyled(
             stdout, "  ", rpad(r.file, 24), lpad(round(r.seconds; digits = 1), 7), "s  ",
-            memory === nothing ? "" : string(lpad(YATF.fmt_bytes(peak_of(memory, r.file)), 6), "  "),
+            memory === nothing ? "" : string(lpad(YATF.Private.fmt_bytes(peak_of(memory, r.file)), 6), "  "),
             r.ok ? "passed" : "FAILED (" * r.status * ")", "\n";
             color = r.ok ? :green : :red
         )
@@ -253,12 +253,12 @@ function print_memory(memory::MemoryLog, jobs::Int)
     largest = isempty(memory.peak) ? nothing : argmax(memory.peak)
     parts = String[]
     memory.suite > 0 && push!(parts, string(
-        "the files peaked at ", YATF.fmt_bytes(memory.suite), " together, with ",
+        "the files peaked at ", YATF.Private.fmt_bytes(memory.suite), " together, with ",
         memory.suite_files, " of ", jobs, " running"))
     largest === nothing || push!(parts, string(
-        "the largest alone at ", YATF.fmt_bytes(memory.peak[largest]), " (", largest, ")"))
+        "the largest alone at ", YATF.Private.fmt_bytes(memory.peak[largest]), " (", largest, ")"))
     memory.total > 0 && push!(parts, string(
-        "the machine at ", YATF.fmt_bytes(memory.machine), " of ", YATF.fmt_bytes(memory.total),
+        "the machine at ", YATF.Private.fmt_bytes(memory.machine), " of ", YATF.Private.fmt_bytes(memory.total),
         " (", percent(memory.machine, memory.total), ")"))
     isempty(parts) || println("  memory: ", join(parts, " · "))
     memory.suite > 0 && println("  (a file's figure is its process and its workers, summed: shared pages count twice)")

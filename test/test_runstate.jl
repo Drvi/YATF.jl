@@ -1,5 +1,5 @@
 using Random: Random
-using YATF: init_run_state, write_status!, finish_run_state!, read_run_state, history,
+using YATF.Private: init_run_state, write_status!, finish_run_state!, read_run_state, history,
             runstate_files, runstate_dir, prune_runstates, new_runstate_path, prepare,
             execute, plan, scan, discover, setup_modules, read_config, Filter, History,
             UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT, SKIPPED, nitems, RS_STATUS_BYTES,
@@ -12,6 +12,37 @@ function a_plan(pkg=fixture("Basic.jl"))
 end
 
 @testset "run state" begin
+    @testset "by default a project's run states are the depot's own, and go with the project" begin
+        depot = mktempdir()
+        pushfirst!(DEPOT_PATH, depot)
+        try
+            withenv("YATF_RUNSTATE_DIR" => nothing) do
+                one_item = "test/a_test.jl" => "@testitem \"one\" begin\n    @test true\nend\n"
+                kept, gone, foreign = make_pkg("Kept", one_item), make_pkg("Gone", one_item),
+                                      make_pkg("Foreign", one_item)
+                paths = Dict(pkg => new_runstate_path(pkg) for pkg in (kept, gone, foreign))
+                for (pkg, path) in paths
+                    # Not under `scratchspaces/`, which `Pkg.gc` empties of what no package registered.
+                    @test startswith(path, joinpath(depot, "yatf", "runs"))
+                    finish_run_state!(init_run_state(path, a_plan(pkg)))
+                    @test read(joinpath(dirname(path), "project"), String) == abspath(pkg)
+                end
+                # Among one gone project's run states, one recorded on another machine.
+                here = gethostname()
+                elsewhere = String(map(b -> b == UInt8('q') ? UInt8('r') : UInt8('q'), codeunits(here)))
+                write(paths[foreign], replace(read(paths[foreign], String), here => elsewhere))
+                rm(gone; recursive = true)
+                rm(foreign; recursive = true)
+                YATF.Private.sweep_runstate_dirs()
+                @test isfile(paths[kept])
+                @test !ispath(dirname(paths[gone]))
+                @test isfile(paths[foreign])        # not this machine's to delete
+            end
+        finally
+            filter!(!=(depot), DEPOT_PATH)
+        end
+    end
+
     @testset "round trip" begin
         p = a_plan()
         dir = mktempdir()
@@ -180,7 +211,7 @@ end
             rm(run.logdir; force=true, recursive=true)
             h = history(pkg)
             @test h.failed == Dict("fails" => 0)
-            # `retry_failed` re-runs exactly those
+            # `runtestsf` re-runs exactly those
             p2, _ = prepare((pkg,); workers=1, logs=:issues, name=Regex("^(fails)\$"))
             @test [p2.items.name[i] for i in 1:nitems(p2)] == ["fails"]
         end
@@ -221,6 +252,25 @@ end
         end
     end
 
+    @testset "YATF_HOST names the machine, so a CI cache is pruned like a local directory" begin
+        dir = mktempdir()
+        p = a_plan()
+        withenv("YATF_RUNSTATE_DIR" => dir, "YATF_HOST" => "ci-linux") do
+            for i in 1:25
+                finish_run_state!(init_run_state(joinpath(dir, string(1000000 + i, "-1.yatf")), p))
+            end
+            @test read_run_state(joinpath(dir, "1000001-1.yatf")).meta["host"] == "ci-linux"
+            # Recorded under the name this runner has too, whatever its hostname: its own.
+            prune_runstates(p.root, 20)
+            @test length(runstate_files(p.root)) == 20
+        end
+        # Under another name, those twenty are another machine's.
+        withenv("YATF_RUNSTATE_DIR" => dir, "YATF_HOST" => "ci-macos") do
+            prune_runstates(p.root, 5)
+            @test length(runstate_files(p.root)) == 20
+        end
+    end
+
     @testset "a replay changes and deletes no run state, the one it runs among them" begin
         with_runstate_dir() do dir
             pkg = make_pkg("ReplayKeeps", "test/r_test.jl" => "@testitem \"x\" begin\n    @test true\nend\n")
@@ -228,13 +278,13 @@ end
             recorded = only(runstate_files(pkg))
             # The oldest of as many as are kept: the run a replay adds would push it out.
             stamp = parse(Int, first(split(basename(recorded), '-')))
-            for k in 1:(YATF.KEEP_RUNS - 1)
+            for k in 1:(YATF.Private.KEEP_RUNS - 1)
                 cp(recorded, joinpath(dir, string(stamp + k, "-1.yatf")))
             end
             before = Dict(f => read(f) for f in runstate_files(pkg))
             capture_run(() -> run_states(pkg; workers=0, logs=:issues, monitor=false, replay=recorded))
             @test all(f -> isfile(f) && read(f) == before[f], keys(before))
-            @test length(runstate_files(pkg)) == YATF.KEEP_RUNS + 1
+            @test length(runstate_files(pkg)) == YATF.Private.KEEP_RUNS + 1
         end
     end
 
@@ -380,7 +430,7 @@ end
     end
 
     @testset "a manifest is read as package versions" begin
-        m = YATF.manifest_versions("""
+        m = YATF.Private.manifest_versions("""
         manifest_format = "2.0"
         [[deps.Foo]]
         uuid = "7876af07-990d-54b4-ab0e-23690620f79a"

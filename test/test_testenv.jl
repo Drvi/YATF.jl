@@ -1,4 +1,4 @@
-using YATF: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED, nitems
+using YATF.Private: prepare, execute, test_env, with_test_env, TEST_ENVS, Target, PASSED, nitems
 
 @testset "test environment" begin
     @testset "a test-only dependency is loadable" begin

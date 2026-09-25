@@ -501,7 +501,7 @@ function print_status_line(io::IO, m::Monitor)
         write(io, UInt8('%'))
     end
     if s.load1 >= 0
-        print(io, " · load ")
+        print(io, " · cpu ")
         # Four wide: a load average on a many-core machine reaches double digits
         # routinely, and this is the last field before the phase.
         print_1dp(io, s.load1, 4)

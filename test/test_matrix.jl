@@ -7,7 +7,7 @@
 # about real line numbers. A test that hard-codes `:14` is a test that goes wrong
 # the first time somebody adds a line above it.
 
-using YATF: PASSED, FAILED, ERRORED, SKIPPED
+using YATF.Private: PASSED, FAILED, ERRORED, SKIPPED
 using YATFWorkers: YATFWorkers
 
 """
@@ -140,17 +140,17 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                     @test any(l -> occursin(repr(name), l) && occursin(word, l), dones)
                 end
                 # Blue while it runs, whatever the item turns out to be.
-                @test all(l -> occursin(YATF.MARK_RUNNING, l), starts)
+                @test all(l -> occursin(YATF.Private.MARK_RUNNING, l), starts)
                 for (name, state) in MATRIX_STATES
                     line = only(filter(l -> occursin(repr(name), l), dones))
-                    @test occursin(YATF.state_mark(state), line)
+                    @test occursin(YATF.Private.state_mark(state), line)
                 end
                 # ...and the glyph is the one the colour would have been.
-                @test count(l -> occursin(YATF.MARK_PASSED, l), dones) ==
+                @test count(l -> occursin(YATF.Private.MARK_PASSED, l), dones) ==
                     count(==(PASSED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATF.MARK_SET_ASIDE, l), dones) ==
+                @test count(l -> occursin(YATF.Private.MARK_SET_ASIDE, l), dones) ==
                     count(==(SKIPPED), values(MATRIX_STATES))
-                @test count(l -> occursin(YATF.MARK_FAILED, l), dones) == 5
+                @test count(l -> occursin(YATF.Private.MARK_FAILED, l), dones) == 5
             end
 
             @testset "the name column lines the outcomes up" begin
@@ -166,7 +166,7 @@ const MATRIX_FILE = joinpath("test", "matrix_test.jl")
                 columns = unique(first(findfirst(r"(PASS|FAIL|ERR|SKIP)", l)) for l in fitting)
                 @test length(columns) == 1
                 # ...and the width is the one the names asked for.
-                @test width == YATF.name_width(collect(keys(MATRIX_STATES)))
+                @test width == YATF.Private.name_width(collect(keys(MATRIX_STATES)))
             end
 
             @testset "a failure names the line it failed on" begin

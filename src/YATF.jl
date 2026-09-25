@@ -14,10 +14,18 @@ contain `@testitem` declarations and nothing else. Shared setup code goes in
 """
 module YATF
 
+"""
+    YATF.Private
+
+Everything but the public API, which `YATF` takes from here by name. `YATF.<tab>`
+offers every name `YATF` itself defines, and the public API is what it should offer.
+"""
+module Private
+
 using Base.ScopedValues: ScopedValue, with
 using Logging: Logging, with_logger, current_logger
 using Pkg: Pkg
-using Random: RandomDevice
+using Random: Random, RandomDevice
 using Test
 using Test: Test
 using TestEnv: TestEnv
@@ -29,19 +37,6 @@ using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRO
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_yatf_run, run_item,
     with_testset_printing, without_enclosing_testset, PATHSEP
-
-export @testitem
-
-# Re-exported, so `using YATF` alone gives a script or the REPL `@test` and the
-# rest. A test item's body does not need it: it is handed `Test` directly.
-export Test, runtests
-for name in names(Test)
-    name === :Test && continue
-    @eval export $name
-end
-
-public retry_failed, current_testitem, in_testitem, in_yatf_run,
-    activate, deactivate, is_activated, debug
 
 include("types.jl")
 include("macros.jl")
@@ -55,6 +50,8 @@ include("monitor.jl")
 include("execute.jl")
 include("interactive.jl")
 include("debug.jl")
+include("setup_packages.jl")
+include("chores.jl")
 
 """
     runtests([paths...]; kwargs...)
@@ -64,6 +61,12 @@ environment is used.
 
 `paths` narrow what is read: a directory, a test file, or `file.jl:42` to select
 the item that line is inside.
+
+Returns the run's testset, a [`RunTestSet`](@ref) named `testset_name` (`"YATF"`
+unless given), holding one testset per test file. Inside an enclosing `@testset`
+it is recorded there, so the runs of several calls add up under one, told apart by
+their names. Outside any, an item that did not pass makes the call throw, which is
+what fails `Pkg.test`. A dry run returns `nothing`.
 
 # Keywords
 
@@ -80,7 +83,7 @@ framework's own frames in a failing item's stacktrace; trimmed by default), `see
 given, and printed at the start of the run).
 
 Output: `logs` (`:issues`, `:batched`, `:eager`), `report`, `verbose`,
-`monitor`, `monitor_interval`.
+`monitor`, `monitor_interval`, `testset_name`.
 
 State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
 downloaded from CI, say) and runs it again: the same items, settings, profiles
@@ -95,11 +98,11 @@ function runtests(args...; name = nothing, tags = nothing, dry_run::Bool = false
     p, target = prepare(args; name, tags, announce = !dry_run, kwargs...)
     if dry_run
         print_plan(stdout, p)
-        return p
+        return nothing
     end
     run = execute(p, target)
     try
-        return report(run)
+        return RunTestSet(report(run))
     finally
         rm(run.logdir; force = true, recursive = true)
     end
@@ -212,11 +215,11 @@ function replayed_config(cfg::RunConfig, rs::RunStateRecord)
 end
 
 """
-    retry_failed(paths...; kwargs...)
+    runtestsf(paths...; kwargs...)
 
 Re-run exactly the items the last run recorded as not passing.
 """
-function retry_failed(args...; kwargs...)
+function runtestsf(args...; kwargs...)
     target = resolve_target(args)
     h = history(target.root; nruns = 1)
     isempty(h.failed) && throw(
@@ -411,9 +414,8 @@ const PRECOMPILE_SIGNATURES = (
         print_bytes(buf, 512 * 2^20, TOTAL_WIDTH)
         print_1dp(buf, 2.5, 4)
         print_int(buf, 42, 4)
-        print_quoted(buf, "an item")
-        item_line(1, 1, 2, "an item", 12, 1, 1, "a_test.jl:1")
-        item_line(1, 1, 2, "an item", 12, 2, 2, (; state = PASSED, elapsed_ns = 1, compile_ns = 0, maxrss = 1))
+        item_line(1, 1, 2, "\"an item\"", 12, 1, 1, "a_test.jl:1")
+        item_line(1, 1, 2, "\"an item\"", 12, 2, 2, (; state = PASSED, elapsed_ns = 1, compile_ns = 0, maxrss = 1))
         parse_record(string(YATFWorkers.RECORD_MARK, "DONE 1 1 2 3 4 5"))
         item_log_path("/precompile/item_", 1, 1)
         bracket("a line\nanother", "[1/2] FAIL", "\"an item\"", "@ a_test.jl:1", :red)
@@ -424,5 +426,26 @@ const PRECOMPILE_SIGNATURES = (
         YATFWorkers.precompile_or_throw(f, types)
     end
 end
+
+end # module Private
+
+using Test
+using .Private: @testitem, runtests, runtestsf, current_testitem, in_testitem, in_yatf_run,
+    activate, deactivate, is_activated, debug, setups_to_packages, chores,
+    ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
+
+export @testitem, runtests, runtestsf, chores
+
+# Re-exported, so `using YATF` alone gives a script or the REPL `@test`, `@testset`
+# and the rest of `Test`'s macros; anything else of it is reached as `Test.X`. A test
+# item's body does not need them: it is handed `Test` directly.
+export Test
+for name in names(Test)
+    startswith(string(name), "@") && @eval export $name
+end
+
+public current_testitem, in_testitem, in_yatf_run,
+    activate, deactivate, is_activated, debug, setups_to_packages,
+    ConfigError, NoTestsError, ScanFailure, RunTestSet, read_run_state
 
 end # module YATF

@@ -3,7 +3,7 @@
 # of a function runs first. Most of this is checked with a stand-in for the
 # debugger that calls the function; the last testset drives the real one.
 
-using YATF: FAILED, ERRORED, ConfigError, NoTestsError
+using YATF.Private: FAILED, ERRORED, ConfigError, NoTestsError
 using REPL: REPL, Terminals
 
 const STEPPED = make_pkg(
@@ -119,7 +119,7 @@ call(body) = body()
     with_activated(STEPPED) do _
         @testset "the body is a function, and what cannot be part of one runs first" begin
             entered = Ref{Any}(nothing)
-            ts = YATF.debug_item("declares and tests", nothing) do body
+            ts = YATF.Private.debug_item("declares and tests", nothing) do body
                 entered[] = only(methods(body))
                 body()
             end
@@ -136,23 +136,23 @@ call(body) = body()
             # `using` inside an `if`, and a Base function extended under the name an
             # `import` gave it, which is a method on `Base.show` and not a local
             # function that `print` would never call.
-            ts = YATF.debug_item(call, "imports and submodules", nothing)
+            ts = YATF.Private.debug_item(call, "imports and submodules", nothing)
             @test ts.n_passed == 4
             @test isempty(ts.results)
         end
 
         @testset "a failure and an error are the item's, at the test file's lines" begin
-            ts = YATF.debug_item(call, "fails", nothing)
+            ts = YATF.Private.debug_item(call, "fails", nothing)
             @test YATFWorkers.state_of(ts) === FAILED
             @test only(ts.results).source.line == line_of("@test x == 42")
-            ts = YATF.debug_item(call, "throws", nothing)
+            ts = YATF.Private.debug_item(call, "throws", nothing)
             @test YATFWorkers.state_of(ts) === ERRORED
             @test occursin("thrown from the item", sprint(show, only(ts.results)))
         end
 
         @testset "an item left before it finished is not a pass" begin
             # A debugger that is quit returns without the body having run to its end.
-            ts = YATF.debug_item(body -> nothing, "declares and tests", nothing)
+            ts = YATF.Private.debug_item(body -> nothing, "declares and tests", nothing)
             @test YATFWorkers.state_of(ts) === ERRORED
             @test occursin("left before it finished", sprint(show, only(ts.results)))
         end
@@ -160,7 +160,7 @@ call(body) = body()
         @testset "a skipped item is not entered" begin
             entered = Ref(false)
             _, out = capture_run() do
-                YATF.debug_item(body -> (entered[] = true; body()), "skipped", nothing)
+                YATF.Private.debug_item(body -> (entered[] = true; body()), "skipped", nothing)
             end
             @test !entered[]
             @test any(l -> occursin("· DONE ·", l) && occursin("SKIP", l), eachsplit(out, '\n'))
@@ -170,16 +170,16 @@ call(body) = body()
             mktempdir() do tmp
                 draw = joinpath(tmp, "draw")
                 drawn(f) = withenv(() -> (f(); read(draw, String)), "YATF_DRAW" => draw)
-                debugged = drawn(() -> YATF.debug_item(call, "draws and fails", 7))
+                debugged = drawn(() -> YATF.Private.debug_item(call, "draws and fails", 7))
                 ran = drawn(() -> run_states(STEPPED; workers=0, seed=7, name="draws and fails", logs=:issues, monitor=false))
                 @test debugged == ran
-                @test drawn(() -> YATF.debug_item(call, "draws and fails", 8)) != ran
+                @test drawn(() -> YATF.Private.debug_item(call, "draws and fails", 8)) != ran
             end
         end
 
         @testset "without a name, it is the last run's most recent failure, with the run's seed" begin
             debug_last() = try
-                YATF.debug_item(call, nothing, nothing)
+                YATF.Private.debug_item(call, nothing, nothing)
             catch e
                 e
             end
@@ -224,7 +224,7 @@ call(body) = body()
             mktempdir() do tmp
                 marker = joinpath(tmp, "end")
                 ts, out = withenv("YATF_END" => marker) do
-                    capture_run(() -> YATF.debug_item(call, "profiled", nothing))
+                    capture_run(() -> YATF.Private.debug_item(call, "profiled", nothing))
                 end
                 @test ts.n_passed == 2
                 @test isempty(ts.results)
@@ -239,7 +239,7 @@ call(body) = body()
 
         @testset "a name that is not an item's suggests the ones it is part of" begin
             err = try
-                YATF.debug_item(call, "declares", nothing)
+                YATF.Private.debug_item(call, "declares", nothing)
             catch e
                 e
             end

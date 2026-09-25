@@ -45,6 +45,12 @@ Base.@kwdef struct RunConfig
     verbose::Bool = false
     memory_threshold::Float64 = 0.9
     full_stacktraces::Bool = false
+    # Every name printed whole in the name column, rather than one too long for it
+    # shortened to a prefix no other item has.
+    full_names::Bool = false
+    # What the run's testset is called in the summary; runs of several calls under
+    # one `@testset` are told apart by it.
+    testset_name::String = "YATF"
     monitor::Bool = true
     monitor_interval::Int = 30
     profiles::Dict{Symbol, Profile} = Dict(DEFAULT_PROFILE => Profile(DEFAULT_PROFILE))
@@ -63,7 +69,7 @@ end
 const RUN_KEYS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries,
     :failfast, :item_failfast, :logs, :report, :verbose, :memory_threshold,
-    :monitor, :monitor_interval, :full_stacktraces, :seed,
+    :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :seed,
 )
 const ORDER_KEYS = (:first, :last)
 const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
@@ -139,6 +145,9 @@ function build_config(path, toml; nunits = 0, kwargs...)
     seed = pick(:seed, 0)
     (seed isa Integer && seed >= 0) || throw(ConfigError("`seed` must be a non-negative integer, got $(repr(seed))"))
     order = section(path, toml, "order", ORDER_KEYS)
+    testset_name = pick(:testset_name, "YATF")
+    (testset_name isa AbstractString && !isempty(testset_name)) ||
+        throw(ConfigError("`testset_name` must be a non-empty string, got $(repr(testset_name))"))
 
     return RunConfig(;
         workers, threads, timeout_s = timeout,
@@ -148,6 +157,8 @@ function build_config(path, toml; nunits = 0, kwargs...)
         report = Bool(pick(:report, false)), verbose = Bool(pick(:verbose, false)),
         memory_threshold = mt, monitor = Bool(pick(:monitor, true)),
         full_stacktraces = Bool(pick(:full_stacktraces, false)),
+        full_names = Bool(pick(:full_names, false)),
+        testset_name = String(testset_name),
         monitor_interval = Int(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
         order_first = String[string(x) for x in get(order, "first", String[])],

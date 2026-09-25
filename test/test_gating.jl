@@ -2,7 +2,7 @@
 # every file parses, no two items share a name, and there is no Julia file sitting
 # under `test/` that the run would otherwise pass over in silence.
 
-using YATF: walk_test_dir, discover, ScanFailure, prepare, runtests, NoTestsError
+using YATF.Private: walk_test_dir, discover, ScanFailure, prepare, runtests, NoTestsError
 
 const GOOD = """
 @testitem "runs" begin

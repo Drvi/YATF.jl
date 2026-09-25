@@ -3,7 +3,7 @@
 # profile's `test_end` expression. None of those may lose the run, and each has to
 # say which of the three it was.
 
-using YATF: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
+using YATF.Private: PASSED, FAILED, ERRORED, UNSEEN, CANCELLED, history, read_run_state, nitems
 
 # An expression that kills the process where it stands the first `n` times it is
 # reached, counting in a file. Written as a TOML literal string, which passes the
@@ -292,7 +292,7 @@ Sys.iswindows() ||
     # A real interrupt comes long after the stall watchdog first looked, and on 1.12
     # it lands in whichever task last ran on the run's thread: the interrupt has to
     # reach the run whatever has run by then.
-    sleep(YATF.STALL_CHECK_S + 1)
+    sleep(YATF.Private.STALL_CHECK_S + 1)
     t0 = time()
     kill(proc, Base.SIGINT)
     wait(proc)

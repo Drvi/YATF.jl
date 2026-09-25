@@ -159,8 +159,10 @@ mutable struct Run
     const runid::String
     const logdir::String
     const logprefix::String   # `logdir` and the part of a log's name that never varies
-    # The name column, chosen once from every name the run will print.
+    # The name column, chosen once from every name the run will print, and each
+    # item's name as it is written there (see `item_names`).
     const name_width::Int32
+    const names::Vector{String}
     const printer::ReentrantLock
     const t0::Float64
     runstate::Union{Nothing, RunStateFile}
@@ -194,10 +196,10 @@ function execute(p::Plan, target)
     project_name = something(project_name_of(target.project), "")
     runid = string(time_ns(); base = 16)
     logdir = mktempdir(; prefix = "yatf_")
+    names, column = item_names(p, name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)))
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
-        joinpath(logdir, "item_"),
-        name_width(p.items.name; columns = terminal_columns(stdout isa Base.TTY)),
+        joinpath(logdir, "item_"), column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0.0, false, Task[],
         YATFWorkers.Worker[], ReentrantLock()
     )
@@ -270,7 +272,10 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                     run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
                     finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
                     # A replay deletes no run state, the one it runs least of all.
-                    isempty(p.cfg.replayed_from) && prune_runstates(p.root)
+                    if isempty(p.cfg.replayed_from)
+                        prune_runstates(p.root)
+                        sweep_runstate_dirs()
+                    end
                     # The exception on its way out stops the report from being
                     # made, so what the run got through is said here or nowhere.
                     interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
@@ -1051,7 +1056,7 @@ end
 
 # An item's RUN or DONE line, drawn from what this run knows about the item.
 item_line(run::Run, slot_id, i::Integer, attempt::Integer, how) = item_line(
-    slot_id, i, nitems(run.plan), run.plan.items.name[i], run.name_width, attempt,
+    slot_id, i, nitems(run.plan), run.names[i], run.name_width, attempt,
     attempts_for(run.plan, run.plan.items.unit[i]), something(how, run.plan.locations[i])
 )
 

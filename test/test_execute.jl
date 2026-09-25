@@ -1,10 +1,14 @@
-using YATF: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
+using YATF.Private: prepare, execute, report, ItemState, UNSEEN, PASSED, FAILED, ERRORED, TIMEDOUT,
             SKIPPED, BROKEN_CHAIN, CANCELLED, ConfigError, nitems, is_non_pass
 using Logging: Logging
 using Random: Random
 
 const FAULTY = fixture("Faulty.jl")
 const BASICPKG = fixture("Basic.jl")
+
+# Named as the REPL names the functions it evaluates input from, and global: a local
+# function's name is mangled.
+@noinline __repl_entry_simulated(f) = f()
 
 @testset "every item draws from the run's seed, whatever ran before it" begin
     with_journal() do jdir
@@ -60,12 +64,79 @@ end
         p2, target2 = prepare((FAULTY,); workers=1, tags=:fail, logs=:issues)
         run2 = execute(p2, target2)
         threw = try
-            YATF.without_enclosing_testset(() -> report(run2))
+            YATF.Private.without_enclosing_testset(() -> report(run2))
             false
         catch e
             e isa Test.TestSetException
         end
         @test threw
+    end
+
+    @testset "runs under one @testset are recorded in it, side by side" begin
+        # Two calls under one `@testset`, as a user writes them. Each run is recorded
+        # into it instead of throwing, so the second runs after the first failed, and
+        # the enclosing testset is what fails. It is outside this file's testsets, so
+        # that failure is its own and not this file's.
+        outer = failing = passing = nothing
+        err = try
+            YATF.Private.without_enclosing_testset() do
+                @testset "both runs" begin
+                    outer = Test.get_testset()
+                    failing = YATF.runtests(FAULTY; workers=1, tags=:fail, logs=:issues, monitor=false,
+                                            testset_name="faulty")
+                    passing = YATF.runtests(BASICPKG; workers=1, logs=:issues, monitor=false,
+                                            testset_name="basic")
+                end
+            end
+            nothing
+        catch e
+            e
+        end
+        @test err isa Test.TestSetException
+        # Each run's testset, told apart by the names the calls gave them.
+        @test outer.results[1] === failing.testset && outer.results[2] === passing.testset
+        @test [ts.description for ts in outer.results] == ["faulty", "basic"]
+        @test !isempty(YATF.Private.collect_failures(failing.testset))
+        @test isempty(YATF.Private.collect_failures(passing.testset))
+        @test Test.get_test_counts(outer).cumulative_passes >= 6   # one or more from each of Basic's items
+    end
+
+    @testset "what runtests returns prints as one line, and is a testset like any other" begin
+        ts = YATF.runtests(BASICPKG; workers=1, logs=:issues, monitor=false, testset_name="basic")
+        @test ts isa YATF.RunTestSet && ts isa Test.AbstractTestSet
+        shown = sprint(show, MIME"text/plain"(), ts)
+        @test occursin(r"^\"basic\" testset: \d+ passed · \S+$", shown)
+        @test ts.description == "basic"                    # its fields read through
+        @test Test.get_test_counts(ts).cumulative_passes >= 6
+        # The type a `@testset` makes, with another inside it.
+        made = YATF.Private.without_enclosing_testset() do
+            @testset YATF.RunTestSet "made" begin
+                @test true
+                @testset "inner" begin
+                    @test true
+                end
+            end
+        end
+        @test made isa YATF.RunTestSet
+        counts = Test.get_test_counts(made)
+        @test counts.passes == 1 && counts.cumulative_passes == 1
+        @test only(made.results) isa Test.DefaultTestSet   # the only kind a tree holds
+        # A failure in it throws at the top, as any testset's does.
+        @test_throws Test.TestSetException YATF.Private.without_enclosing_testset() do
+            @testset YATF.RunTestSet "failing" begin
+                @test false
+            end
+        end
+        # Recorded into a parent, what goes in is the testset it holds.
+        parent = Test.DefaultTestSet("parent")
+        Test.record(parent, ts)
+        @test only(parent.results) === ts.testset
+    end
+
+    @testset "a dry run prints the plan and returns nothing" begin
+        returned, out = capture_run(() -> YATF.runtests(BASICPKG; dry_run=true))
+        @test returned === nothing
+        @test occursin("uses setup", out)
     end
 
     @testset "a failing item is recorded, not fatal" begin
@@ -150,7 +221,7 @@ end
         p, target = prepare((FAULTY,); workers=1, logs=:issues, monitor=false, name="errors")
         run = execute(p, target)
         rm(run.logdir; force=true, recursive=true)
-        trimmed = sprint(show, first(YATF.collect_failures(run.statuses.testsets[1])))
+        trimmed = sprint(show, first(YATF.Private.collect_failures(run.statuses.testsets[1])))
         @test occursin("faults_test.jl", trimmed)        # the item's own frame is kept
         @test !occursin("runitem.jl", trimmed)           # the framework's are not
         @test !occursin("serve_requests", trimmed)
@@ -159,9 +230,68 @@ end
                               full_stacktraces=true)
         run2 = execute(p2, target2)
         rm(run2.logdir; force=true, recursive=true)
-        full = sprint(show, first(YATF.collect_failures(run2.statuses.testsets[1])))
+        full = sprint(show, first(YATF.Private.collect_failures(run2.statuses.testsets[1])))
         @test occursin("runitem.jl", full)               # kept when asked for
         @test length(split(full, '\n')) > length(split(trimmed, '\n'))
+    end
+
+    @testset "so does every one a testset inside the item records" begin
+        # `Test` formats these backtraces itself, and cuts them only where Julia's
+        # REPL entered the code, so each way an error reaches a report is its own case.
+        dir = make_pkg("NestedErrors", "test/n_test.jl" => """
+        @testitem "outside any test" begin
+            @testset "inner" begin
+                error("thrown outside any test")
+            end
+        end
+        @testitem "inside a test" begin
+            @testset "inner" begin
+                @test error("thrown inside a test")
+            end
+        end
+        @testitem "in a task" begin
+            @testset "inner" begin
+                wait(Threads.@spawn error("thrown in a task"))
+            end
+        end
+        @testitem "while handling another" begin
+            @testset "inner" begin
+                try
+                    error("the first")
+                catch
+                    error("thrown while handling another")
+                end
+            end
+        end
+        """)
+        function reports(; kw...)
+            _, run, p = run_states(dir; logs=:issues, monitor=false, kw...)
+            return Dict(p.items.name[i] => sprint(show, only(YATF.Private.collect_failures(run.statuses.testsets[i])))
+                        for i in 1:nitems(p))
+        end
+        # A worker's frames lie beneath the item's; with no workers, this process's do.
+        beneath = ("runitem.jl", "serve_requests", "execute.jl", "_start")
+        # At the REPL, the REPL's own entry frame lies beneath all of this process's,
+        # and `Test` cuts there.
+        at_the_repl() = __repl_entry_simulated(() -> reports(; workers=0))
+        for shown in (reports(; workers=1), reports(; workers=0), at_the_repl())
+            for (item, message) in ("outside any test" => "thrown outside any test",
+                                    "inside a test" => "thrown inside a test",
+                                    "in a task" => "thrown in a task",
+                                    "while handling another" => "thrown while handling another")
+                @test occursin(message, shown[item])
+                @test occursin("n_test.jl", shown[item])   # the item's own frames stay
+                @test !any(f -> occursin(f, shown[item]), beneath)
+            end
+            # The task's own frames are shown under the failure that waited on it,
+            # and the first error under the second, each with frames of its own.
+            @test occursin("nested task error", shown["in a task"])
+            @test occursin(r"caused by: the first(.|\n)*n_test\.jl", shown["while handling another"])
+        end
+        # Asked for, the worker's frames are kept. Not under an error inside a `@test`:
+        # `Test` cuts that one at the test itself, whatever runs beneath.
+        full = reports(; workers=1, full_stacktraces=true)
+        @test occursin("runitem.jl", full["outside any test"]) && occursin("runitem.jl", full["in a task"])
     end
 
     @testset "skip is honoured, statically and dynamically" begin

@@ -3,7 +3,7 @@
 # parser, same evaluator, same environment — because an item that behaves one way
 # when pasted and another when scheduled is worse than one that cannot be pasted.
 
-using YATF: activate, deactivate, is_activated, ScanFailure, ConfigError,
+using YATF.Private: activate, deactivate, is_activated, ScanFailure, ConfigError,
             collect_failures, PASSED, FAILED, SKIPPED, ERRORED
 using YATFWorkers: state_of
 using Logging: Logging
@@ -261,7 +261,7 @@ end
     # a worker, which is exactly what those two need.
 
     @testset "the warning covers only what a sandbox cannot supply" begin
-        ignored(sandboxed) = [k for (k, _) in YATF.repl_ignored(sandboxed)]
+        ignored(sandboxed) = [k for (k, _) in YATF.Private.repl_ignored(sandboxed)]
         @test :timeout in ignored(false)
         @test :retries in ignored(false)
         @test :timeout ∉ ignored(true)
@@ -304,7 +304,7 @@ end
                 sleep(30)
                 @test true
             end)
-            @test_throws YATF.TimeoutException Core.eval(Main, ex)
+            @test_throws YATF.Private.TimeoutException Core.eval(Main, ex)
         end
     end
 end

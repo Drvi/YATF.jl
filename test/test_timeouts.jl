@@ -2,7 +2,7 @@
 # a profile's `init` and `test_end` expressions are the suite's own code, run on
 # the same worker, and each is timed against a limit of its own.
 
-using YATF: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
+using YATF.Private: PASSED, FAILED, ERRORED, TIMEDOUT, UNSEEN, collect_failures, report,
             without_enclosing_testset
 
 @testset "timeouts" begin
@@ -183,13 +183,13 @@ end
     # Whatever the process prints on its way down — a signal, a backtrace — is the
     # worker's, not the item's. This item prints nothing of its own, so a line
     # attributed to it would be a line attributed wrongly.
-    @test !any(l -> startswith(l, YATF.MARK_ITEM * " w"), lines)
-    @test any(l -> occursin(YATF.MARK_WORKER, l) && occursin("KILL", l), lines)
+    @test !any(l -> startswith(l, YATF.Private.MARK_ITEM * " w"), lines)
+    @test any(l -> occursin(YATF.Private.MARK_WORKER, l) && occursin("KILL", l), lines)
     # It is filed with the item rather than printed across the run: the only worker
     # lines left are the lifecycle words, and the rest went where the report for
     # this item will find it.
     lifecycle = l -> any(w -> occursin(w, l), ("UP", "EXIT", "KILL", "LOST"))
-    @test all(lifecycle, filter(l -> occursin(YATF.MARK_WORKER, l), lines))
+    @test all(lifecycle, filter(l -> occursin(YATF.Private.MARK_WORKER, l), lines))
     # Windows ends a process with TerminateProcess, which prints nothing on the way.
     Sys.iswindows() || @test occursin("Captured logs", out)
 end
@@ -211,10 +211,10 @@ end
         with_runstate_dir() do _
             t0 = time()
             err, out = capture_run() do
-                Base.ScopedValues.with(YATF.STALL_LIMIT_OVERRIDE => 3.0) do
-                    p, target = YATF.prepare((dir,); workers, logs=:issues, monitor=true, announce=false)
+                Base.ScopedValues.with(YATF.Private.STALL_LIMIT_OVERRIDE => 3.0) do
+                    p, target = YATF.Private.prepare((dir,); workers, logs=:issues, monitor=true, announce=false)
                     try
-                        YATF.execute(p, target)
+                        YATF.Private.execute(p, target)
                         nothing
                     catch e
                         e
@@ -222,12 +222,12 @@ end
                 end
             end
             # Seconds after the last item finished, not the two minutes the other sleeps.
-            @test err isa YATF.RunStalled
+            @test err isa YATF.Private.RunStalled
             @test time() - t0 < 60
             @test occursin("stopping the run as hung", out)
             @test occursin("stopped as hung after", out)
             # What was running is timed out, and says why; what finished stands.
-            rs = YATF.read_run_state(only(YATF.runstate_files(dir)))
+            rs = YATF.Private.read_run_state(only(YATF.Private.runstate_files(dir)))
             state(name) = rs.statuses[findfirst(it -> it.name == name, rs.items)].state
             @test state("quick") === PASSED
             @test state("outlasts the limit") === TIMEDOUT

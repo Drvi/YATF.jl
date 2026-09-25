@@ -145,7 +145,7 @@ end
 
 # An item's RUN or DONE line: one item, so no count, and a name column its own width.
 say(item::RawItem, target, attempt, how) = (println(stdout, item_line(
-    nothing, 1, 0, item.name, quoted_width(item.name), attempt, 1, something(how, item_location(item, target))
+    nothing, 1, 0, repr(item.name), quoted_width(item.name), attempt, 1, something(how, item_location(item, target))
 )); flush(stdout))
 
 # A pasted item's file may be `REPL[3]`, `none` or a notebook cell; only a real path
