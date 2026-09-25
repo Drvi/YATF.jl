@@ -47,6 +47,7 @@ include("runstate.jl")
 include("report.jl")
 include("platform.jl")
 include("monitor.jl")
+include("coverage.jl")
 include("execute.jl")
 include("interactive.jl")
 include("debug.jl")
@@ -83,7 +84,9 @@ framework's own frames in a failing item's stacktrace; trimmed by default), `see
 given, and printed at the start of the run).
 
 Output: `logs` (`:issues`, `:batched`, `:eager`), `report`, `verbose`,
-`monitor`, `monitor_interval`, `testset_name`.
+`monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
+`src/` and `ext/` the workers run, merged into `lcov.info` at the package's root;
+also `YATF_COVERAGE`, which a keyword overrides and which overrides the file).
 
 State: `dry_run` prints the plan and runs nothing. `replay` names a run state (one
 downloaded from CI, say) and runs it again: the same items, settings, profiles

@@ -409,10 +409,10 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test w["slow thing"] == "[order] first"
         @test w["add works"] == "failed in the last run"
         @test w["mul works"] == "failed 3 runs ago"
-        @test w["uses setup"] == "long, est 1m40.0s"
+        @test w["uses setup"] == "long: est 1m40.0s"
         # A file written since the newest run started: its items come early too.
         w = whys(make_plan(; history = History(Dict{String, Float64}(), Dict{String, Int}(), 1.0)))
-        @test w["add works"] == "file changed since the last run"
+        @test w["add works"] == "file changed since last"
 
         dir = make_pkg("Placed",
             "test/p_test.jl" => """
@@ -432,6 +432,47 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test w["in its own process"] == "sandbox"
         @test w["last of all"] == "[order] last"
         @test w["in file order"] == ""
+    end
+
+    @testset "a chain's reason is its own, naming the member it is owed to" begin
+        # A chain split across two files, a single item, and filler for the share.
+        dir = make_pkg(
+            "ChainWhy",
+            "test/a_test.jl" => declared("c1", "c2"; opts = "chain=:c"),
+            "test/d_test.jl" => declared("c3"; opts = "chain=:c"),
+            "test/b_test.jl" => declared("solo"),
+            "test/f_test.jl" => declared("f1", "f2", "f3", "f4"),
+        )
+        seconds = Dict("c1" => 2.0, "c2" => 2.0, "c3" => 2.0, "solo" => 10.0,
+                       "f1" => 0.5, "f2" => 0.5, "f3" => 0.5, "f4" => 0.5)
+        # What the dry run's column says, row by row: a chain's on its first row only.
+        function why_column(history)
+            p = plan_dir(dir; history)
+            return Dict(p.items.name[i] => (i == first(p.units.span[p.items.unit[i]]) ?
+                                            YATF.Private.why_text(p, p.items.unit[i]) : "")
+                        for i in 1:nitems(p))
+        end
+        w = why_column(History(seconds, Dict("c3" => 0), 0.0))
+        @test w["c1"] == "\"c3\" failed in the last run"
+        @test w["c2"] == "" && w["c3"] == ""
+        @test why_column(History(seconds, Dict("c3" => 1), 0.0))["c1"] == "\"c3\" failed 2 runs ago"
+        # The first member itself: nothing to name.
+        @test why_column(History(seconds, Dict("c1" => 0), 0.0))["c1"] == "failed in the last run"
+        # Long by the chain's total, though each member is short.
+        w = why_column(History(merge(seconds, Dict("solo" => 4.0)), Dict{String, Int}(), 0.0))
+        @test w["c1"] == "long: est 6.0s (chain: `c`)"
+        @test w["solo"] == "long: est 4.0s"
+        # Written since the newest run: the file, which need not be the first member's.
+        since = maximum(mtime, readdir(joinpath(dir, "test"); join = true))
+        sleep(0.05)
+        touch(joinpath(dir, "test", "d_test.jl"))
+        @test why_column(History(seconds, Dict{String, Int}(), since))["c1"] ==
+              "$(joinpath("test", "d_test.jl")) changed since last"
+        # Pinned by the member `[order]` names.
+        write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"c2\"]\n")
+        @test why_column(History(seconds, Dict{String, Int}(), 0.0))["c1"] == "[order] first names \"c2\""
+        write(joinpath(dir, "test", "TestItems.toml"), "[order]\nfirst = [\"c1\"]\n")
+        @test why_column(History(seconds, Dict{String, Int}(), 0.0))["c1"] == "[order] first"
     end
 
     @testset "the table is in the order the run would start the items, and says where" begin

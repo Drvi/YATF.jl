@@ -28,6 +28,7 @@ function plan_block(p::Plan, order)
         println(io, "timeout: ", cfg.timeout_s, "s · retries: ", cfg.retries, " · failfast: ", cfg.failfast,
                 " · logs: ", cfg.logs, " · memory_threshold: ", cfg.memory_threshold)
         print_profiles(io, p)
+        print_coverage_setting(io, p.cfg)
         estimated = any(>(0), p.units.est_s)
         if !single_process(p)
             estimated && println(io, "estimated work: ",
@@ -118,18 +119,31 @@ est_text(s::Real) = s < 1 ? string(round(s; sigdigits = 2), "s") : fmt_seconds(s
     why_text(p, u) -> String
 
 Why unit `u` is handed out where it is, for the dry run: empty for a unit in its
-worker's stretch, where file order put it.
+worker's stretch, where file order put it. It is shown on the unit's first item, so
+a chain placed for another of its members names that member, and a chain's changed
+file is named, since its members can be in several.
 """
 function why_text(p::Plan, u::UnitIdx)
     why = p.units.why[u]
-    why === PINNED_FIRST && return "[order] first"
-    why === PINNED_LAST && return "[order] last"
+    span = p.units.span[u]
+    chain = p.units.chain[u]
+    name(i) = repr(p.items.name[i])
+    if why === PINNED_FIRST || why === PINNED_LAST
+        which, listed = why === PINNED_FIRST ? ("first", p.cfg.order_first) : ("last", p.cfg.order_last)
+        # The member listed earliest is the one that set the chain's place.
+        i = argmin(i -> something(findfirst(==(p.items.name[i]), listed), typemax(Int)), span)
+        return i == first(span) ? "[order] $which" : string("[order] ", which, " names ", name(i))
+    end
     why === SANDBOXED && return "sandbox"
-    why === LONG && return string("long, est ", est_text(p.units.est_s[u]))
+    why === LONG && return string("long: est ", est_text(p.units.est_s[u]),
+                                  chain === NO_CHAIN ? "" : string(" (chain: `", chain, "`)"))
     why === RECENT || return ""
-    ago = p.units.failed_ago[u]
-    failed = ago < 0 ? "" : ago == 0 ? "failed in the last run" : string("failed ", ago + 1, " runs ago")
-    changed = p.units.changed[u] ? "file changed since the last run" : ""
+    ago, f = p.units.failed_ago[u], p.units.failed_item[u]
+    failed = ago < 0 ? "" : string(f == first(span) ? "" : string(name(f), " "),
+                                   ago == 0 ? "failed in the last run" : string("failed ", ago + 1, " runs ago"))
+    c = p.units.changed_item[u]
+    changed = c == 0 ? "" : chain === NO_CHAIN ? "file changed since last" :
+        string(p.relfiles[p.items.fileidx[c]], " changed since last")
     return join(filter(!isempty, [failed, changed]), ", ")
 end
 
@@ -518,6 +532,7 @@ function print_run_header(run)
         println(io, "env: ", something(Base.active_project(), "none"))
         print_startup(io, p.startup)
         print_profiles(io, p)
+        print_coverage_setting(io, p.cfg)
     end
     print_yatf_block(run, head, body)
     return nothing
@@ -610,6 +625,7 @@ function print_conclusion(run, ended::Symbol = :finished)
     )
     body = styled() do io
         run.monitor === nothing || print_memory_summary(io, run.monitor; indent = "")
+        run.coverage === nothing || print_coverage(io, run.coverage, p.root)
         if run.runstate !== nothing
             print(io, "run state: ")
             printstyled(io, run.runstate.path; color = :light_black)

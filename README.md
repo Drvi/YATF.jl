@@ -177,6 +177,7 @@ given.
 | `full_stacktraces` | keep YATF's own frames in a failing item's backtrace |
 | `full_names` | write every item's name whole, where by default one much longer than the rest is shortened to a prefix of its own (see [The plan](#the-plan)) |
 | `testset_name` | what the run's testset is called in the summary; `"YATF"` by default. Runs of several calls under one `@testset` are told apart by it |
+| `coverage` | count which lines of `src/` and `ext/` the items run, into `lcov.info` at the package's root; also `YATF_COVERAGE` (see [Coverage](#coverage)) |
 | `seed` | where every item's random numbers start, with its name; random unless given, and printed at the start of the run |
 | `dry_run` | print the plan and run nothing |
 | `replay` | run a recorded run again (see [Run state](#run-state)) |
@@ -187,6 +188,42 @@ a keyword given to `runtests` wins over the file.
 With `workers = 0` the items run in this process, one after another. An item that
 needs a process of its own (`sandbox=true`, or a profile) still gets one, started
 and stopped around it, and the run lists which items did.
+
+### Coverage
+
+`coverage = true`, as a keyword, as `YATF_COVERAGE=true` in the environment, or
+under `[run]` in `TestItems.toml`, has every worker count which lines of the
+package's `src/` and `ext/` run. A keyword wins over the variable, and the variable
+over the file; the run's opening block says which of them decided. At the end the
+workers' counts are merged into `lcov.info` at the package's root, with paths
+relative to it, ready for Codecov or Coveralls. Every line of a function that never
+ran counts as not covered, in a file that was never loaded too, and the closing
+block gives the share that ran:
+
+<pre>
+<b>│ </b>coverage: 33.3% of 6 lines in 2 files · lcov.info
+</pre>
+
+Coverage is counted by the workers, so it needs one (`workers = 0` is an error).
+A worker writes what it counted as it exits, a timed-out one included, so a worker
+that dies without exiting, one killed outright or one that crashed, takes its
+counts with it; the closing block says how many did. On Windows a timed-out worker
+is terminated outright too. A report that cannot be written is said there as well,
+and the run's result stands.
+
+Under `Pkg.test(coverage = true)`, which is what `julia-actions/julia-runtest` does,
+the workers take Julia's coverage flags from the test process and write `.cov`
+files beside the sources, as the test process does, for `julia-processcoverage` to
+merge; nothing needs setting. To upload the merged file instead:
+
+```yaml
+- uses: julia-actions/julia-runtest@v1
+  env:
+    YATF_COVERAGE: true
+- uses: codecov/codecov-action@v5
+  with:
+    files: lcov.info
+```
 
 ## The plan
 

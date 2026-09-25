@@ -5,6 +5,32 @@
 
 using YATF.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
 
+# A chain member that takes long enough for an overlap to show, and records when it
+# ended as well as when it started; `before` runs first.
+chain_link(name; chain::Symbol, before="") = journal_item(name; opts="chain=:$chain", body=before * """
+    sleep(0.2)
+    open(joinpath(ENV["YATF_JOURNAL"], string(time_ns(), "-", getpid(), "-end")), "w") do io
+        println(io, $(repr(name * " end")), "\\t", getpid(), "\\t", time())
+    end
+    @test true
+    """)
+
+# The chain `links` ran in one process, each member starting after the one before
+# it ended: by the worker's clock, in the journal, and by the coordinator's, in the
+# dispatch time and duration it recorded.
+function check_ran_in_sequence(rows, run, p, links)
+    ours = [r for r in rows if r.name in links || r.name in (l * " end" for l in links)]
+    @test [r.name for r in ours] == collect(Iterators.flatten((l, l * " end") for l in links))
+    @test length(unique(r.pid for r in ours)) == 1
+    idx = [findfirst(==(l), p.items.name) for l in links]
+    st = run.statuses
+    @test allequal(st.slot[i] for i in idx)
+    @test all(i -> st.pid[i] == first(ours).pid, idx)
+    for (a, b) in zip(idx, idx[2:end])
+        @test st.start[b] >= st.start[a] + st.elapsed[a] - 1e-3
+    end
+end
+
 @testset "sandboxes, chains and order" begin
     @testset "a sandboxed item has its process to itself" begin
         dir = make_pkg("Alone", "test/t_test.jl" => string(
@@ -276,49 +302,65 @@ using YATF.Private: PASSED, ERRORED, TIMEDOUT, BROKEN_CHAIN, nitems
         @test slot_of("left over") != slot_of("slow one")
     end
 
-    @testset "a stolen chain moves whole" begin
-        # Two files are two affinity groups, so two slots get one each. The slot
-        # holding the single quick item drains at once and steals from the tail of
-        # the other queue, which is where the chain is. What it must take is the
-        # whole chain: the members may not run at the same time as each other, and
-        # two workers holding two halves is exactly that.
-        #
-        # "filler one" holds its worker until the other slot has taken some of the
-        # queue behind it, and "solo" holds that slot until "filler one" is running,
-        # so there is always a queue to take from, whichever worker starts first.
-        behind = ["filler two", "filler three", "tail chain one", "tail chain two", "tail chain three"]
+    @testset "a chain stolen from the end of a queue moves whole" begin
+        # Two files are two affinity groups, so each of two slots gets one. The slot
+        # holding "solo" drains first and takes the second half of what the other
+        # has left, which always holds that queue's last unit: the chain. "filler
+        # one" holds its slot until the chain's last member has started elsewhere,
+        # so the chain is taken on every run, and never taken back. Behind "filler
+        # one" are "filler two" and the chain: as one unit the chain is the half
+        # taken, where three units of their own would be split, two and one.
+        links = ["tail chain one", "tail chain two", "tail chain three"]
         dir = make_pkg(
             "StolenChain",
             "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["filler one"]) * "@test true"),
             "test/b_test.jl" => string(
-                journal_item("filler one"; body=started_elsewhere(behind) * "@test true"),
+                journal_item("filler one"; body=started_elsewhere(["tail chain three"]) * "@test true"),
                 journal_item("filler two"),
-                journal_item("filler three"),
-                journal_item("tail chain one"; opts="chain=:t"),
-                journal_item("tail chain two"; opts="chain=:t"),
-                journal_item("tail chain three"; opts="chain=:t"),
+                (chain_link(l; chain=:t) for l in links)...,
             ),
         )
-        rows, run, p = with_journal() do path
+        rows, run, p, gave_up = with_journal() do path
             states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
             @test all(==(PASSED), values(states))
-            journal(path), run, p
+            journal(path), run, p, isfile(joinpath(path, "gave-up"))
         end
-
-        # The slot the planner gave each item, against the slot that ran it.
+        @test !gave_up          # each hold was released by the move it waited for
         planned(i) = findfirst(r -> p.items.unit[i] in r, p.slot_units)
-        stolen = [i for i in 1:nitems(p) if run.statuses.slot[i] != planned(i)]
-        @test !isempty(stolen)            # otherwise this test proves nothing
+        chain = [findfirst(==(l), p.items.name) for l in links]
+        @test all(i -> run.statuses.slot[i] != planned(i), chain)   # the chain itself moved
+        check_ran_in_sequence(rows, run, p, links)
+    end
 
-        chain = [r for r in rows if startswith(r.name, "tail chain")]
-        @test length(chain) == 3
-        # One process ran all three, in order: a split chain is two pids.
-        @test length(unique(r.pid for r in chain)) == 1
-        @test [r.name for r in chain] == ["tail chain one", "tail chain two", "tail chain three"]
-        # ...and every member moved together, whether or not it was the chain that
-        # was stolen.
-        chain_idx = [i for i in 1:nitems(p) if startswith(p.items.name[i], "tail chain")]
-        @test length(unique(run.statuses.slot[i] for i in chain_idx)) == 1
+    @testset "a slot looking for work never takes the rest of a running chain" begin
+        # The chain is the first unit of its slot's queue, claimed whole as it
+        # starts. "chain one" holds its worker until a filler has started
+        # elsewhere, so the other slot, freed by "solo", goes looking for work in
+        # this queue while the chain is under way: it finds the fillers, and never
+        # the chain's later members.
+        links = ["chain one", "chain two", "chain three"]
+        fillers = ["filler one", "filler two"]
+        dir = make_pkg(
+            "RunningChain",
+            "test/a_test.jl" => journal_item("solo"; body=started_elsewhere(["chain one"]) * "@test true"),
+            "test/b_test.jl" => string(
+                chain_link("chain one"; chain=:r, before=started_elsewhere(fillers)),
+                chain_link("chain two"; chain=:r),
+                chain_link("chain three"; chain=:r),
+                (journal_item(f) for f in fillers)...,
+            ),
+        )
+        rows, run, p, gave_up = with_journal() do path
+            states, run, p = run_states(dir; workers=2, logs=:issues, monitor=false)
+            @test all(==(PASSED), values(states))
+            journal(path), run, p, isfile(joinpath(path, "gave-up"))
+        end
+        @test !gave_up
+        planned(i) = findfirst(r -> p.items.unit[i] in r, p.slot_units)
+        at(name) = findfirst(==(name), p.items.name)
+        @test any(f -> run.statuses.slot[at(f)] != planned(at(f)), fillers)   # work was taken
+        @test all(l -> run.statuses.slot[at(l)] == planned(at(l)), links)     # but not the chain
+        check_ran_in_sequence(rows, run, p, links)
     end
 
     @testset "[order] moves the chain an item belongs to, not just the item" begin

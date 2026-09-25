@@ -64,6 +64,39 @@ end
         end
     end
 
+    @testset "coverage comes from the keyword, then YATF_COVERAGE, then the file, and says which" begin
+        withenv("YATF_COVERAGE" => nothing) do
+            cfg = read_config(mktempdir())
+            @test !cfg.coverage && cfg.coverage_source == ""          # the default says nothing
+            with_toml("[run]\ncoverage = true\n") do dir
+                cfg = read_config(dir)
+                @test cfg.coverage && endswith(cfg.coverage_source, "TestItems.toml")
+                # `nothing` is no choice: the file's stands.
+                @test read_config(dir; coverage = nothing).coverage
+                withenv("YATF_COVERAGE" => "false") do
+                    cfg = read_config(dir)
+                    @test !cfg.coverage && cfg.coverage_source == "`YATF_COVERAGE`"
+                    @test !read_config(dir; coverage = nothing).coverage
+                    cfg = read_config(dir; coverage = true)
+                    @test cfg.coverage && cfg.coverage_source == "the `coverage` keyword"
+                end
+            end
+            withenv("YATF_COVERAGE" => "yes") do
+                @test read_config(mktempdir()).coverage
+                @test !read_config(mktempdir(); coverage = false).coverage
+            end
+            withenv("YATF_COVERAGE" => "maybe") do
+                err = try; read_config(mktempdir()); catch e; e; end
+                @test err isa ConfigError
+                @test occursin("`YATF_COVERAGE` must be true or false", sprint(showerror, err))
+            end
+            # A process's coverage is set when it starts, so it takes a worker.
+            err = try; read_config(mktempdir(); coverage = true, workers = 0); catch e; e; end
+            @test err isa ConfigError
+            @test occursin("`workers = 0` runs the items in this one", sprint(showerror, err))
+        end
+    end
+
     @testset "a testset name is a non-empty string" begin
         @test read_config(mktempdir(); testset_name = "integration").testset_name == "integration"
         for bad in ("", 3)

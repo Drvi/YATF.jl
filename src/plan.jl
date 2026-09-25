@@ -57,7 +57,8 @@ struct Units
     est_s::Vector{Float64}
     why::Vector{Why}            # where `order_pool!` put it, and so why
     failed_ago::Vector{Int32}   # runs since a member last did not pass, -1 for none recorded
-    changed::Vector{Bool}       # a member's file was written since the newest recorded run
+    failed_item::Vector{ItemIdx}    # that member, 0 for none
+    changed_item::Vector{ItemIdx}   # a member whose file was written since the newest recorded run, 0 for none
 end
 
 Base.length(u::Units) = length(u.span)
@@ -237,14 +238,15 @@ mutable struct UnitDraft
     key::Tuple{Int, Int, Float64, String, Int32}   # its place in its pool; see `order_pool!`
     why::Why
     failed_ago::Int32
-    changed::Bool
+    failed_at::Int    # which of `items` failed most recently, 0 for none
+    changed_at::Int   # which of `items` has a file written since the newest run, 0 for none
 end
 
 function build_units(raw::Vector{RawItem}, profile_idx, history::History)
     draft(its, exclusive, chain) = UnitDraft(
         its, profile_idx[its[1].profile], exclusive, chain,
         sum(it -> get(history.seconds, it.name, 0.0), its; init = 0.0), (0, 0, 0.0, "", Int32(0)),
-        IN_FILE_ORDER, Int32(-1), false
+        IN_FILE_ORDER, Int32(-1), 0, 0
     )
     chains = Dict{Symbol, Vector{RawItem}}()
     units = UnitDraft[]
@@ -352,10 +354,11 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, c
         d = units[u]
         p = minimum(it -> get(pin, it.name, 0), d.items)
         at = (d.items[1].file, d.items[1].line)
-        ago = minimum(it -> get(history.failed, it.name, typemax(Int)), d.items)
+        ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
         d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)
-        d.changed = any(it -> it.file in changed, d.items)
-        urgency = d.changed ? 0 : ago
+        d.failed_at = ago == typemax(Int) ? 0 : k
+        d.changed_at = something(findfirst(it -> it.file in changed, d.items), 0)
+        urgency = d.changed_at > 0 ? 0 : ago
         d.why = p < 0 ? PINNED_FIRST : p > 0 ? PINNED_LAST : d.exclusive ? SANDBOXED :
             urgency < typemax(Int) ? RECENT :
             d.est_s >= LONG_FLOOR_S && d.est_s > share / 4 ? LONG : IN_FILE_ORDER
@@ -409,7 +412,7 @@ function materialize(
     files = String[]; fileids = Dict{String, Int32}()
     uspan = UnitRange{ItemIdx}[]; uprofile = ProfileIdx[]; uexcl = Bool[]
     uchain = Symbol[]; uest = Float64[]; ufile = Int32[]
-    uwhy = Why[]; uago = Int32[]; uchanged = Bool[]
+    uwhy = Why[]; uago = Int32[]; ufailed = ItemIdx[]; uchanged = ItemIdx[]
     all_setups = Symbol[]
     ps = Pool[]; slot_pool = Int32[]; slot_units = UnitRange{UnitIdx}[]; pending = Int32[]
     for (k, pool) in enumerate(pools)
@@ -434,7 +437,9 @@ function materialize(
             push!(uspan, ifirst:ItemIdx(length(name)))
             push!(uprofile, d.profile); push!(uexcl, d.exclusive)
             push!(uchain, d.chain); push!(uest, d.est_s); push!(ufile, fileidx[ifirst])
-            push!(uwhy, d.why); push!(uago, d.failed_ago); push!(uchanged, d.changed)
+            push!(uwhy, d.why); push!(uago, d.failed_ago)
+            push!(ufailed, d.failed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.failed_at - 1))
+            push!(uchanged, d.changed_at == 0 ? ItemIdx(0) : ifirst + ItemIdx(d.changed_at - 1))
         end
         nhead = count(u -> units[u].key[1] in HEAD_CLASSES, pool)
         ntail = count(u -> units[u].key[1] == TAIL_CLASS, pool)
@@ -454,7 +459,7 @@ function materialize(
     )
     relfiles = String[relpath_or_path(f, root) for f in files]
     return Plan(
-        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, uchanged), files, relfiles,
+        items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, uchanged), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
         profiles, ps, slot_pool, slot_units, pending, sort!(unique!(all_setups)), cfg,
         String(root), Startup(), String(selection), suite_names

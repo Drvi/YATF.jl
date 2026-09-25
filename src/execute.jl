@@ -179,8 +179,11 @@ mutable struct Run
     const tasks::Vector{Task}
     # Workers `kill_workers!` took from their slots, for `shutdown!` to wait for.
     const killed::Vector{YATFWorkers.Worker}
-    # Guards `tasks` and `killed`, which the watchdog's timer uses as well.
+    # Guards `tasks`, `killed` and `item_pids`, which other tasks use as well.
     const lock::ReentrantLock
+    # Every process an attempt ran in: under coverage, each should leave a tracefile.
+    const item_pids::Set{Int32}
+    coverage::Union{Nothing, CoverageSummary}
 end
 
 """
@@ -201,8 +204,9 @@ function execute(p::Plan, target)
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"), column, names,
         ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0.0, false, Task[],
-        YATFWorkers.Worker[], ReentrantLock()
+        YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing
     )
+    cfg.coverage && mkpath(coverage_dir(logdir))
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
     for s in 1:nslots(p)
         push!(
@@ -269,6 +273,8 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                     set_phase!(run.monitor, PHASE_REPORT)
                     stop_monitor!(run.monitor)
                     shutdown!(run)
+                    # Every worker has exited, so every tracefile there will be is written.
+                    cfg.coverage && (run.coverage = collect_coverage(run))
                     run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
                     finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
                     # A replay deletes no run state, the one it runs least of all.
@@ -951,7 +957,8 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     for attempt in 1:(WORKER_START_RETRIES + 1)
         w = try
             YATFWorkers.Worker(;
-                julia_args = prof.julia_args,
+                julia_args = run.plan.cfg.coverage ?
+                    [prof.julia_args; coverage_flags(run.plan.root, coverage_dir(run.logdir))] : prof.julia_args,
                 threads = prof.threads,
                 extra_env = worker_env(run.runid, slot.id, get(run.profile_projects, slot.profile.name, Base.active_project()), slot.profile),
                 dir = target.root,
@@ -1323,6 +1330,7 @@ function began!(run::Run, i::ItemIdx, slot::SlotIdx, attempt::Int8, pid::Integer
     st = run.statuses
     st.start[i] = Float32(time() - run.t0)
     st.pid[i] = Int32(pid)
+    pid == 0 || @lock run.lock push!(run.item_pids, Int32(pid))
     pid == 0 || write_status!(run.runstate, i, RUNNING, attempt, slot; start_off = st.start[i], pid)
     return nothing
 end

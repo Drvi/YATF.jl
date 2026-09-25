@@ -51,6 +51,11 @@ Base.@kwdef struct RunConfig
     # What the run's testset is called in the summary; runs of several calls under
     # one `@testset` are told apart by it.
     testset_name::String = "YATF"
+    # Workers count which lines of the package's `src/` and `ext/` run, and the run
+    # merges what they counted into `lcov.info` at the package's root.
+    coverage::Bool = false
+    # What set `coverage`, for the run to say, or empty for the default.
+    coverage_source::String = ""
     monitor::Bool = true
     monitor_interval::Int = 30
     profiles::Dict{Symbol, Profile} = Dict(DEFAULT_PROFILE => Profile(DEFAULT_PROFILE))
@@ -69,7 +74,7 @@ end
 const RUN_KEYS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries,
     :failfast, :item_failfast, :logs, :report, :verbose, :memory_threshold,
-    :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :seed,
+    :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
 )
 const ORDER_KEYS = (:first, :last)
 const PROFILE_KEYS = (:julia_args, :threads, :env, :init, :test_end, :preferences)
@@ -119,6 +124,15 @@ function section(path, parent::AbstractDict, key::AbstractString, allowed::Tuple
     return t
 end
 
+# `true` or `false` from an environment variable, or `nothing` when it is unset or empty.
+function env_flag(name::AbstractString)
+    v = lowercase(strip(get(ENV, name, "")))
+    isempty(v) && return nothing
+    v in ("1", "true", "yes") && return true
+    v in ("0", "false", "no") && return false
+    throw(ConfigError("`$name` must be true or false (or 1, 0, yes, no), got $(repr(ENV[name]))"))
+end
+
 function build_config(path, toml; nunits = 0, kwargs...)
     for k in keys(kwargs)
         k in RUN_KEYS || throw(ConfigError("unknown keyword `$k`; the run settings are $(join(RUN_KEYS, ", "))"))
@@ -145,6 +159,18 @@ function build_config(path, toml; nunits = 0, kwargs...)
     seed = pick(:seed, 0)
     (seed isa Integer && seed >= 0) || throw(ConfigError("`seed` must be a non-negative integer, got $(repr(seed))"))
     order = section(path, toml, "order", ORDER_KEYS)
+    # A keyword, then the environment, then the file: CI switches coverage on for a
+    # job without editing the project.
+    env_coverage = env_flag("YATF_COVERAGE")
+    coverage, coverage_source =
+        get(kwargs, :coverage, nothing) !== nothing ? (kwargs[:coverage], "the `coverage` keyword") :
+        env_coverage !== nothing ? (env_coverage, "`YATF_COVERAGE`") :
+        haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
+    coverage isa Bool || throw(ConfigError("`coverage` must be true or false, got $(repr(coverage))"))
+    coverage && workers == 0 && throw(ConfigError(
+        "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
+            "whose coverage was fixed when it started; use one worker or more"
+    ))
     testset_name = pick(:testset_name, "YATF")
     (testset_name isa AbstractString && !isempty(testset_name)) ||
         throw(ConfigError("`testset_name` must be a non-empty string, got $(repr(testset_name))"))
@@ -158,7 +184,7 @@ function build_config(path, toml; nunits = 0, kwargs...)
         memory_threshold = mt, monitor = Bool(pick(:monitor, true)),
         full_stacktraces = Bool(pick(:full_stacktraces, false)),
         full_names = Bool(pick(:full_names, false)),
-        testset_name = String(testset_name),
+        testset_name = String(testset_name), coverage, coverage_source,
         monitor_interval = Int(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
         order_first = String[string(x) for x in get(order, "first", String[])],
