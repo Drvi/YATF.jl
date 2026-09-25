@@ -48,7 +48,8 @@ function debug_item(enter, name::Union{Nothing, String}, seed::Union{Nothing, In
         throw(ConfigError("YATF.debug looks for test items in a package, and there is no package here"))
     failure = name === nothing ? last_failure(target) : nothing
     item = find_item(target, failure === nothing ? name : failure.name)
-    prof = debug_profile(item, target)
+    # The profile a run would give the item, `[profiles.default]` included.
+    prof = interactive_profile(item, target)
     # A failure is stepped into with the seed of the run it happened in.
     runs = failure === nothing ? nothing : failure.seed
     run_seed = UInt64(something(seed, runs, rand(RandomDevice(), UInt64)))
@@ -56,7 +57,7 @@ function debug_item(enter, name::Union{Nothing, String}, seed::Union{Nothing, In
     return with_interactive_env(target) do
         withenv(prof.env...) do
             isempty(prof.init.args) || Core.eval(Main, Expr(:block, prof.init.args...))
-            spec = interactive_spec(item, target, item_seed(run_seed, item.name))
+            spec = interactive_spec(item, target, 1, item_seed(run_seed, item.name))
             say(item, target, 1, nothing)
             # The item's testset prints its own summary as it finishes; a `test_end`
             # that then fails is nested under it, and said here.
@@ -87,29 +88,24 @@ timed out, the one that finished last; `others` are the rest, most recent first.
 recorded or the last one had no failures.
 """
 function last_failure(target)
-    here = project_id(target.root)
-    for path in Iterators.reverse(runstate_files(target.root))
-        rs = read_run_state(path)
-        # A dry run ran nothing, and a directory shared by several projects holds
-        # other projects' runs.
-        (rs === nothing || rs.dry_run || get(rs.meta, "project_id", "") != here) && continue
-        failed = filter(i -> rs.statuses[i].state in STEPPABLE, eachindex(rs.statuses))
-        isempty(failed) && throw(
-            NoTestsError(
-                "the last recorded run of this project had no failures to step into; " *
-                    "name an item instead: `YATF.debug(\"name\")`"
-            )
-        )
-        sort!(failed; by = i -> rs.statuses[i].start_off + rs.statuses[i].elapsed, rev = true)
-        names = [rs.items[i].name for i in failed]
-        return (; name = first(names), others = names[2:end], seed = tryparse(UInt64, get(rs.meta, "seed", "")))
-    end
-    throw(
+    runs = recent_runs(target.root, 1)
+    isempty(runs) && throw(
         NoTestsError(
             "no run of this project is recorded, so there is no failure to step into; " *
                 "run its tests first, or name an item: `YATF.debug(\"name\")`"
         )
     )
+    rs = last(only(runs))
+    failed = filter(i -> rs.statuses[i].state in STEPPABLE, eachindex(rs.statuses))
+    isempty(failed) && throw(
+        NoTestsError(
+            "the last recorded run of this project had no failures to step into; " *
+                "name an item instead: `YATF.debug(\"name\")`"
+        )
+    )
+    sort!(failed; by = i -> rs.statuses[i].start_off + rs.statuses[i].elapsed, rev = true)
+    names = [rs.items[i].name for i in failed]
+    return (; name = first(names), others = names[2:end], seed = tryparse(UInt64, get(rs.meta, "seed", "")))
 end
 
 # The item called `name`, from the whole suite read the way a run reads it.
@@ -128,11 +124,6 @@ function find_item(target, name::String)
         )
     )
 end
-
-# The profile a run would give the item, `[profiles.default]` included.
-debug_profile(item::RawItem, target) =
-    item.profile === DEFAULT_PROFILE ? read_config(target.testdir).profiles[DEFAULT_PROFILE] :
-    interactive_profile(item, target)
 
 # Said before the debugger takes the terminal: which item and why, whose seed, the
 # failures there are to step into instead, and what the item gets here that it

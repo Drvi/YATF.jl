@@ -98,6 +98,8 @@ end
     @testset "a worker evaluates, runs items, reports errors as text, and stops" begin
         out = IOBuffer()
         w = Worker(; threads="1", redirect_io=out)
+        # On Windows a worker is held in a job, which ends what it starts.
+        @test (w.job != C_NULL) == Sys.iswindows()
         try
             @test remote_fetch(w, :(global probe = 41)) === nothing
             err = try; remote_fetch(w, :(error("boom"))); catch e; e; end
@@ -213,20 +215,94 @@ end
             end
             @test occursin("live tasks", String(take!(out)))   # jl_print_task_backtraces ran on the worker
         end
+    end
 
-        @testset "killing a worker kills the processes its item started" begin
-            alive(pid) = ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == 0
-            pidfile = tempname()
+    # A process an item starts and does not wait for: `sleep` on Unix, where every
+    # machine has one; Windows has no such command, so Julia sleeps instead.
+    sleeper = Sys.iswindows() ? `$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"` : `sleep 600`
+    # `uv_kill` with signal 0 asks whether the process is there, on Windows too.
+    alive(pid) = ccall(:uv_kill, Cint, (Cint, Cint), pid, 0) == 0
+
+    @testset "a job ends every process it holds, one started inside it included" begin
+        if Sys.iswindows()
+            # A process that starts one of its own, says which, and waits. The job
+            # holds it before it has run a line: Julia's startup alone outlasts that.
+            script, pidfile = tempname() * ".jl", tempname()
+            write(script, """
+            p = run(`\$(Base.julia_cmd()) --startup-file=no -e "sleep(600)"`; wait=false)
+            write(ARGS[1], string(getpid(p)))
+            sleep(600)
+            """)
+            parent = run(`$(Base.julia_cmd()) --startup-file=no $script $pidfile`; wait=false)
+            job = YATFWorkers.worker_job(getpid(parent))
             child = 0
-            with_worker(; threads="1", redirect_io=IOBuffer()) do w
-                spec = probe_spec(:(begin write($pidfile, string(getpid(run(`sleep 600`; wait=false)))) end);
-                                  name="spawner")
-                fetch(remote_run(w, spec))
+            try
+                @test job != C_NULL
+                @test timedwait(() -> isfile(pidfile) && filesize(pidfile) > 0, 60) === :ok
                 child = parse(Int, read(pidfile, String))
                 @test alive(child)
+                YATFWorkers.end_job!(job)
+                job = C_NULL
+                @test timedwait(() -> !alive(child) && process_exited(parent), 10) === :ok
+            finally
+                YATFWorkers.end_job!(job)
+                child == 0 || ccall(:uv_kill, Cint, (Cint, Cint), child, Base.SIGKILL)
+                process_running(parent) && kill(parent, Base.SIGKILL)
             end
-            @test child != 0 && timedwait(() -> !alive(child), 5) === :ok
+        else
+            # A process group does this elsewhere, and there is no job to end.
+            @test YATFWorkers.worker_job(getpid()) == C_NULL
+            @test YATFWorkers.end_job!(C_NULL) === nothing
         end
+    end
+
+    @testset "killing a worker kills the processes its item started" begin
+        pidfile = tempname()
+        child = 0
+        with_worker(; threads="1", redirect_io=IOBuffer()) do w
+            spec = probe_spec(:(begin write($pidfile, string(getpid(run($sleeper; wait=false)))) end);
+                              name="spawner")
+            fetch(remote_run(w, spec))
+            child = parse(Int, read(pidfile, String))
+            @test alive(child)
+        end
+        @test child != 0 && timedwait(() -> !alive(child), 5) === :ok
+    end
+
+    # A worker that exits by itself: what its item left running holds the output
+    # pipe it inherited. On Unix `detach` puts the child in a session of its own,
+    # beyond the reach of the worker's process group; on Windows it stays in the
+    # worker's job.
+    function exits_leaving(spawn)
+        pidfile = tempname()
+        w = Worker(; threads="1", redirect_io=IOBuffer())
+        child = 0
+        try
+            fut = remote_eval(w, :(begin
+                child = run(pipeline($spawn; stdout=stdout, stderr=stderr); wait=false)
+                write($pidfile, string(getpid(child)))
+                exit(7)
+            end))
+            @test_throws WorkerTerminatedException fetch(fut)
+            child = parse(Int, read(pidfile, String))
+            # Waited for from a task of its own, so a wait that never ends fails
+            # this test rather than hanging it.
+            waiter = @async wait(w)
+            done = timedwait(() -> istaskdone(waiter), YATFWorkers.GRACEFUL_EXIT_SECONDS + 10) === :ok
+            return (; done, gone = timedwait(() -> !alive(child), 5) === :ok)
+        finally
+            child == 0 || ccall(:uv_kill, Cint, (Cint, Cint), child, Base.SIGKILL)
+        end
+    end
+
+    @testset "what a worker leaves running goes when it exits" begin
+        r = exits_leaving(sleeper)
+        @test r.done
+        @test r.gone
+    end
+
+    @testset "a process that left the worker's group cannot hold its teardown" begin
+        @test exits_leaving(detach(sleeper)).done
     end
 
     @testset "a worker nobody connects to exits on its own" begin

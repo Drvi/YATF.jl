@@ -288,7 +288,11 @@ end
 
 rstrip_path(p::AbstractString) = rstrip(p, PATH_SEPARATORS)
 
-_pkgdir(m::Module) = something(pkgdir(m), throw(ArgumentError("could not find a directory for module $m")))
+function _pkgdir(m::Module)
+    dir = pkgdir(m)
+    dir === nothing && throw(ArgumentError("could not find a directory for module $m"))
+    return dir
+end
 
 function split_line_suffix(path::AbstractString)
     m = match(r"^(.*\.jl):(\d+)$", path)

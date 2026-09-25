@@ -89,6 +89,8 @@ end
                 err = try; read_config(mktempdir()); catch e; e; end
                 @test err isa ConfigError
                 @test occursin("`YATF_COVERAGE` must be true or false", sprint(showerror, err))
+                # The keyword decides, so the variable is not read, and cannot fail.
+                @test !read_config(mktempdir(); coverage = false).coverage
             end
             # A process's coverage is set when it starts, so it takes a worker.
             err = try; read_config(mktempdir(); coverage = true, workers = 0); catch e; e; end
@@ -138,7 +140,10 @@ end
                      "[run]\nworkers = \"most\"\n", "[run]\nmonitor_interval = -5\n",
                      "[run]\nmonitor_interval = nan\n", "[run]\ntimeout = inf\n",
                      "[run]\ntimeout = 1e12\n", "[run]\nretries = 1000\n", "[run]\nretries = 1.5\n",
-                     "[run]\ninit_timeout = nan\n")
+                     "[run]\ninit_timeout = nan\n", "[run]\nworkers = 2.5\n", "[run]\nworkers = 40000\n",
+                     "[run]\nfailfast = 1\n", "[run]\nverbose = \"yes\"\n", "[run]\nseed = -1\n",
+                     "[run]\nmemory_threshold = \"high\"\n", "[run]\nthreads = \"x\"\n",
+                     "[run]\nthreads = \"0\"\n", "[profiles.p]\nthreads = \"4,1,1\"\n")
             with_toml(toml) do dir
                 @test_throws ConfigError read_config(dir)
             end
@@ -150,6 +155,13 @@ end
             @test_throws r"`retries` must be an integer from 0 to 126, got 127" read_config(dir; retries = 127)
             @test read_config(dir; retries = 126).retries == 126
             @test read_config(dir; timeout = 1.5).timeout_s == 2
+            @test_throws r"`seed` must be an integer from 0 to" read_config(dir; seed = big(2)^70)
+            @test_throws r"`threads` must be what `--threads` takes" read_config(dir; threads = "2, 1")
+            # Every form `--threads` takes, and a number for one.
+            for t in ("4", "4,1", "4,0", "auto", "auto,1", "4,auto")
+                @test read_config(dir; threads = t).threads == t
+            end
+            @test read_config(dir; threads = 4).threads == "4"
         end
     end
 

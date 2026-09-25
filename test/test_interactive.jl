@@ -226,6 +226,54 @@ const DEPS = fixture("TestDeps.jl")
         end
     end
 
+    # What follows is what a run does for a sandboxed item, and a pasted one has to
+    # do the same: the default profile from TestItems.toml, a profile's preferences,
+    # its `test_end`'s verdict.
+    @testset "sandbox=true runs under [profiles.default]" begin
+        dir = make_pkg("PastedDefault", "test/TestItems.toml" => "[profiles.default.env]\nYATF_PASTED_FLAG = \"configured\"\n")
+        with_activated(dir) do _
+            ts, _ = capture_run() do
+                @testitem "pasted default profile" sandbox=true begin
+                    @test get(ENV, "YATF_PASTED_FLAG", "unset") == "configured"
+                end
+            end
+            @test state_of(ts) === PASSED
+        end
+    end
+
+    @testset "a pasted profile's preferences reach its worker" begin
+        dir = make_pkg("PastedPrefs", "test/prefs.toml" => "[PastedPrefs]\nmode = \"fast\"\n",
+                       "test/TestItems.toml" => "[profiles.tuned]\npreferences = \"prefs.toml\"\n")
+        uuid = YATF.Private.TOML.parsefile(joinpath(dir, "Project.toml"))["uuid"]
+        with_activated(dir) do _
+            ts, _ = capture_run() do
+                Core.eval(Main, :(@testitem "pasted preferences" sandbox=:tuned begin
+                    @test get(Base.get_preferences(Base.UUID($uuid)), "mode", "unset") == "fast"
+                end))
+            end
+            @test state_of(ts) === PASSED
+        end
+    end
+
+    @testset "a pasted profile's test_end counts, and a skipped item runs none" begin
+        dir = make_pkg("PastedEnd", "test/TestItems.toml" => "[profiles.checked]\ntest_end = \"@test false\"\n")
+        with_activated(dir) do _
+            failed, _ = capture_run() do
+                @testitem "pasted checked" sandbox=:checked begin
+                    @test true
+                end
+            end
+            skipped, _ = capture_run() do
+                @testitem "pasted checked skip" sandbox=:checked skip=true begin
+                    @test true
+                end
+            end
+            @test state_of(failed) === YATF.Private.FAILED
+            @test length(collect_failures(failed)) == 1
+            @test isempty(collect_failures(skipped))   # the hook's `@test false` never ran
+        end
+    end
+
     @testset "a sandbox profile that does not exist says so" begin
         with_activated(DEPS) do _
             err = try
@@ -295,6 +343,26 @@ end
                 @test isempty(collect_failures(ts))
             end
         end
+        end
+    end
+
+    @testset "a retry knows it is one, and draws the numbers the first attempt drew" begin
+        with_activated(DEPS) do _
+            log = tempname()
+            withenv("YATF_ATTEMPTS" => log) do
+                ts, _ = capture_run() do
+                    # The fixture's workers load YATFWorkers, not YATF.
+                    @testitem "paste attempts" retries=1 sandbox=true begin
+                        attempt = Main.YATFWorkers.current_testitem().attempt
+                        open(io -> println(io, attempt, " ", rand(UInt64)), ENV["YATF_ATTEMPTS"], "a")
+                        @test attempt == 2
+                    end
+                end
+                @test state_of(ts) === PASSED
+            end
+            attempts = split.(readlines(log))
+            @test first.(attempts) == ["1", "2"]
+            @test attempts[1][2] == attempts[2][2]
         end
     end
 

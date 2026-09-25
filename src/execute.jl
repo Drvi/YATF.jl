@@ -537,24 +537,31 @@ own.
 """
 function profile_projects!(run::Run, p::Plan)
     env = Base.active_project()
-    env === nothing && return nothing
-    root = dirname(env)
     for prof in values(p.profiles)
-        isempty(prof.preferences) && continue
-        dir = joinpath(root, string("yatf_profile_", prof.name))
-        mkpath(dir)
-        copy_env_files(dir, root)
-        own = joinpath(root, "LocalPreferences.toml")
-        merged = isfile(own) ? TOML.parsefile(own) : Dict{String, Any}()
-        for (pkg, table) in TOML.parsefile(prof.preferences)
-            # Per package, not per key: a half-overridden preferences table is a
-            # configuration nobody wrote down.
-            merged[pkg] = table
-        end
-        open(io -> TOML.print(io, merged), joinpath(dir, "LocalPreferences.toml"), "w")
-        run.profile_projects[prof.name] = dir
+        dir = profile_project(prof, env)
+        dir === nothing || (run.profile_projects[prof.name] = dir)
     end
     return nothing
+end
+
+# The project `prof`'s workers run in, beside the environment `env`, or `nothing` for
+# a profile without preferences, whose workers run in `env` itself. Rewritten on
+# every call, so it follows the environment and the preferences file.
+function profile_project(prof::Profile, env)
+    (env === nothing || isempty(prof.preferences)) && return nothing
+    root = dirname(env)
+    dir = joinpath(root, string("yatf_profile_", prof.name))
+    mkpath(dir)
+    copy_env_files(dir, root)
+    own = joinpath(root, "LocalPreferences.toml")
+    merged = isfile(own) ? TOML.parsefile(own) : Dict{String, Any}()
+    for (pkg, table) in TOML.parsefile(prof.preferences)
+        # Per package, not per key: a half-overridden preferences table is a
+        # configuration nobody wrote down.
+        merged[pkg] = table
+    end
+    open(io -> TOML.print(io, merged), joinpath(dir, "LocalPreferences.toml"), "w")
+    return dir
 end
 
 """

@@ -364,11 +364,10 @@ end
 
 function item_on_pid(m::Monitor, pid::Int32)
     for slot in run_of(m).slots
-        w = slot.worker
-        w === nothing && continue
-        if Int32(w.pid) == pid && slot.current != 0
-            return run_of(m).plan.items.name[slot.current]
-        end
+        # Read once each: the slot's own task changes both while this runs.
+        w, i = slot.worker, slot.current
+        (w === nothing || i == 0) && continue
+        Int32(w.pid) == pid && return run_of(m).plan.items.name[i]
     end
     return ""
 end
@@ -572,7 +571,12 @@ function clip_status!(m::Monitor, from::Integer)
     buf = m.linebuf
     to = position(buf)
     fits = from + bytes_within(buf.data, from + 1, to, m.columns)
-    fits < to && truncate(buf, fits)
+    if fits < to
+        # A colour the kept part turns on may have had its reset cut off.
+        colored = any(==(0x1b), view(buf.data, (from + 1):fits))
+        truncate(buf, fits)
+        colored && print(buf, "\e[0m")
+    end
     return nothing
 end
 
@@ -582,7 +586,8 @@ end
 How many of the bytes `data[from:to]` fit in `columns` columns of screen.
 
 Escape sequences change the colour, not the cursor's position, so they cost
-nothing. Decoded a byte at a time: a `String` would allocate on every redraw.
+nothing, and one is kept or cut whole. Decoded a byte at a time: a `String` would
+allocate on every redraw.
 """
 function bytes_within(data::AbstractVector{UInt8}, from::Int, to::Int, columns::Int)
     col = 0
@@ -590,11 +595,17 @@ function bytes_within(data::AbstractVector{UInt8}, from::Int, to::Int, columns::
     while i <= to
         b = data[i]
         if b == 0x1b
-            j = i + 1
-            while j <= to && !(0x40 <= data[j] <= 0x7e)
-                j += 1
+            # `ESC [`, then parameter and intermediate bytes, then a final byte in
+            # 0x40:0x7e; any other escape is `ESC` and one byte.
+            if i + 1 <= to && data[i + 1] == UInt8('[')
+                j = i + 2
+                while j <= to && !(0x40 <= data[j] <= 0x7e)
+                    j += 1
+                end
+                i = j + 1
+            else
+                i += 2
             end
-            i = j + 1
             continue
         end
         n = b < 0x80 ? 1 : b < 0xe0 ? 2 : b < 0xf0 ? 3 : 4
@@ -853,6 +864,10 @@ end
 const GUARD_BACKPRESSURE_SECONDS = 10.0
 const GUARD_GC_SECONDS = 20.0
 const GUARD_RESTART_COOLDOWN = 60.0
+# A hold ends this far below the threshold, not at it. The machine's reading drifts
+# by about this much with nothing happening (1.8 points over 30s, measured on an idle
+# 64 GiB Mac), and a hold released on the first dip is taken again on the next rise.
+const GUARD_HYSTERESIS = 0.02
 
 # Escalates slowly on purpose: restarting a worker throws away everything it has
 # compiled, which on a compilation-heavy suite is the most expensive thing the
@@ -864,19 +879,25 @@ function guard!(m::Monitor)
     s.machine_total > 0 || return nothing
     pressure = s.machine_used / s.machine_total
     now = time()
-    if pressure < threshold
-        if m.over_since != 0.0
-            m.over_since = 0.0
+    release = max(threshold - GUARD_HYSTERESIS, threshold / 2)
+    if m.over_since != 0.0 && pressure < release
+        m.over_since = 0.0
+        # Said only when the hold was still on: `wait_while_paused` lets go by itself
+        # after `MAX_BACKPRESSURE_SECONDS`, and says so.
+        if is_paused(run.queues)
             set_paused!(run.queues, false)
+            say(run, "memory is down to ", round(Int, 100 * pressure), "%; no longer holding off on new test items")
         end
         return nothing
     end
+    pressure < threshold && return nothing   # below it, or on the way down from a hold
     if m.over_since == 0.0
         m.over_since = now
         set_paused!(run.queues, true)
         m.stats.guard_actions += 1
-        @warn "YATF: memory pressure is at $(round(Int, 100 * pressure))%; " *
-            "holding off on new test items"
+        @warn "YATF: memory is at $(round(Int, 100 * pressure))% of the machine; holding off on new " *
+            "test items until it is below $(round(Int, 100 * release))%, for " *
+            "$(round(Int, MAX_BACKPRESSURE_SECONDS))s at most"
         return nothing
     end
     over = now - m.over_since

@@ -155,21 +155,26 @@ item_location(item::RawItem, target) = string(
     isabspath(item.file) && target !== nothing ? relpath_or_path(item.file, target.root) : item.file, ":", item.line
 )
 
-function interactive_spec(item::RawItem, target, seed::UInt64 = rand(RandomDevice(), UInt64))
+function interactive_spec(item::RawItem, target, attempt::Integer = 1, seed::UInt64 = rand(RandomDevice(), UInt64))
     project = target === nothing ? "" : something(project_name_of(target.project), "")
     return ItemSpec(
         Int32(1), item.name, item.file, item.line, item.code, item.skip, item.failfast == 1,
-        project, item.profile, Int8(1), false, "", seed
+        project, item.profile, Int8(attempt), false, "", seed
     )
 end
 
-# A worker configured as a run would configure it.
-sandbox_worker(prof, target, redirect_fn) = YATFWorkers.Worker(;
+# A worker configured as a run would configure it, in the profile's own project
+# when it declares preferences.
+function sandbox_worker(prof, target, redirect_fn)
+    env = Base.active_project()
+    project = something(profile_project(prof, env), Some(env))
+    return YATFWorkers.Worker(;
         julia_args = prof.julia_args, threads = prof.threads,
-        extra_env = worker_env("repl", 1, Base.active_project(), prof),
+        extra_env = worker_env("repl", 1, project, prof),
         dir = target === nothing ? pwd() : target.root,
-        project = Base.active_project(), redirect_io = stdout, redirect_fn
+        project = env, redirect_io = stdout, redirect_fn
     )
+end
 
 function run_sandboxed(item::RawItem, target)
     prof = interactive_profile(item, target)
@@ -179,19 +184,23 @@ function run_sandboxed(item::RawItem, target)
     relay(io, pid, line) = let rec = parse_record(line)
         rec === nothing ? println(io, "      worker ", pid, " | ", line) : say(item, target, rec.attempt, rec.how)
     end
+    # One seed for every attempt, as a run's retries draw the same numbers.
+    seed = rand(RandomDevice(), UInt64)
     for attempt in 1:attempts
         w = sandbox_worker(prof, target, relay)
         try
             isempty(prof.init.args) ||
                 fetch(YATFWorkers.remote_eval(w, Expr(:block, prof.init.args...)))
-            spec = interactive_spec(item, target)
+            spec = interactive_spec(item, target, attempt, seed)
             fut = YATFWorkers.remote_run(w, spec)
             result = (
                 timeout === nothing ? fetch(fut) :
                 fetch_within(fut, timeout, TimeoutException(timeout, "test item", item.name, "its own timeout=$timeout"))
             )::ItemResult
-            isempty(prof.test_end.args) ||
-                fetch(YATFWorkers.remote_end(w, spec, prof.test_end))
+            # What the profile's `test_end` records counts, as it does in a run.
+            if !isempty(prof.test_end.args) && result.state !== SKIPPED
+                result = merge_test_end(result, fetch(YATFWorkers.remote_end(w, spec, prof.test_end))::ItemResult)
+            end
             (result.state === YATFWorkers.PASSED || attempt == attempts) && break
         catch e
             e isa TimeoutException || rethrow()
@@ -206,10 +215,13 @@ function run_sandboxed(item::RawItem, target)
     return result
 end
 
+# The profile from the project's TestItems.toml, `default` included, as a run reads
+# it. Only a session without a project has the built-in default.
 function interactive_profile(item::RawItem, target)
-    item.profile === DEFAULT_PROFILE && return Profile(DEFAULT_PROFILE)
-    target === nothing &&
+    if target === nothing
+        item.profile === DEFAULT_PROFILE && return Profile(DEFAULT_PROFILE)
         throw(ConfigError("`sandbox=:$(item.profile)` needs a TestItems.toml, and there is no project here"))
+    end
     cfg = read_config(target.testdir)
     haskey(cfg.profiles, item.profile) || throw(
         ConfigError(

@@ -80,7 +80,8 @@ worker, item)` in that order, a chain's members spread over its time; `work` is 
 worker's estimated seconds. A run without workers takes the units in plan order.
 """
 function run_order(p::Plan)
-    est = [e > 0 ? e : typical_estimate(p.units.est_s) for e in p.units.est_s]
+    typical = typical_estimate(p.units.est_s)
+    est = [e > 0 ? e : typical for e in p.units.est_s]
     items = Tuple{Float64, Int, ItemIdx}[]
     function started!(t, s, u)
         span = p.units.span[u]

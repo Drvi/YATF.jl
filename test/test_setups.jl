@@ -283,6 +283,27 @@ end
         # added, indented as the module's body is.
         @test relocated("module S\n    p = \"\$(@__DIR__)/x\"\nend\n") ==
               "module S\n    import MyPkg\n    p = \"\$(pkgdir(MyPkg, \"test\", \"testsetups\"))/x\"\nend\n"
+        # A body that goes on on the module's own line gets the import first in it,
+        # inside the module; evaluated, the setup finds the directory it was in.
+        for (code, expected) in (
+                "module S; p = @__DIR__; end\n" => "module S; import MyPkg; p = pkgdir(MyPkg, \"test\", \"testsetups\"); end\n",
+                "module S p = @__DIR__ end\n" => "module S; import MyPkg; p = pkgdir(MyPkg, \"test\", \"testsetups\") end\n",
+            )
+            @test relocated(code) == expected
+            yatf = replace(code, "S" => "Setup")
+            m = Module()
+            Core.eval(m, Meta.parseall(first(YATF.Private.relocate(yatf, Meta.parseall(yatf), "Setup", "YATF"))))
+            @test Core.eval(m, :(Setup.p)) == pkgdir(YATF, "test", "testsetups")
+        end
+    end
+
+    @testset "a relative include is found however it is spaced" begin
+        hazards(code) = last(YATF.Private.relocate(code, Meta.parseall(code), "S", "MyPkg"))
+        for call in ("include(\"helper.jl\")", "include( \"helper.jl\")", "include(\n    \"helper.jl\",\n)")
+            @test length(hazards("module S\n$call\nend\n")) == 1
+        end
+        @test isempty(hazards("module S\ninclude(\"/abs/helper.jl\")\nend\n"))
+        @test isempty(hazards("module S\ninclude(joinpath(@__DIR__, \"helper.jl\"))\nend\n"))
     end
 
     @testset "every module a setup imports from outside is found" begin

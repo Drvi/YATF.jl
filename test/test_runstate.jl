@@ -217,6 +217,23 @@ end
         end
     end
 
+    @testset "a directory several projects share gives each its own history" begin
+        with_runstate_dir() do _
+            item(passes) = "@testitem \"shared name\" begin\n    @test $passes\nend\n"
+            a = make_pkg("SharedA", "test/t_test.jl" => item(true))
+            b = make_pkg("SharedB", "test/t_test.jl" => item(false))
+            capture_run(() -> run_states(a; workers=0, logs=:issues, monitor=false))
+            capture_run(() -> run_states(b; workers=0, logs=:issues, monitor=false))   # the newer, failing
+            @test length(runstate_files(a)) == 2          # both in the one directory
+            @test isempty(history(a; nruns=1).failed)
+            @test history(b; nruns=1).failed == Dict("shared name" => 0)
+            # Pruning one project's runs leaves the other's alone.
+            prune_runstates(a, 0)
+            @test isempty(history(a).seconds)
+            @test history(b; nruns=1).failed == Dict("shared name" => 0)
+        end
+    end
+
     @testset "old run states are pruned" begin
         dir = mktempdir()
         withenv("YATF_RUNSTATE_DIR" => dir) do

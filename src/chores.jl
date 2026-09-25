@@ -138,18 +138,18 @@ end
 """
     stale_runstates(root) -> Vector{String}
 
-The run states `chores(fix = true)` deletes: this machine's, modified more than
-`STALE_RUN_DAYS` ago, and not among the newest `HISTORY_RUNS`, which `history`
-reads. One recorded elsewhere, and one that cannot be read, are never among them:
-nothing shows they are this machine's to delete.
+The run states `chores(fix = true)` deletes: this machine's, for this project,
+modified more than `STALE_RUN_DAYS` ago, and not among the runs `history` reads.
+One recorded elsewhere, one of another project, and one that cannot be read are
+never among them: nothing shows they are this machine's to delete.
 """
 function stale_runstates(root::AbstractString)
-    files = runstate_files(root)
-    here = run_host()
+    here, project = run_host(), project_id(root)
     cutoff = time() - STALE_RUN_DAYS * 86400
-    return filter(files[1:max(0, end - HISTORY_RUNS)]) do f
-        mtime(f) < cutoff || return false
+    read_by_history = Set(first.(recent_runs(root, HISTORY_RUNS)))
+    return filter(runstate_files(root)) do f
+        (mtime(f) < cutoff && !(f in read_by_history)) || return false
         rs = read_run_state(f)
-        return rs !== nothing && get(rs.meta, "host", "") == here
+        return rs !== nothing && get(rs.meta, "host", "") == here && of_project(rs, project)
     end
 end

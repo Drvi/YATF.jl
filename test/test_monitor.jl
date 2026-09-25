@@ -16,6 +16,9 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
         ok = ensure_checked!()
         @test ok == PER_PROCESS_OK[]
         @test ok isa Bool
+        # The Windows bindings pass their own check, the child listing included: no
+        # other platform's run exercises them.
+        Sys.iswindows() && @test ok
     end
 
     @testset "resident size agrees with Sys.maxrss" begin
@@ -35,7 +38,9 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
     end
 
     @testset "children of this process are found" begin
-        if PER_PROCESS_OK[] && !Sys.iswindows()
+        # On Windows whatever the self-check decided: the listing is the part of
+        # the Windows bindings no other platform's run exercises.
+        if PER_PROCESS_OK[] || Sys.iswindows()
             proc = run(`$(Base.julia_cmd()[1]) -e "sleep(30)"`; wait=false)
             try
                 pid = Int32(Libc.getpid(proc))
@@ -50,6 +55,59 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
             finally
                 kill(proc, Base.SIGKILL)
             end
+        end
+    end
+
+    @testset "a process tree is walked from its roots, however the children are listed" begin
+        P = YATF.Private.Platform
+        # `pid => parent`, as a Windows snapshot lists them: 1 has a line of
+        # descendants six deep, 8 is 1's other child, 20 and 21 name each other (a
+        # parent's pid reused by its own child's child), 0 names itself, as the
+        # System Idle Process does, and 30 is no one's.
+        parents = Pair{Int32, Int32}[2 => 1, 3 => 2, 4 => 3, 5 => 4, 6 => 5, 7 => 6, 8 => 1,
+                                     20 => 21, 21 => 20, 0 => 0, 30 => 99]
+        children = P.children_in(parents)
+        @test sort(children(1)) == [2, 8]
+        @test children(0) == Int32[]
+        @test children(42) == Int32[]
+        # Four generations below a root and no further, each process once.
+        @test sort(P.process_tree([1]; children)) == [1, 2, 3, 4, 5, 8]
+        @test sort(P.process_tree([1]; maxdepth = 1, children)) == [1, 2, 8]
+        @test sort(P.process_tree([20]; children)) == [20, 21]
+        @test sort(P.process_tree([0]; children)) == [0]
+        @test sort(P.process_tree([3, 30]; children)) == [3, 4, 5, 6, 7, 30]
+    end
+
+    @testset "the Windows structures have the layout Windows gives them" begin
+        # The C layout rules for these fields are the same on every 64-bit
+        # platform, so a field moved or resized fails here, and not only where
+        # Windows would read the wrong bytes.
+        if Sys.WORD_SIZE == 64
+            offset(T, f) = fieldoffset(T, findfirst(==(f), fieldnames(T)))
+            E = YATF.Private.Platform.ProcessEntry32W
+            @test sizeof(E) == 568
+            @test offset(E, :pid) == 8
+            @test offset(E, :parent_pid) == 32
+            @test offset(E, :exe_file) == 44
+            B, J = YATFWorkers.JobBasicLimits, YATFWorkers.JobExtendedLimits
+            @test sizeof(B) == 64
+            @test offset(B, :limit_flags) == 16
+            @test offset(B, :scheduling_class) == 60
+            @test sizeof(J) == 144
+            @test offset(J, :io) == 64
+            @test offset(J, :peak_job_memory) == 136
+        end
+    end
+
+    Sys.iswindows() && @testset "every process is listed with its parent" begin
+        ps = YATF.Private.Platform.process_parents_windows()
+        @test any(p -> first(p) == getpid(), ps)
+        proc = run(`$(Base.julia_cmd()[1]) -e "sleep(30)"`; wait=false)
+        try
+            child = Int32(Libc.getpid(proc))
+            @test (child => Int32(getpid())) in YATF.Private.Platform.process_parents_windows()
+        finally
+            kill(proc, Base.SIGKILL)
         end
     end
 
@@ -315,8 +373,16 @@ end
         YATF.Private.guard!(m)
         @test !YATF.Private.is_paused(run.queues)
         reading(min(1.0, limit + 0.02))
-        @test_logs (:warn, r"holding off") YATF.Private.guard!(m)
+        release = round(Int, 100 * (limit - YATF.Private.GUARD_HYSTERESIS))
+        @test_logs (:warn, Regex("holding off on new test items until it is below $release%")) YATF.Private.guard!(m)
         @test YATF.Private.is_paused(run.queues)
+        # Dipping under the threshold is not enough to let go: a machine hovering on
+        # it would take and release the hold at every sample.
+        reading(limit - YATF.Private.GUARD_HYSTERESIS / 2)
+        @test_logs YATF.Private.guard!(m)
+        @test YATF.Private.is_paused(run.queues)
+        @test m.stats.guard_actions == 1
+        reading(min(1.0, limit + 0.02))
         # Still over once holding back has had its chance: collect.
         m.over_since = time() - YATF.Private.GUARD_BACKPRESSURE_SECONDS - 1
         YATF.Private.guard!(m)
@@ -327,9 +393,11 @@ end
         @test m.stats.guard_actions == 3
         YATF.Private.guard!(m)
         @test m.stats.guard_actions == 3
+        # Well below it, the hold ends, and the run says so.
         reading(limit / 2)
-        YATF.Private.guard!(m)
+        _, out = capture_run(() -> YATF.Private.guard!(m))
         @test !YATF.Private.is_paused(run.queues)
+        @test occursin("memory is down to $(round(Int, 50 * limit))%; no longer holding off on new test items", out)
     end
 
     @testset "the memory guard restarts a worker between items, and stops no item" begin
@@ -662,6 +730,19 @@ end
         end
         # Wide enough for the whole line, and it is not cut at all.
         @test textwidth(plain(drawn(400))) == textwidth(plain(drawn(0)))
+
+        # In colour: the escape codes take no columns and are kept or cut whole, and
+        # a line cut inside a colour still ends by resetting it.
+        fits(s, cols) = YATF.Private.bytes_within(codeunits(s), 1, ncodeunits(s), cols)
+        @test fits("abcdef", 4) == 4
+        @test fits("\e[32mabcdef\e[0m", 4) == ncodeunits("\e[32mabcd")
+        @test fits("\e[1;32mab\e[0mcdef", 4) == ncodeunits("\e[1;32mab\e[0mcd")
+        @test fits("ab\e[32m", 4) == ncodeunits("ab\e[32m")
+        m = withenv(() -> with(() -> Monitor(run), YATF.Private.TTY_OVERRIDE => true), "COLUMNS" => "4")
+        truncate(m.linebuf, 0)
+        print(m.linebuf, "\e[32mabcdef\e[0m")
+        YATF.Private.clip_status!(m, 0)
+        @test String(take!(m.linebuf)) == "\e[32mabcd\e[0m"
     end
 
     @testset "a run that throws before its first item takes the line down" begin
@@ -716,7 +797,7 @@ end
                 stop_monitor!(m)
             end
         end
-        at = findfirst("Warning: YATF: memory pressure", out)
+        at = findfirst("Warning: YATF: memory is at", out)
         @test at !== nothing
         if at !== nothing
             # What is on the warning's row before it: the status line was drawn

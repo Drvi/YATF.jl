@@ -321,9 +321,10 @@ spawned`, say).
 
 If memory gets tight the run holds off on new items, collects garbage, and only
 then restarts the largest worker, once the item it is running has finished: a
-running item is never stopped for memory, which may be someone else's. The hold is
-bounded, so pressure caused by something else on the machine slows a run down but
-never stalls it.
+running item is never stopped for memory, which may be someone else's. The hold
+ends once memory is two points below `memory_threshold`, and the run says when it
+does. It is also bounded, so pressure caused by something else on the machine slows
+a run down but never stalls it.
 
 A run that goes longer without any item finishing than one attempt at any of them
 may take (the largest `timeout`, the profiles' `init` and `test_end` limits, a
@@ -399,7 +400,9 @@ adds numbers  |    1      1  0.0s
 It is read by the same parser as a test file, so a keyword that would be an error
 in a file is an error here, and it runs the same way: fresh module, soft scope,
 `Test` and the package in scope. `skip` and `failfast` are honoured, and so is
-`sandbox`, by starting a worker for the item. `timeout`, `retries` and `chain` need
+`sandbox`, by starting a worker for the item under the profile a run would give it
+(`[profiles.default]` for `sandbox=true`): its flags, environment, preferences,
+`init`, and `test_end`, whose failures count. `timeout`, `retries` and `chain` need
 a run around the item, so they are ignored with a warning, except that an item
 with a worker of its own keeps its `timeout` and `retries`. `tags` are ignored.
 

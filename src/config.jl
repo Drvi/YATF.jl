@@ -145,32 +145,39 @@ function build_config(path, toml; nunits = 0, kwargs...)
     # monitor print as often as it can.
     interval(x) = (x isa Real && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
         throw(ConfigError("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))"))
+    flag(key, default) = (v = pick(key, default); v isa Bool ? v :
+        throw(ConfigError("`$key` must be true or false, got $(repr(v))")))
 
-    threads = string(pick(:threads, "2,1"))
+    threads = threads_spec("threads", pick(:threads, "2,1"))
     w = pick(:workers, "auto")
-    w isa AbstractString && w != "auto" &&
-        throw(ConfigError("`workers` must be an integer or \"auto\", got $(repr(w))"))
-    workers = w isa AbstractString ? auto_workers(threads, nunits) : Int(w)
-    workers >= 0 || throw(ConfigError("`workers` must be >= 0, got $workers"))
+    # A worker is a slot, and slots are numbered in a `SlotIdx`.
+    ((w isa Integer && 0 <= w <= typemax(SlotIdx)) || w == "auto") || throw(ConfigError(
+        "`workers` must be \"auto\" or an integer from 0 to $(typemax(SlotIdx)), got $(repr(w))"
+    ))
+    workers = w isa Integer ? Int(w) : auto_workers(threads, nunits)
     logs = Symbol(pick(:logs, default_logs(workers)))
     logs in LOG_MODES || throw(ConfigError("`logs` must be one of $(LOG_MODES), got $(repr(logs))"))
     timeout = seconds(:timeout, pick(:timeout, 30 * 60))
     retries = pick(:retries, 0)
     (retries isa Integer && 0 <= retries <= MAX_RETRIES) ||
         throw(ConfigError("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))"))
-    mt = Float64(pick(:memory_threshold, 0.9))
-    0 < mt <= 1 || throw(ConfigError("`memory_threshold` must be in (0, 1], got $mt"))
-    failfast = Bool(pick(:failfast, false))
+    mt = pick(:memory_threshold, 0.9)
+    (mt isa Real && 0 < mt <= 1) || throw(ConfigError("`memory_threshold` must be in (0, 1], got $(repr(mt))"))
+    failfast = flag(:failfast, false)
     seed = pick(:seed, 0)
-    (seed isa Integer && seed >= 0) || throw(ConfigError("`seed` must be a non-negative integer, got $(repr(seed))"))
+    (seed isa Integer && 0 <= seed <= typemax(UInt64)) ||
+        throw(ConfigError("`seed` must be an integer from 0 to $(typemax(UInt64)), got $(repr(seed))"))
     order = section(path, toml, "order", ORDER_KEYS)
     # A keyword, then the environment, then the file: CI switches coverage on for a
-    # job without editing the project.
-    env_coverage = env_flag("YATF_COVERAGE")
-    coverage, coverage_source =
-        get(kwargs, :coverage, nothing) !== nothing ? (kwargs[:coverage], "the `coverage` keyword") :
+    # job without editing the project. The environment is read only when the keyword
+    # does not decide, so a bad value there fails only a run it would have set.
+    coverage, coverage_source = if get(kwargs, :coverage, nothing) !== nothing
+        (kwargs[:coverage], "the `coverage` keyword")
+    else
+        env_coverage = env_flag("YATF_COVERAGE")
         env_coverage !== nothing ? (env_coverage, "`YATF_COVERAGE`") :
-        haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
+            haskey(run, "coverage") ? (run["coverage"], relpath_or_path(path)) : (false, "")
+    end
     coverage isa Bool || throw(ConfigError("`coverage` must be true or false, got $(repr(coverage))"))
     coverage && workers == 0 && throw(ConfigError(
         "`coverage` is counted by worker processes, and `workers = 0` runs the items in this one, " *
@@ -184,11 +191,11 @@ function build_config(path, toml; nunits = 0, kwargs...)
         workers, threads, timeout_s = timeout,
         init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout)),
         test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout)),
-        retries = Int(retries), failfast, item_failfast = Bool(pick(:item_failfast, failfast)), logs,
-        verbose = Bool(pick(:verbose, false)),
-        memory_threshold = mt, monitor = Bool(pick(:monitor, true)),
-        full_stacktraces = Bool(pick(:full_stacktraces, false)),
-        full_names = Bool(pick(:full_names, false)),
+        retries = Int(retries), failfast, item_failfast = flag(:item_failfast, failfast), logs,
+        verbose = flag(:verbose, false),
+        memory_threshold = Float64(mt), monitor = flag(:monitor, true),
+        full_stacktraces = flag(:full_stacktraces, false),
+        full_names = flag(:full_names, false),
         testset_name = String(testset_name), coverage, coverage_source,
         monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
@@ -196,6 +203,16 @@ function build_config(path, toml; nunits = 0, kwargs...)
         order_last = String[string(x) for x in get(order, "last", String[])],
         seed = seed == 0 ? rand(RandomDevice(), UInt64) : UInt64(seed)
     )
+end
+
+# What `--threads` takes: default threads, `auto` or at least one, then optionally
+# interactive ones, `auto` or any number. Checked here, or the first worker dies of it.
+function threads_spec(what, x)
+    s = x isa Integer ? string(x) : x
+    (s isa AbstractString && occursin(r"^(auto|[1-9][0-9]*)(,(auto|[0-9]+))?$", s)) || throw(ConfigError(
+        "`$what` must be what `--threads` takes (\"4\", \"4,1\", \"auto\"), got $(repr(x))"
+    ))
+    return String(s)
 end
 
 # One interactive worker streams its logs; several would interleave unreadably, so
@@ -208,6 +225,9 @@ function read_profiles(path, toml, default_threads::String)
     profiles = Dict{Symbol, Profile}()
     tbl = get(toml, "profiles", Dict{String, Any}())
     tbl isa AbstractDict || throw(ConfigError("[profiles] of $(relpath_or_path(path)) must be a table"))
+    # Numbered in a `ProfileIdx`, `default` among them.
+    length(tbl) < typemax(ProfileIdx) ||
+        throw(ConfigError("$(relpath_or_path(path)) declares $(length(tbl)) profiles; at most $(typemax(ProfileIdx) - 1) fit"))
     for name in keys(tbl)
         p = section(path, tbl, name, PROFILE_KEYS, "profiles.$name")
         args = String[string(a) for a in get(p, "julia_args", String[])]
@@ -215,7 +235,7 @@ function read_profiles(path, toml, default_threads::String)
         sort!(env; by = first)
         profiles[Symbol(name)] = Profile(
             Symbol(name), args,
-            string(get(p, "threads", default_threads)), env,
+            threads_spec("threads of [profiles.$name]", get(p, "threads", default_threads)), env,
             parse_expr(path, name, "init", get(p, "init", "")),
             parse_expr(path, name, "test_end", get(p, "test_end", "")),
             profile_preferences(path, name, get(p, "preferences", ""))

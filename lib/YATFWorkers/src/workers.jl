@@ -148,6 +148,9 @@ mutable struct Worker
     # Why the process was ended: the `from` of the first `terminate!`, `:interrupt`
     # for `kill!`. `:connection_lost` and `:process_exit` mean it ended on its own.
     @atomic ended_by   :: Symbol
+    # On Windows, the job object the worker and every process it starts belong to,
+    # until `end_group!` ends it; `C_NULL` elsewhere, or where no job could be made.
+    @atomic job        :: Ptr{Cvoid}
     const on_exit    :: Any              # called with the worker once its process has exited, or nothing
 end
 
@@ -282,6 +285,100 @@ end
 
 wait_exit(proc::Base.Process, seconds::Real) =
     timedwait(() -> process_exited(proc), seconds; pollint=0.02) === :ok
+
+"""
+    end_group!(w::Worker)
+
+Put down what is left of the processes a worker started, once the worker itself has
+exited: whatever its items started and did not wait for would otherwise outlive it,
+and one that inherited its output pipe keeps that pipe from ever reaching EOF.
+
+On Unix they are the worker's process group: SIGTERM, then SIGKILL after
+`TERM_GRACE_SECONDS`. Called straight after the leader is reaped: a process group's
+id is not reused while the group has a member, so the signal can only reach
+processes of that group. A process that left the group, by starting a session of
+its own, is out of reach. On Windows they are the worker's job object, ended and
+closed once; a process cannot leave a job that does not allow it.
+"""
+function end_group!(w::Worker)
+    Sys.iswindows() && return end_job!(@atomicswap w.job = C_NULL)
+    pid = w.pid
+    pid <= 0 && return nothing
+    alive() = ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), 0) == 0
+    alive() || return nothing
+    ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), Base.SIGTERM)
+    timedwait(() -> !alive(), TERM_GRACE_SECONDS; pollint=0.02) === :ok && return nothing
+    ccall(:uv_kill, Cint, (Cint, Cint), -Cint(pid), Base.SIGKILL)
+    return nothing
+end
+
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION, which `SetInformationJobObject` takes for its
+# class 9: 144 bytes on 64-bit Windows, `LimitFlags` at offset 16.
+struct JobBasicLimits
+    per_process_user_time::Int64
+    per_job_user_time::Int64
+    limit_flags::UInt32
+    minimum_working_set::Csize_t
+    maximum_working_set::Csize_t
+    active_process_limit::UInt32
+    affinity::UInt
+    priority_class::UInt32
+    scheduling_class::UInt32
+end
+
+struct JobExtendedLimits
+    basic::JobBasicLimits
+    io::NTuple{6, UInt64}
+    process_memory_limit::Csize_t
+    job_memory_limit::Csize_t
+    peak_process_memory::Csize_t
+    peak_job_memory::Csize_t
+end
+
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = Cint(9)
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = UInt32(0x2000)
+const PROCESS_SET_QUOTA_AND_TERMINATE = UInt32(0x0100 | 0x0001)
+
+"""
+    worker_job(pid) -> Ptr{Cvoid}
+
+A job object holding process `pid`, on Windows, or `C_NULL`. Windows has no process
+groups; a process a job holds brings every process it starts into the job, unless
+the job lets them break away, which this one does not. The job is set to end what
+it holds when its last handle closes, so a coordinator that dies takes its workers
+and their processes with it. Assigned straight after the worker is spawned, before
+it has run anything that could start a process. Anything that fails leaves the
+worker outside a job, as it would be without one.
+"""
+function worker_job(pid::Integer)
+    (Sys.iswindows() && pid > 0) || return C_NULL
+    job = ccall((:CreateJobObjectW, "kernel32"), Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{UInt16}), C_NULL, C_NULL)
+    job == C_NULL && return C_NULL
+    limits = Ref(JobExtendedLimits(
+        JobBasicLimits(0, 0, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0, 0, 0, 0, 0, 0),
+        ntuple(_ -> UInt64(0), 6), 0, 0, 0, 0
+    ))
+    ok = ccall((:SetInformationJobObject, "kernel32"), Cint, (Ptr{Cvoid}, Cint, Ptr{JobExtendedLimits}, UInt32),
+               job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, limits, sizeof(JobExtendedLimits)) != 0
+    if ok
+        h = ccall((:OpenProcess, "kernel32"), Ptr{Cvoid}, (UInt32, Cint, UInt32),
+                  PROCESS_SET_QUOTA_AND_TERMINATE, 0, pid)
+        ok = h != C_NULL && ccall((:AssignProcessToJobObject, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{Cvoid}), job, h) != 0
+        h == C_NULL || ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), h)
+    end
+    ok && return job
+    ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), job)
+    return C_NULL
+end
+
+# End every process the job holds, and close it. The caller owns `job` and passes
+# it here once.
+function end_job!(job::Ptr{Cvoid})
+    job == C_NULL && return nothing
+    ccall((:TerminateJobObject, "kernel32"), Cint, (Ptr{Cvoid}, UInt32), job, 1)
+    ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), job)
+    return nothing
+end
 
 ### Interrupts #############################################################
 
@@ -420,6 +517,7 @@ function watch_and_terminate!(w::Worker, ev::Threads.Event)
         end
     end
     terminate!(w, w.closing ? :close : :process_exit)
+    end_group!(w)
     w.on_exit === nothing && return nothing
     try
         w.on_exit(w)
@@ -474,12 +572,23 @@ end
 # Never throws: by now the worker is being torn down, and a task that failed on the
 # way out has reported itself. Throwing would take down the slot and its queue.
 function Base.wait(w::Worker)
-    for t in (w.process_watch, w.messages, w.output)
+    for t in (w.process_watch, w.messages)
         try
             wait(t)
         catch e
             is_interrupt(e) && rethrow()
         end
+    end
+    # The worker and its process group are gone by now, but the relay ends at EOF,
+    # which a process that left the group and holds the pipe can put off for as long
+    # as it runs. What the worker wrote has been read by then, or never will be.
+    if timedwait(() -> istaskdone(w.output), GRACEFUL_EXIT_SECONDS; pollint=0.02) !== :ok
+        close(w.process.out)
+    end
+    try
+        wait(w.output)
+    catch e
+        is_interrupt(e) && rethrow()
     end
     return nothing
 end
@@ -539,6 +648,7 @@ function Worker(;
         is_interrupt(e) && (kill(proc, Base.SIGKILL); untrack!(proc); rethrow())
         Int32(0)
     end
+    job = worker_job(pid)
     cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
     local sock, w
     try
@@ -559,7 +669,7 @@ function Worker(;
         end
         w = Worker(ReentrantLock(), ReentrantLock(), pid, proc, sock,
                    Task(nothing), Task(nothing), Task(nothing),
-                   Dict{UInt64,Future}(), UInt64(0), 0, false, false, :none, on_exit)
+                   Dict{UInt64,Future}(), UInt64(0), 0, false, false, :none, job, on_exit)
         # Shielded: these watch the worker until it has gone, which on Ctrl-C is
         # what the caller's teardown waits for.
         e1, e2, e3 = Threads.Event(), Threads.Event(), Threads.Event()
@@ -577,7 +687,8 @@ function Worker(;
         end
         untrack!(proc)
         @isdefined(sock) && close(sock)
-        @isdefined(w) && terminate!(w, :start_failed)
+        # The job is the worker's to end once it exists; until then, it is here.
+        @isdefined(w) ? (terminate!(w, :start_failed); end_group!(w)) : end_job!(job)
         rethrow()
     end
 end

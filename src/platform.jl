@@ -110,9 +110,55 @@ function rss_windows(pid::Integer)
     end
 end
 
-# A process tree on Windows needs a toolhelp snapshot. Workers are tracked by pid,
-# so only their children are missed.
-children_windows(::Integer) = Int32[]
+# PROCESSENTRY32W, as `Process32FirstW` and `Process32NextW` fill it: 568 bytes on
+# 64-bit Windows, the parent's pid at offset 32.
+struct ProcessEntry32W
+    size::UInt32
+    usage::UInt32
+    pid::UInt32
+    default_heap::UInt
+    module_id::UInt32
+    threads::UInt32
+    parent_pid::UInt32
+    priority_base::Int32
+    flags::UInt32
+    exe_file::NTuple{260, UInt16}
+end
+
+const TH32CS_SNAPPROCESS = UInt32(0x2)
+const INVALID_HANDLE_VALUE = reinterpret(Ptr{Cvoid}, typemax(UInt))
+
+# Every process on the machine, `pid => parent pid`, from one toolhelp snapshot.
+# Windows keeps no list of a process's children, only each process's parent.
+function process_parents_windows()
+    out = Pair{Int32, Int32}[]
+    snap = ccall((:CreateToolhelp32Snapshot, "kernel32"), Ptr{Cvoid}, (UInt32, UInt32), TH32CS_SNAPPROCESS, 0)
+    snap == INVALID_HANDLE_VALUE && return out
+    try
+        entry = Ref(ProcessEntry32W(sizeof(ProcessEntry32W), 0, 0, 0, 0, 0, 0, 0, 0, ntuple(_ -> 0x0000, 260)))
+        ok = ccall((:Process32FirstW, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
+        while ok != 0
+            push!(out, Int32(entry[].pid) => Int32(entry[].parent_pid))
+            ok = ccall((:Process32NextW, "kernel32"), Cint, (Ptr{Cvoid}, Ptr{ProcessEntry32W}), snap, entry)
+        end
+    catch e
+        is_interrupt(e) && rethrow()
+    finally
+        ccall((:CloseHandle, "kernel32"), Cint, (Ptr{Cvoid},), snap)
+    end
+    return out
+end
+
+# The children of each pid, as a function, from a list of `pid => parent`. A pid
+# Windows has reused since a parent exited can name a process that was never the
+# parent's child; a snapshot cannot tell them apart.
+children_in(parents) = pid -> Int32[c for (c, p) in parents if p == pid && c != pid]
+
+children_windows(pid::Integer) = children_in(process_parents_windows())(pid)
+
+# The children of each process, as one function for a whole walk: on Windows every
+# listing is a snapshot of every process, so a walk takes one and reads it.
+child_lister() = @static Sys.iswindows() ? children_in(process_parents_windows()) : child_pids
 
 ### Dispatch ###############################################################
 
@@ -304,12 +350,12 @@ function machine_memory()
 end
 
 """
-    process_tree(roots; maxdepth=4) -> Vector{Int32}
+    process_tree(roots; maxdepth=4, children=child_lister()) -> Vector{Int32}
 
 Every process descended from `roots`, including them: precompilation and anything
 a test item starts belong to the run's memory as much as the workers do.
 """
-function process_tree(roots; maxdepth::Int = 4)
+function process_tree(roots; maxdepth::Int = 4, children = child_lister())
     seen = Set{Int32}()
     frontier = Int32[Int32(r) for r in roots]
     for _ in 0:maxdepth
@@ -318,7 +364,7 @@ function process_tree(roots; maxdepth::Int = 4)
         for pid in frontier
             pid in seen && continue
             push!(seen, pid)
-            append!(next, child_pids(pid))
+            append!(next, children(pid))
         end
         frontier = next
     end
@@ -342,18 +388,16 @@ function platform_selfcheck!()
         # Resident size is not maxrss, but a working binding lands in the same
         # neighbourhood; a wrong struct offset does not.
         (rss > 0 && maxrss > 0 && rss < 100 * maxrss && rss > maxrss ÷ 100) || return false
-        if !Sys.iswindows()
-            proc = run(`$(Base.julia_cmd()[1]) --startup-file=no --history-file=no -e "sleep(20)"`; wait = false)
-            try
-                found = false
-                for _ in 1:100
-                    Int32(Libc.getpid(proc)) in child_pids(me) && (found = true; break)
-                    sleep(0.05)
-                end
-                found || return false
-            finally
-                kill(proc, Base.SIGKILL)
+        proc = run(`$(Base.julia_cmd()[1]) --startup-file=no --history-file=no -e "sleep(20)"`; wait = false)
+        try
+            found = false
+            for _ in 1:100
+                Int32(Libc.getpid(proc)) in child_pids(me) && (found = true; break)
+                sleep(0.05)
             end
+            found || return false
+        finally
+            kill(proc, Base.SIGKILL)
         end
         PER_PROCESS_OK[] = true
         return true

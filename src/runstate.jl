@@ -777,14 +777,19 @@ const KEEP_RUNS = 20
 # How many of the newest run states `history` reads durations and failures from.
 const HISTORY_RUNS = 5
 
-# Only the run states this machine recorded are pruned, and the newest `keep` of
-# them stay. One recorded elsewhere, a CI artifact downloaded into the directory
-# say, and one that cannot be read are never deleted: nothing shows they are ours.
+# Whether a run state is this project's. The default directory holds one project's
+# runs; one set by `YATF_RUNSTATE_DIR` can hold several.
+of_project(rs::RunStateRecord, project::AbstractString) = get(rs.meta, "project_id", "") == project
+
+# Only the run states this machine recorded for this project are pruned, and the
+# newest `keep` of them stay. One recorded elsewhere, a CI artifact downloaded into
+# the directory say, one of another project, and one that cannot be read are never
+# deleted: nothing shows they are ours.
 function prune_runstates(root::AbstractString, keep::Int = KEEP_RUNS)
-    here = run_host()
+    here, project = run_host(), project_id(root)
     ours = filter(runstate_files(root)) do f
         rs = read_run_state(f)
-        rs !== nothing && get(rs.meta, "host", "") == here
+        rs !== nothing && get(rs.meta, "host", "") == here && of_project(rs, project)
     end
     for f in ours[1:max(0, length(ours) - keep)]
         try
@@ -824,7 +829,25 @@ function sweep_runstate_dirs(base::AbstractString = runstate_root())
     return nothing
 end
 
-latest_runstate(root::AbstractString) = (fs = runstate_files(root); isempty(fs) ? nothing : last(fs))
+"""
+    recent_runs(root, n) -> Vector{Pair{String, RunStateRecord}}
+
+The newest `n` runs that `history` reads, oldest first, each with its file: this
+project's, readable, and not dry runs, which ran nothing. Read from the newest back,
+so the files of other projects in a shared directory are passed over rather than
+counted.
+"""
+function recent_runs(root::AbstractString, n::Int)
+    project = project_id(root)
+    runs = Pair{String, RunStateRecord}[]
+    for f in Iterators.reverse(runstate_files(root))
+        length(runs) >= n && break
+        rs = read_run_state(f)
+        (rs === nothing || rs.dry_run || !of_project(rs, project)) && continue
+        push!(runs, f => rs)
+    end
+    return reverse!(runs)
+end
 
 """
     history(root) -> History
@@ -837,14 +860,10 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
     seconds = Dict{String, Float64}()
     failed = Dict{String, Int}()
     since = 0.0
-    files = runstate_files(root)
-    isempty(files) && return History()
-    recent = files[max(1, end - nruns + 1):end]
-    for (k, f) in enumerate(recent)
+    recent = last.(recent_runs(root, nruns))
+    isempty(recent) && return History()
+    for (k, rs) in enumerate(recent)
         ago = length(recent) - k
-        rs = read_run_state(f)
-        rs === nothing && continue
-        rs.dry_run && continue
         since = rs.start_unix
         for (i, it) in enumerate(rs.items)
             i <= length(rs.statuses) || break

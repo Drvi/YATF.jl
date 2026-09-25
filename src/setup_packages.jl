@@ -325,6 +325,13 @@ function relocate(code::String, ex::Expr, name::String, pkg::Union{Nothing, Stri
     blank(i) = kind(i) in ("Whitespace", "NewlineWs", "Comment") || isempty(toks[i].range)
     next_token(i) = (j = i + 1; while j <= n && blank(j); j += 1; end; j)
     prev_token(i) = (j = i - 1; while j >= 1 && blank(j); j -= 1; end; j)
+    # `include("file.jl")`, blanks allowed between the tokens as the parser allows
+    # them; the string's own content follows its quote directly.
+    function is_relative_include(i)
+        p = next_token(i)
+        q = p <= n && text(p) == "(" ? next_token(p) : n + 1
+        return q + 1 <= n && kind(q) == "\"" && kind(q + 1) == "String" && !isabspath(text(q + 1))
+    end
     bound = pkg === nothing ? nothing : package_binding(ex, Symbol(name), Symbol(pkg))
     ref = string(something(bound, pkg, ""))
     edits = Tuple{UnitRange{Int}, String}[]
@@ -369,8 +376,7 @@ function relocate(code::String, ex::Expr, name::String, pkg::Union{Nothing, Stri
                 push!(hazards, (at, "`@__FILE__` would change with the move; use `@__DIR__`, which is " *
                                     "rewritten to keep its meaning"))
             end
-        elseif kind(i) == "Identifier" && text(i) == "include" && i + 3 <= n && text(i + 1) == "(" &&
-                kind(i + 2) == "\"" && kind(i + 3) == "String" && !isabspath(text(i + 3))
+        elseif kind(i) == "Identifier" && text(i) == "include" && is_relative_include(i)
             push!(hazards, (at, "`include` of a relative path would look in `src/` after the move; use " *
                                 "`include(joinpath(@__DIR__, …))`, which is rewritten to keep its meaning"))
         end
@@ -378,14 +384,25 @@ function relocate(code::String, ex::Expr, name::String, pkg::Union{Nothing, Stri
     rewritten = length(edits)
     imported = rewritten > 0 && bound === nothing && pkg !== nothing
     if imported
-        # On a line of its own after `module Name`, indented as the body is.
+        # First in the module's body: on a line of its own after `module Name`,
+        # indented as the body is, or, when the body goes on on that line, as a
+        # statement of its own there.
         for i in eachindex(toks)
             kind(i) in ("module", "baremodule") || continue
             j = next_token(i)
             (j <= n && text(j) == name) || continue
-            nl = findnext(==(UInt8('\n')), bytes, last_byte(j))
-            at = nl === nothing ? length(bytes) + 1 : nl + 1
-            push!(edits, (at:(at - 1), string(nl === nothing ? "\n" : "", body_indent(bytes, at), "import ", pkg, "\n")))
+            k = j + 1
+            while k <= n && (kind(k) == "Whitespace" || isempty(toks[k].range))
+                k += 1
+            end
+            if k <= n && !(kind(k) in ("NewlineWs", "Comment"))
+                at = last_byte(j) + 1
+                push!(edits, (at:(at - 1), string("; import ", pkg, text(k) == ";" ? "" : ";")))
+            else
+                nl = findnext(==(UInt8('\n')), bytes, last_byte(j))
+                at = nl === nothing ? length(bytes) + 1 : nl + 1
+                push!(edits, (at:(at - 1), string(nl === nothing ? "\n" : "", body_indent(bytes, at), "import ", pkg, "\n")))
+            end
             break
         end
     end

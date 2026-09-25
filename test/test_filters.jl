@@ -96,6 +96,11 @@ filtered(paths...; kwargs...) =
         @test filtered(dir, string(joinpath(dir, "test", "a_test.jl"), ":6")) == ["multiplies numbers"]
     end
 
+    @testset "a module stands for its package's directory" begin
+        @test YATF.Private.resolve_target((YATF,)).root == pkgdir(YATF)
+        @test_throws r"could not find a directory for module" YATF.Private.resolve_target((Module(:Loose),))
+    end
+
     @testset "name, tags and path narrow together" begin
         @test filtered(dir, joinpath(dir, "test", "a_test.jl"); tags=:math) ==
             ["adds numbers", "solves slowly"]
