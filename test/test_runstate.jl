@@ -24,6 +24,9 @@ end
                 for (pkg, path) in paths
                     # Not under `scratchspaces/`, which `Pkg.gc` empties of what no package registered.
                     @test startswith(path, joinpath(depot, "yatf", "runs"))
+                    # Named for the package, so a person can tell whose it is.
+                    @test occursin(r"^[A-Za-z]+-[0-9a-f]{8}$", basename(dirname(path)))
+                    @test startswith(basename(dirname(path)), YATF.Private.project_name_of(joinpath(pkg, "Project.toml")))
                     finish_run_state!(init_run_state(path, a_plan(pkg)))
                     @test read(joinpath(dirname(path), "project"), String) == abspath(pkg)
                 end
@@ -37,6 +40,15 @@ end
                 @test isfile(paths[kept])
                 @test !ispath(dirname(paths[gone]))
                 @test isfile(paths[foreign])        # not this machine's to delete
+
+                # A project without a name is named for its directory, and what a
+                # directory name cannot hold everywhere is left out.
+                env = mkpath(joinpath(mktempdir(), ".my env ☃ " * "x"^40))
+                write(joinpath(env, "Project.toml"), "[deps]\n")
+                @test basename(runstate_dir(env)) == string("myenvx", "x"^26, "-", string(YATF.Private.crc32c(abspath(env)); base = 16, pad = 8))
+                # Nothing left of the name: the key alone.
+                odd = mkpath(joinpath(mktempdir(), "☃☃"))
+                @test occursin(r"^[0-9a-f]{8}$", basename(runstate_dir(odd)))
             end
         finally
             filter!(!=(depot), DEPOT_PATH)

@@ -170,11 +170,13 @@ end
         # no message. The item asks for two retries and passes on the third
         # attempt, and the items around it must be unaffected.
         with_marker_dir() do dir
-            states, _, _ = run_states(FAULTY; workers=1, logs=:issues,
-                                      name=r"^(survives two dead workers|passes|fails)$")
+            states, run, _ = run_states(FAULTY; workers=1, logs=:issues,
+                                        name=r"^(survives two dead workers|passes|fails)$")
             @test states["survives two dead workers"] === PASSED
             @test states["passes"] === PASSED          # the run was not cancelled
             @test states["fails"] === FAILED
+            # The status line's count: the attempts that errored are not failures.
+            @test run.nonpass == count(is_non_pass, run.statuses.state) == 1
             @test parse(Int, read(joinpath(dir, "yatf_abort_count"), String)) == 3
         end
     end
@@ -191,9 +193,10 @@ end
 
     @testset "retries re-run a failing item" begin
         with_marker_dir() do dir
-            states, _, _ = run_states(FAULTY; workers=1, tags=[:retry], logs=:issues)
+            states, run, _ = run_states(FAULTY; workers=1, tags=[:retry], logs=:issues)
             @test states["passes on the second try"] === PASSED
             @test isfile(joinpath(dir, "yatf_retry"))
+            @test run.nonpass == count(is_non_pass, run.statuses.state) == 0
         end
         # An item's own `retries` wins over the run default, in both directions.
         with_marker_dir() do dir

@@ -310,7 +310,7 @@ The run ends with what it cost, stage by stage, followed by `Test`'s usual summa
 <b>│ </b>testing · 1.8s · tree max  1.0G · child max  452M · coordinator + 2 workers · 87% compile
 <b>│ </b>(summed resident sizes over-count pages the processes share)
 <b>│ </b>machine · 57.7G of 64.0G in use at peak
-<b>└ </b>run state: ~/.julia/yatf/runs/8db4f545/1790247276-96211.yatf
+<b>└ </b>run state: ~/.julia/yatf/runs/MyPackage-8db4f545/1790247276-96211.yatf
 </pre>
 
 The memory figures cover every process the run owns: the coordinator, the workers,
@@ -470,8 +470,8 @@ run again somewhere else:
 - the test environment's `Project.toml` and `Manifest.toml`.
 
 The path is printed at the end of every run. Run states live in the depot, in a
-directory per project under `yatf/runs/`, or in the directory `YATF_RUNSTATE_DIR`
-names. The 20 most recent that this machine recorded are kept, and once a project
+directory per project under `yatf/runs/` named for the project, or in the directory
+`YATF_RUNSTATE_DIR` names. The 20 most recent that this machine recorded are kept, and once a project
 no longer exists, the run states this machine recorded for it are deleted too. The
 machine is the hostname, or the name `YATF_HOST` gives it.
 One recorded elsewhere, such as a run state downloaded from CI, is never changed

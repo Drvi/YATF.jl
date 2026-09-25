@@ -314,7 +314,7 @@ using YATFWorkers: YATFWorkers
         @test isempty(slot.dying_log)
 
         # A process can print without limit on its way down.
-        slot.dying_log = path
+        @atomic slot.dying_log = path
         for i in 1:(YATF.Private.MAX_DYING_LINES + 50)
             YATF.Private.keep_dying_line!(slot, "line $i")
         end
@@ -323,7 +323,7 @@ using YATFWorkers: YATFWorkers
         @test length(readlines(path)) == 4 + YATF.Private.MAX_DYING_LINES
 
         # A log that cannot be written is a lost backtrace, never a failed run.
-        slot.dying_log = joinpath(dir, "no", "such", "dir", "x.log")
+        @atomic slot.dying_log = joinpath(dir, "no", "such", "dir", "x.log")
         YATF.Private.keep_dying_line!(slot, "x")
         @test YATF.Private.flush_dying_log!(slot) === nothing
         @test isempty(slot.dying_lines)

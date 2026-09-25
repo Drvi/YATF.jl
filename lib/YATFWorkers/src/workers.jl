@@ -387,13 +387,19 @@ end
 # here: a worker's watcher, relay or reader, or a timer. Each hands it on rather
 # than end with it or take it for a failure of its own.
 
+# Atomic: set on the target's thread, read from whichever thread caught Ctrl-C.
+mutable struct InterruptTarget
+    @atomic task :: Union{Nothing,Task}
+end
+
 """
     INTERRUPT_TARGET
 
-The task that an interrupt caught by one of this package's tasks is handed to, or
-`nothing`. Whoever starts workers sets it for as long as it wants those interrupts.
+`INTERRUPT_TARGET.task` is the task that an interrupt caught by one of this
+package's tasks is handed to, or `nothing`. Whoever starts workers sets it for as
+long as it wants those interrupts.
 """
-const INTERRUPT_TARGET = Ref{Union{Nothing,Task}}(nothing)
+const INTERRUPT_TARGET = InterruptTarget(nothing)
 
 """
     forward_interrupt(e) -> Bool
@@ -405,10 +411,11 @@ running and scheduling it is safe. Julia delivers SIGINT to thread 1, where the
 REPL and a script both run, so that is where the catching task is.
 """
 function forward_interrupt(e::Exception)
-    t = INTERRUPT_TARGET[]
+    t = @atomic INTERRUPT_TARGET.task
     (t === nothing || t === current_task() || istaskdone(t)) && return false
     (t.sticky && Threads.threadid(t) == Threads.threadid()) || return false
-    INTERRUPT_TARGET[] = nothing
+    # Taken by exactly one of the tasks that caught the same Ctrl-C.
+    (@atomicreplace INTERRUPT_TARGET.task t => nothing).success || return false
     schedule(t, e; error=true)
     return true
 end

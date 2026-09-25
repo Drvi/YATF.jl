@@ -251,7 +251,8 @@ coordinator of its own started with `julia_args`, and send it SIGINT `delay` sec
 after every item is running. With `repl`, the coordinator raises the interrupt as a
 REPL does; without, it exits on it, as a script and `Pkg.test` do. Returns whether
 the items got running, how long the coordinator took to end, what it printed and
-said on stderr, and the pids of the workers it started.
+said on stderr, the pids of the workers it started, and how many times Ctrl-C was
+pressed.
 """
 function interrupted_run(; items = 4, julia_args = String[], monitor = false, delay, repl = true)
     ready = joinpath(mktempdir(), "ready")
@@ -305,13 +306,26 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     sleep(delay)
     t0 = time()
     kill(proc, Base.SIGINT)
+    # A script's Ctrl-C is Julia's to act on, by ending the process, and Julia 1.12
+    # can pass one by while the run's own tasks all wait. Pressed again, as a person
+    # would. A REPL's Ctrl-C is the run's to handle, and there one that is lost is
+    # the failure under test.
+    presses = 1
+    while !repl && presses < 3 && timedwait(() -> process_exited(proc), 10) !== :ok
+        kill(proc, Base.SIGINT)
+        presses += 1
+    end
     # Bounded: an interrupt that is lost would hold the test for the items' ten
-    # minutes, and the time it took is what is checked. The workers go too: each is
-    # in a process group of its own, holds the coordinator's stderr, and would keep
-    # the output from ending until its item did.
-    if timedwait(() -> process_exited(proc), 120) !== :ok
+    # minutes, and the time it took is what is checked. SIGQUIT first, on which Julia
+    # prints every task's backtrace to stderr, which is said below. The workers go
+    # too: each is in a process group of its own, holds the coordinator's stderr, and
+    # would keep the output from ending until its item did.
+    hung = timedwait(() -> process_exited(proc), 120) !== :ok
+    if hung
+        kill(proc, 3)
+        timedwait(() -> process_exited(proc), 5)
         run(ignorestatus(`pkill -9 -P $(getpid(proc))`))
-        kill(proc, Base.SIGKILL)
+        process_running(proc) && kill(proc, Base.SIGKILL)
     end
     wait(proc)
     elapsed = time() - t0
@@ -319,9 +333,10 @@ function interrupted_run(; items = 4, julia_args = String[], monitor = false, de
     close(log)
     out = read(err, String)
     printed = read(log, String)
+    hung && @warn "the coordinator did not end after $presses Ctrl-C; its stderr:\n$out"
     started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
     rm(path; force=true)
-    return (; got_running, elapsed, out, printed, started)
+    return (; got_running, elapsed, out, printed, started, presses)
 end
 
 # What the coordinator catches: an `InterruptException`, or from 1.14 the

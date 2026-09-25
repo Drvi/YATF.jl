@@ -726,7 +726,8 @@ end
     runstate_dir(root) -> String
 
 `\$YATF_RUNSTATE_DIR` when set, otherwise a directory of the depot's own keyed by
-the project path, so nothing lands in the repository. Not under `scratchspaces/`:
+the project path, so nothing lands in the repository, and named for the project as
+well, so a person can tell which is whose. Not under `scratchspaces/`:
 `Pkg.gc`, which `Pkg` also runs after its own operations, deletes every directory
 there that no package has registered, and with it the history that orders the
 next run. The path is printed at the end of a run so CI can upload it.
@@ -734,7 +735,21 @@ next run. The path is printed at the end of a run so CI can upload it.
 function runstate_dir(root::AbstractString)
     dir = get(ENV, "YATF_RUNSTATE_DIR", "")
     isempty(dir) || return dir
-    return joinpath(runstate_root(), string(crc32c(abspath(root)); base = 16, pad = 8))
+    key = string(crc32c(abspath(root)); base = 16, pad = 8)
+    label = dir_label(root)
+    return joinpath(runstate_root(), isempty(label) ? key : string(label, "-", key))
+end
+
+# The project's name, or its directory's when it has none, as a directory name
+# takes it on any system: ASCII letters, digits, `_`, `-` and `.`, not leading with
+# a dot, at most 32 of them. For people to read; the key beside it tells projects
+# apart.
+function dir_label(root::AbstractString)
+    i = findfirst(f -> isfile(joinpath(root, f)), PROJECT_NAMES)
+    name = i === nothing ? nothing : project_name_of(joinpath(root, PROJECT_NAMES[i]))
+    name isa AbstractString || (name = basename(abspath(root)))
+    kept = filter(c -> isascii(c) && (isletter(c) || isdigit(c) || c in "_-."), name)
+    return first(lstrip(==('.'), kept), 32)
 end
 
 # Where each project's directory of run states goes, when `YATF_RUNSTATE_DIR` does

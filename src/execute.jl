@@ -6,18 +6,22 @@
 
 using Base: SIGKILL
 
+# A slot is its own task's, on the run's thread. The fields other threads read are
+# atomic: `worker` and `current`, which the monitor reads, and `dying_log`, which the
+# worker's output relay reads. `dying_lines` is the relay's while `dying_log` is set,
+# and the slot's again once it has joined the relay.
 mutable struct Slot
     const id::SlotIdx
     profile::Profile
-    worker::Union{Nothing, YATFWorkers.Worker}
+    @atomic worker::Union{Nothing, YATFWorkers.Worker}
     started_at::Float64      # when this slot's current process came up
     worker_items::Int        # items the current process has run, for its EXIT line
-    current::ItemIdx      # the item this slot is running, 0 when idle
+    @atomic current::ItemIdx      # the item this slot is running, 0 when idle
     # A process killed for a timeout prints its signal and backtrace after its item
     # has stopped capturing. Those lines belong in `dying_log`, the log of the item
     # that was running (empty otherwise), and wait in `dying_lines` until the
     # process is gone.
-    dying_log::String
+    @atomic dying_log::String
     const dying_lines::Vector{String}
     # Set by the memory guard: replace this slot's worker before its next unit. The
     # slot owns its worker, so the guard asks rather than kills: an item is never
@@ -171,12 +175,17 @@ mutable struct Run
     const names::Vector{String}
     const printer::ReentrantLock
     const t0::Float64
-    runstate::Union{Nothing, RunStateFile}
+    # Opened once the test environment is active, after the monitor, which writes
+    # its peaks here, has started.
+    @atomic runstate::Union{Nothing, RunStateFile}
     monitor::Union{Nothing, Monitor}
     # Profile name -> the project directory its workers run in. Only profiles that
     # declare preferences have one; everything else uses the test environment.
     const profile_projects::Dict{Symbol, String}
     @atomic ndone::Int
+    # Items whose state does not pass, kept by `set_state!` for the status line,
+    # which is drawn from other threads than the one the states are written on.
+    @atomic nonpass::Int
     # When an item last finished, or testing started: what the watchdog measures from.
     @atomic last_finish::Float64
     # Set when the watchdog stopped the run because nothing finished in time.
@@ -209,15 +218,16 @@ function execute(p::Plan, target)
     run = Run(
         p, Queues(p), Statuses(nitems(p)), Slot[], project_name, runid, logdir,
         joinpath(logdir, "item_"), column, names,
-        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0.0, false, Task[],
+        ReentrantLock(), time(), nothing, nothing, Dict{Symbol, String}(), 0, 0, 0.0, false, Task[],
         YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing
     )
     cfg.coverage && mkpath(coverage_dir(logdir))
     # Ctrl-C caught by any task the run starts is thrown into this one, which is
     # where the run knows how to stop.
-    outer = YATFWorkers.INTERRUPT_TARGET[]
-    YATFWorkers.INTERRUPT_TARGET[] = current_task()
-    cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
+    outer = @atomic YATFWorkers.INTERRUPT_TARGET.task
+    @atomic YATFWorkers.INTERRUPT_TARGET.task = current_task()
+    # The slots, then the monitor: its task walks `run.slots` from another thread,
+    # so the vector is complete before that task exists, and is never resized.
     for s in 1:nslots(p)
         push!(
             run.slots, Slot(
@@ -226,6 +236,10 @@ function execute(p::Plan, target)
             )
         )
     end
+    if cfg.monitor
+        run.monitor = Monitor(run; print_interval = cfg.monitor_interval)
+        start_monitor!(run.monitor)
+    end
     setup_path = joinpath(target.testdir, TESTSETUPS_DIR)
     return try
         run_phases(run, p, target, setup_path)
@@ -233,7 +247,7 @@ function execute(p::Plan, target)
         # Wherever the run stopped: a throw before the first item would otherwise
         # leave the monitor running and the error printed over its line.
         shielded(() -> stop_monitor!(run.monitor))
-        YATFWorkers.INTERRUPT_TARGET[] = outer
+        @atomic YATFWorkers.INTERRUPT_TARGET.task = outer
     end
 end
 
@@ -243,7 +257,7 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
         with_test_env(target, run) do
             # Opened once the test environment is active: its manifest is part of
             # what the file records.
-            run.runstate = open_runstate(p, run.t0)
+            @atomic run.runstate = open_runstate(p, run.t0)
             check_replayed_environment(run)
             with_load_path(setup_path) do
                 profile_projects!(run, p)
@@ -869,7 +883,7 @@ is.
 function interrupt_slots!(tasks)
     # These interrupts are the run's own. A slot hands back only the user's, and
     # handing these back would cut short the run's wait for its slots.
-    YATFWorkers.INTERRUPT_TARGET[] = nothing
+    @atomic YATFWorkers.INTERRUPT_TARGET.task = nothing
     for t in tasks
         (t === current_task() || istaskdone(t)) && continue
         try
@@ -1003,7 +1017,7 @@ end
 function ensure_worker!(run::Run, slot::Slot, target, exclusive::Bool)
     slot.worker === nothing || (slot.worker.terminated ? nothing : return slot.worker)
     w = start_worker(run, slot, target, exclusive)
-    slot.worker = w
+    @atomic slot.worker = w
     return w
 end
 
@@ -1041,7 +1055,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             init_worker!(run, slot, w)
             slot.started_at = time()
             slot.worker_items = 0
-            count_worker_start!(run.monitor, slot.id)
+            count_worker_start!(run.monitor)
             print_worker_line(
                 run, slot.id, "UP", string(
                     "pid ", w.pid, " · threads ", prof.threads,
@@ -1108,7 +1122,7 @@ send is dropped, and what it says goes with the item's log.
 """
 function relay!(run::Run, slot::Slot, within::Base.RefValue{Bool}, line::AbstractString)
     rec = parse_record(line)
-    if !isempty(slot.dying_log)
+    if !isempty(@atomic slot.dying_log)
         rec === nothing && keep_dying_line!(slot, line)
         return nothing
     end
@@ -1134,7 +1148,7 @@ file's only writer.
 """
 function flush_dying_log!(slot::Slot)
     path = slot.dying_log
-    slot.dying_log = ""
+    @atomic slot.dying_log = ""
     if !isempty(path) && !isempty(slot.dying_lines)
         try
             open(path, "a") do io
@@ -1188,7 +1202,7 @@ end
 function stop_worker!(run::Run, slot::Slot, why::AbstractString = "")
     w = slot.worker
     w === nothing && return nothing
-    slot.worker = nothing
+    @atomic slot.worker = nothing
     ran = slot.worker_items
     alive = slot.started_at == 0.0 ? 0.0 : time() - slot.started_at
     try
@@ -1221,7 +1235,7 @@ function died_how(run::Run, slot::Slot, w::YATFWorkers.Worker)
     elseif !alone
         how *= string(", stopped after ", replace(String(by), '_' => ' '))
     end
-    return string(how, memory_note(run.monitor, slot.id))
+    return string(how, memory_note(run.monitor, slot.id, w.pid))
 end
 
 """
@@ -1263,7 +1277,7 @@ function report_unfinished_run()
         for slot in run.slots
             w = slot.worker
             w === nothing && continue
-            slot.worker = nothing
+            @atomic slot.worker = nothing
             YATFWorkers.kill!(w)
         end
         # Told to stop, not waited for: `stop_monitor!` takes the printer and waits
@@ -1300,7 +1314,7 @@ function kill_workers!(run::Run, why::AbstractString = "interrupted")
         w = slot.worker
         w === nothing && continue
         @lock run.lock push!(run.killed, w)
-        slot.worker = nothing
+        @atomic slot.worker = nothing
         live += 1
         YATFWorkers.kill!(w)
     end
@@ -1374,8 +1388,18 @@ has_non_pass(run::Run, u::UnitIdx) =
 
 function reset_unit!(run::Run, u::UnitIdx)
     for i in run.plan.units.span[u]
-        run.statuses.state[i] = UNSEEN
+        set_state!(run, i, UNSEEN)
     end
+    return nothing
+end
+
+# Every write of an item's state goes through here, so that `run.nonpass`, which
+# the status line reads from other threads, is always the count of the states.
+function set_state!(run::Run, i::Integer, state::ItemState)
+    st = run.statuses
+    delta = Int(is_non_pass(state)) - Int(is_non_pass(st.state[i]))
+    st.state[i] = state
+    delta == 0 || @atomic run.nonpass += delta
     return nothing
 end
 
@@ -1392,7 +1416,7 @@ function run_unit_once!(run::Run, slot::Slot, u::UnitIdx, target, attempt::Int8,
     for i in p.units.span[u]
         # Every item is unseen when the loop reaches it: `reset_unit!` puts them
         # back before each retry.
-        is_cancelled(run.queues) && (run.statuses.state[i] = CANCELLED; continue)
+        is_cancelled(run.queues) && (set_state!(run, i, CANCELLED); continue)
         attempt_item!(run, slot, i, target, attempt, max_attempts) || return true
     end
     exclusive && stop_worker!(run, slot)
@@ -1425,17 +1449,17 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     end
     spec = item_spec(run, i, slot, attempt)
     began!(run, i, slot.id, attempt, w.pid)
-    slot.current = i
+    @atomic slot.current = i
     result = try
         dispatch(run, w, spec, item_timeout(p, i), slot)
     catch e
         # An interrupt leaves it set: the slot is unwinding, and what it was
         # running is the one thing `record_stopped_item!` needs from it.
         is_interrupt(e) && rethrow()
-        slot.current = ItemIdx(0)
+        @atomic slot.current = ItemIdx(0)
         return handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
     end
-    slot.current = ItemIdx(0)
+    @atomic slot.current = ItemIdx(0)
     slot.worker_items += 1
     record_result!(run, i, slot, attempt, result, max_attempts)
     return true
@@ -1542,12 +1566,12 @@ function handle_dispatch_failure!(
             # `wait` below joins the task relaying this worker's output, so
             # everything the process says on its way down has been filed by the
             # time the item is reported.
-            slot.dying_log = item_log_path(run.logprefix, i, attempt)
+            @atomic slot.dying_log = item_log_path(run.logprefix, i, attempt)
             YATFWorkers.terminate!(w, :timeout)
             wait(w)   # a replacement must not overlap the process it replaces
             flush_dying_log!(slot)
         end
-        slot.worker = nothing
+        @atomic slot.worker = nothing
         record_error!(
             run, i, slot, attempt, TIMEDOUT,
             string(sprint(showerror, e), " · ", retry_note(attempt, max_attempts, is_cancelled(run.queues)));
@@ -1568,7 +1592,7 @@ function handle_dispatch_failure!(
             how = died_how(run, slot, w)
             print_worker_line(run, slot.id, "LOST", string("pid ", w.pid, " · died while running ", repr(item), ": ", how))
         end
-        slot.worker = nothing
+        @atomic slot.worker = nothing
         # A stopped run took this worker away itself: the item neither failed nor
         # ran, and is counted with the ones that never started.
         if is_cancelled(run.queues)
@@ -1642,7 +1666,7 @@ function record!(
     )
     (state === UNSEEN || state === RUNNING) && error("YATF internal error: item $i recorded as $state")
     st = run.statuses
-    st.state[i] = state
+    set_state!(run, i, state)
     st.synthetic[i] = synthetic
     st.attempt[i] = attempt
     st.slot[i] = slot

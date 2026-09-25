@@ -16,8 +16,10 @@ without a person:
 - test setups: what [`setups_to_packages`](@ref) would do, making packages of the
   setups that are not and adding to their `[deps]` what they have come to import.
 - run states: this machine's, modified more than $(STALE_RUN_DAYS) days ago, are
-  deleted, except the newest $(HISTORY_RUNS), whose durations order the next run. One
-  recorded elsewhere, a CI artifact say, is never deleted.
+  deleted, except the newest $(HISTORY_RUNS) that name any of the suite's test items,
+  however old: their durations order the next run. A run that names none of them
+  orders nothing and is not among those kept. One recorded elsewhere, a CI artifact
+  say, is never deleted.
 
 Returns whether nothing is left to do: `true` when the check finds nothing, or when
 `fix = true` found nothing it could not do. `path` finds the package as it does for
@@ -27,11 +29,12 @@ function chores(args...; fix::Bool = false)
     target = resolve_target(args)
     todo = problems = 0
     body = styled() do io
-        problems += check_suite!(io, target)
+        bad, names = check_suite!(io, target)
+        problems += bad
         n, bad = chore_setups!(io, target, fix)
         todo += n
         problems += bad
-        todo += chore_runstates!(io, target, fix)
+        todo += chore_runstates!(io, target, fix, names)
         if problems > 0
             print(io, "to fix by hand: ", problems)
             todo > 0 && !fix && print(io, " · the rest `YATF.chores(fix = true)` does")
@@ -46,7 +49,8 @@ function chores(args...; fix::Bool = false)
 end
 
 # The suite as a full run would read it: its items, then its settings and what they
-# name. The number of problems a person has to fix.
+# name. The number of problems a person has to fix, and the names of the test items,
+# `nothing` when they could not be read.
 function check_suite!(io::IO, target)
     config = joinpath(target.testdir, "TestItems.toml")
     try
@@ -59,9 +63,9 @@ function check_suite!(io::IO, target)
         else
             println(io, "none")
         end
-        return 0
+        return 0, Set(p.items.name)
     catch e
-        e isa ConfigError && return print_problem(io, "config", e.msg)
+        e isa ConfigError && return print_problem(io, "config", e.msg), nothing
         e isa ScanFailure || e isa NoTestsError || rethrow()
         n = if e isa ScanFailure
             println(io, "test items: ", plural(length(e.errors), "problem"), ":")
@@ -75,14 +79,14 @@ function check_suite!(io::IO, target)
             read_config(target.testdir)
         catch e2
             e2 isa ConfigError || rethrow()
-            return n + print_problem(io, "config", e2.msg)
+            return n + print_problem(io, "config", e2.msg), nothing
         end
         if isfile(config)
             print(io, "config: ")
             printstyled(io, relpath_or_path(config, target.root); color = :light_black)
             println(io, " reads; the items it names are checked once the test items read")
         end
-        return n
+        return n, nothing
     end
 end
 
@@ -118,38 +122,47 @@ function chore_setups!(io::IO, target, fix::Bool)
 end
 
 # Deletes, under `fix`, the run states `stale_runstates` names; their number.
-function chore_runstates!(io::IO, target, fix::Bool)
+function chore_runstates!(io::IO, target, fix::Bool, names)
     files = runstate_files(target.root)
     print(io, "run states: ")
     isempty(files) && (println(io, "none"); return 0)
     print(io, length(files), " in ")
     printstyled(io, relpath_or_path(runstate_dir(target.root), target.root); color = :light_black)
-    stale = stale_runstates(target.root)
+    stale = stale_runstates(target.root, names)
     if isempty(stale)
         println(io, ", none to delete")
         return 0
     end
     fix && foreach(f -> rm(f; force = true), stale)
     println(io, ", ", length(stale), " of this machine's older than ", STALE_RUN_DAYS, " days ",
-            fix ? "deleted" : "to delete", " (the newest ", HISTORY_RUNS, " stay)")
+            fix ? "deleted" : "to delete", " (the newest ", HISTORY_RUNS,
+            names === nothing ? "" : " naming a test item", " stay)")
     return length(stale)
 end
 
 """
-    stale_runstates(root) -> Vector{String}
+    stale_runstates(root, names = nothing) -> Vector{String}
 
-The run states `chores(fix = true)` deletes: this machine's, for this project,
-modified more than `STALE_RUN_DAYS` ago, and not among the runs `history` reads.
-One recorded elsewhere, one of another project, and one that cannot be read are
-never among them: nothing shows they are this machine's to delete.
+The run states `chores(fix = true)` deletes, oldest first: this machine's, for this
+project, modified more than `STALE_RUN_DAYS` ago, and not among the newest
+`HISTORY_RUNS` that `history` could read and that name any of `names`, the suite's
+test items. Without `names` the newest `HISTORY_RUNS` stay whatever they name. One
+recorded elsewhere, one of another project, and one that cannot be read are never
+among them: nothing shows they are this machine's to delete.
 """
-function stale_runstates(root::AbstractString)
+function stale_runstates(root::AbstractString, names::Union{Nothing, AbstractSet{String}} = nothing)
     here, project = run_host(), project_id(root)
     cutoff = time() - STALE_RUN_DAYS * 86400
-    read_by_history = Set(first.(recent_runs(root, HISTORY_RUNS)))
-    return filter(runstate_files(root)) do f
-        (mtime(f) < cutoff && !(f in read_by_history)) || return false
+    stale = String[]
+    kept = 0
+    for f in Iterators.reverse(runstate_files(root))
         rs = read_run_state(f)
-        return rs !== nothing && get(rs.meta, "host", "") == here && of_project(rs, project)
+        (rs === nothing || !of_project(rs, project)) && continue
+        if kept < HISTORY_RUNS && !rs.dry_run && (names === nothing || any(it -> it.name in names, rs.items))
+            kept += 1
+        elseif mtime(f) < cutoff && get(rs.meta, "host", "") == here
+            push!(stale, f)
+        end
     end
+    return reverse!(stale)
 end

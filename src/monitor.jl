@@ -34,19 +34,24 @@ Sample() = Sample(0.0f0, PHASE_SETUP, 0, 0, 0, 0, 0, 0, 0, -1.0f0)
 
 # What one stage of a run cost. Per stage because the stages are different
 # machines: one process resolving, a few short-lived ones precompiling, and the
-# workers testing.
-Base.@kwdef mutable struct PhaseStats
-    entered::Float64 = 0.0    # when the run entered this stage, 0 if it never did
-    peak_total::Int64 = 0      # summed resident size over our processes
-    peak_single::Int64 = 0
+# workers testing. `entered` and `starts` are written on the run's thread, the rest
+# by the monitor's task; the monitor reads `entered`, so it is atomic, and `starts`
+# is read only once the monitor has stopped.
+mutable struct PhaseStats
+    @atomic entered::Float64   # when the run entered this stage, 0 if it never did
+    peak_total::Int64          # summed resident size over our processes
+    peak_single::Int64
     # Processes alive at the sample that set `peak_total`, not the most ever alive:
     # maxima from different instants, printed side by side, contradict each other.
-    nprocs_at_peak::Int = 0
-    workers_at_peak::Int = 0   # of those, the live workers
+    nprocs_at_peak::Int
+    workers_at_peak::Int       # of those, the live workers
     # Processes started during this stage. A stage that replaces a worker per item
     # churns through many more than are ever alive together.
-    starts::Int = 0
+    starts::Int
 end
+
+PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, nprocs_at_peak = 0, workers_at_peak = 0, starts = 0) =
+    PhaseStats(entered, peak_total, peak_single, nprocs_at_peak, workers_at_peak, starts)
 
 """
     MemStats
@@ -98,6 +103,24 @@ end
 
 const RING_SAMPLES = 300      # 60 s of history at 5 Hz, allocated once
 
+"""
+    Reading
+
+What the monitor has measured, as of its newest sample, for readers on other
+threads: the status line, which whoever prints redraws, and the report of a worker
+that died. Built whole by the monitor's task and published through one atomic
+field, so a reader sees one sample's figures together; the ring, the statistics and
+the peaks it is built from stay the monitor's own.
+"""
+struct Reading
+    sample::Sample
+    peak_total::Int64            # the run's peak, summed over its processes
+    peak_single::Int64           # the largest any one of them has been
+    phase_entered::Float64       # when the sample's stage began
+    worker_peak::Vector{Int64}   # per slot, the largest its worker was sampled at; a copy
+    worker_pid::Vector{Int32}    # and whose peak that is; a copy
+end
+
 mutable struct Monitor
     # `Run` is defined after this, so the field cannot name its type; `run_of`
     # restores it, or every access from the sampling loop is a dynamic lookup.
@@ -105,6 +128,8 @@ mutable struct Monitor
     const stats::MemStats
     const samples::Vector{Sample}
     ring_head::Int
+    # See `Reading`: the only way into what the monitor measures from another thread.
+    @atomic reading::Reading
     task::Union{Nothing, Task}
     @atomic stop::Bool
     # Something else owns the terminal for a moment; sampling carries on, drawing
@@ -121,11 +146,14 @@ mutable struct Monitor
     columns::Int
     # Scratch for the status line's list of running items, refilled rather than
     # rebuilt: on a terminal the line is redrawn after every line the run prints.
-    # Only ever touched under `run.printer`, which is held for every redraw.
+    # There it is only touched under `run.printer`, which every redraw holds; off a
+    # terminal only the monitor's task builds the line.
     const running::Vector{String}
-    # Per slot, the largest resident size sampled for its current process: what a
-    # report of that process's death can say about memory.
+    # Per slot, the largest resident size sampled for its current process, and that
+    # process's pid: a new pid starts a new peak. The monitor's task alone writes
+    # both; others read the peaks through `reading`.
     const worker_peak::Vector{Int64}
+    const worker_pid::Vector{Int32}
     # Where the status line is assembled, reused for the same reason. `lineio`
     # carries the colour setting into it: written to the buffer directly, every
     # `printstyled` in the line would come out plain.
@@ -133,7 +161,7 @@ mutable struct Monitor
     const lineio::IO
     const color::Bool
     # `strftime` builds a string per call and the clock moves once a second, while
-    # this line is redrawn after every line the run prints.
+    # this line is redrawn after every line the run prints. Touched as `running` is.
     clock_at::Int
     clock_text::String
     last_print::Float64
@@ -178,31 +206,34 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     # The run is already in its first stage by the time it has a monitor — nothing
     # calls `set_phase!` to enter the one it starts in.
     stats = MemStats()
-    phase_stats(stats, PHASE_SETUP).entered = time()
+    entered = time()
+    @atomic phase_stats(stats, PHASE_SETUP).entered = entered
+    n = nslots(run.plan)
     return Monitor(
-        run, stats, fill(Sample(), RING_SAMPLES), 0, nothing, false, false,
+        run, stats, fill(Sample(), RING_SAMPLES), 0, Reading(Sample(), 0, 0, entered, zeros(Int64, n), zeros(Int32, n)),
+        nothing, false, false,
         PHASE_SETUP, true, interval, print_interval, tty, terminal_columns(tty),
-        sizehint!(String[], nslots(run.plan)), zeros(Int64, nslots(run.plan)), linebuf,
+        sizehint!(String[], n), zeros(Int64, n), zeros(Int32, n), linebuf,
         IOContext(linebuf, :color => color), color, 0, "", 0.0, 0.0, 0.0,
         zeros(Float64, length(MEMORY_MARKS)), PHASE_REPORT, 0.0, 0.0, 0.0
     )
 end
 
 # Counted rather than sampled: a sandbox worker can live and die between samples.
-function count_worker_start!(m::Union{Nothing, Monitor}, slot::Integer)
+function count_worker_start!(m::Union{Nothing, Monitor})
     m === nothing && return nothing
     phase_stats(m.stats, @atomic m.phase).starts += 1
-    m.worker_peak[slot] = 0
     return nothing
 end
 
-# What memory looked like when a slot's worker was last seen: the largest its
-# process was sampled at, and the machine at the newest sample. Empty when nothing
-# was measured.
-function memory_note(m::Union{Nothing, Monitor}, slot::Integer)
+# What memory looked like when the worker `pid` in a slot was last seen: the largest
+# it was sampled at, and the machine at the newest sample. Empty when nothing was
+# measured; no peak when that worker died before a sample saw it.
+function memory_note(m::Union{Nothing, Monitor}, slot::Integer, pid::Integer)
     m === nothing && return ""
-    s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
-    peak = m.worker_peak[slot]
+    r = @atomic m.reading
+    s = r.sample
+    peak = r.worker_pid[slot] == pid ? r.worker_peak[slot] : 0
     return string(
         peak > 0 ? string(" · peak rss ", fmt_bytes(peak)) : "",
         s.machine_total > 0 ? string(" · machine ", round(Int, 100 * s.machine_used / s.machine_total), "% in use") : ""
@@ -212,7 +243,7 @@ end
 # Stamped by the run's own task as it enters a stage: one writer per field.
 function set_phase!(m::Union{Nothing, Monitor}, p::RunPhase)
     m === nothing && return nothing
-    phase_stats(m.stats, p).entered = time()
+    @atomic phase_stats(m.stats, p).entered = time()
     @atomic m.phase = p
     return nothing
 end
@@ -301,9 +332,14 @@ function sample!(m::Monitor)
             rss > largest && ((largest, largest_pid) = (rss, Int32(pid)))
         end
         for slot in run_of(m).slots
-            w = slot.worker
+            w = @atomic slot.worker
             w === nothing && continue
-            rss = process_rss(w.pid)
+            pid = Int32(w.pid)
+            if m.worker_pid[slot.id] != pid
+                m.worker_pid[slot.id] = pid
+                m.worker_peak[slot.id] = 0
+            end
+            rss = process_rss(pid)
             rss > m.worker_peak[slot.id] && (m.worker_peak[slot.id] = rss)
         end
     end
@@ -315,6 +351,9 @@ function sample!(m::Monitor)
     m.samples[head] = s
     m.ring_head = head
     update_stats!(m, s)
+    st = m.stats
+    @atomic m.reading = Reading(s, st.peak_total_bytes, st.peak_single_bytes,
+                                (@atomic phase_stats(st, phase).entered), copy(m.worker_peak), copy(m.worker_pid))
     return s
 end
 
@@ -327,13 +366,13 @@ function update_stats!(m::Monitor, s::Sample)
         st.peak_total_bytes = s.total_rss
         st.peak_total_at = Float64(s.t)
         st.peak_total_phase = s.phase
-        write_memory!(run_of(m).runstate, st)
+        write_memory!((@atomic run_of(m).runstate), st)
     end
     if s.largest_rss > st.peak_single_bytes
         st.peak_single_bytes = s.largest_rss
         st.peak_single_pid = s.largest_pid
         st.peak_single_item = item_on_pid(m, s.largest_pid)
-        write_memory!(run_of(m).runstate, st)
+        write_memory!((@atomic run_of(m).runstate), st)
     end
     # The stages are different memory regimes, and a figure for the whole run
     # hides which of them was the expensive one.
@@ -356,7 +395,7 @@ function running_items!(m::Monitor)
     dest = m.running
     empty!(dest)
     for slot in run_of(m).slots
-        i = slot.current
+        i = @atomic slot.current
         i == 0 || push!(dest, run_of(m).plan.items.name[i])
     end
     return dest
@@ -365,7 +404,7 @@ end
 function item_on_pid(m::Monitor, pid::Int32)
     for slot in run_of(m).slots
         # Read once each: the slot's own task changes both while this runs.
-        w, i = slot.worker, slot.current
+        w, i = (@atomic slot.worker), (@atomic slot.current)
         (w === nothing || i == 0) && continue
         Int32(w.pid) == pid && return run_of(m).plan.items.name[i]
     end
@@ -458,7 +497,10 @@ It is rebuilt after every line the run prints, so nothing formats through a
 temporary string.
 """
 function print_status_line(io::IO, m::Monitor)
-    s = m.samples[m.ring_head == 0 ? 1 : m.ring_head]
+    # Drawn by whichever task prints, on any thread: what the monitor measured
+    # comes from its published reading, and the run's own counts are atomic.
+    r = @atomic m.reading
+    s = r.sample
     run = run_of(m)
     total = nitems(run.plan)
     done = @atomic run.ndone
@@ -470,13 +512,12 @@ function print_status_line(io::IO, m::Monitor)
     write(io, UInt8('/'))
     print_int(io, total)
     print(io, FIELD)
-    # Counted from the states rather than tracked: an item that fails and then
-    # passes on a retry is not a failure. Unpadded: on a healthy run it is one digit.
-    print_int(io, count(is_non_pass, run.statuses.state))
+    # Unpadded: on a healthy run it is one digit.
+    print_int(io, @atomic run.nonpass)
     print(io, " failed")
     if !solo
         print(io, FIELD)
-        print_int(io, count(sl -> sl.worker !== nothing, run.slots))
+        print_int(io, count(sl -> (@atomic sl.worker) !== nothing, run.slots))
         write(io, UInt8('/'))
         print_int(io, length(run.slots))
         print(io, " workers")
@@ -487,7 +528,7 @@ function print_status_line(io::IO, m::Monitor)
             print(io, " · rss ")
             print_bytes(io, s.total_rss, TOTAL_WIDTH)
             print(io, " (max ")
-            print_bytes(io, m.stats.peak_total_bytes)
+            print_bytes(io, r.peak_total)
             write(io, UInt8(')'))
         else
             # The newest sample's whole tree, the coordinator among it, with the
@@ -495,12 +536,12 @@ function print_status_line(io::IO, m::Monitor)
             print(io, " · tree mem ")
             print_bytes(io, s.total_rss, TOTAL_WIDTH)
             print(io, " (max ")
-            print_bytes(io, m.stats.peak_total_bytes)
+            print_bytes(io, r.peak_total)
             write(io, UInt8(')'))
             # The largest any one process has been, not the largest now: a current
             # reading moves with whichever worker is mid-item.
             print(io, " · child max ")
-            print_bytes(io, m.stats.peak_single_bytes, TOTAL_WIDTH)
+            print_bytes(io, r.peak_single, TOTAL_WIDTH)
         end
     end
     if s.machine_total > 0
@@ -519,7 +560,7 @@ function print_status_line(io::IO, m::Monitor)
     # The stage and its age, then the first running item: last, because it is the
     # only field that changes width.
     print(io, " · ", phase_name(s.phase), " ")
-    print_age(io, run.t0 + Float64(s.t) - phase_stats(m.stats, s.phase).entered)
+    print_age(io, run.t0 + Float64(s.t) - r.phase_entered)
     running = running_items!(m)
     isempty(running) || (print(io, " · "); print_clipped(io, first(running), RUNNING_WIDTH))
     return nothing
@@ -910,8 +951,8 @@ function guard!(m::Monitor)
         m.stats.guard_actions += 1
         GC.gc(true)
         for slot in run.slots
-            w = slot.worker
-            (w === nothing || slot.current != 0) && continue   # do not disturb a running item
+            w = @atomic slot.worker
+            (w === nothing || (@atomic slot.current) != 0) && continue   # do not disturb a running item
             try
                 YATFWorkers.remote_eval(w, :(GC.gc(true)))
             catch e
@@ -927,18 +968,18 @@ function recycle_biggest_worker!(m::Monitor)
     run = run_of(m)
     victim, most = nothing, Int64(-1)
     for slot in run.slots
-        w = slot.worker
+        w = @atomic slot.worker
         (w === nothing || (@atomic slot.recycle)) && continue
         rss = process_rss(w.pid)
         rss > most && ((victim, most) = (slot, rss))
     end
     victim === nothing && return nothing
-    w = victim.worker
+    w = @atomic victim.worker
     w === nothing && return nothing
     @atomic victim.recycle = true
     say(run, "memory is above ", round(Int, 100 * run.plan.cfg.memory_threshold), "%; restarting w",
         victim.id, " (pid ", w.pid, most > 0 ? string(", ", fmt_bytes(most)) : "", ")",
-        victim.current == 0 ? "" : " once its item is done")
+        (@atomic victim.current) == 0 ? "" : " once its item is done")
     return nothing
 end
 

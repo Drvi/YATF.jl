@@ -474,6 +474,21 @@ end
         @test YATF.Private.plural(2, "process", "processes") == "2 processes"
     end
 
+    @testset "a dead worker's memory is its own" begin
+        p, target = prepare((fixture("Basic.jl"),); workers=1, logs=:issues, monitor=true)
+        run = execute(p, target)
+        rm(run.logdir; force=true, recursive=true)
+        m = run.monitor
+        r = @atomic m.reading
+        @atomic m.reading = YATF.Private.Reading(r.sample, r.peak_total, r.peak_single, r.phase_entered,
+                                                 [Int64(3) << 30], Int32[4242])
+        note(pid) = YATF.Private.memory_note(m, 1, pid)
+        @test occursin("peak rss $(fmt_bytes(Int64(3) << 30))", note(4242))
+        # A worker that died before a sample saw it is not given the peak of the
+        # one before it in the slot.
+        @test !occursin("peak rss", note(4243))
+    end
+
     @testset "a stage lasts until the next one starts" begin
         st = MemStats()
         # Nothing entered: nothing to report, and no negative durations.
@@ -481,8 +496,8 @@ end
             @test phase_seconds(st, phase, 100.0) == 0.0
             @test phase_peak(st, phase) == 0
         end
-        phase_stats(st, PHASE_SETUP).entered = 10.0
-        phase_stats(st, PHASE_TEST).entered = 20.0
+        @atomic phase_stats(st, PHASE_SETUP).entered = 10.0
+        @atomic phase_stats(st, PHASE_TEST).entered = 20.0
         @test phase_seconds(st, PHASE_SETUP, 100.0) == 10.0
         # The last stage entered runs until the run ends.
         @test phase_seconds(st, PHASE_TEST, 100.0) == 80.0
