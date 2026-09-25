@@ -332,6 +332,38 @@ end
         @test !YATF.Private.is_paused(run.queues)
     end
 
+    @testset "the memory guard restarts a worker between items, and stops no item" begin
+        # Asked while the worker is running an item: the item finishes and passes,
+        # and the next one gets a fresh process.
+        ready = joinpath(mktempdir(), "ready")
+        dir = make_pkg("GuardRecycle", "test/t_test.jl" => """
+            @testitem "holds the worker" begin
+                touch($(repr(ready)))
+                sleep(2)
+                @test true
+            end
+            @testitem "runs after" begin
+                @test true
+            end
+            """)
+        (states, run, p), out = capture_run() do
+            task = @async run_states(dir; workers=1, logs=:issues, monitor=false)
+            deadline = time() + 300
+            while !isfile(ready) && !istaskdone(task) && time() < deadline
+                sleep(0.05)
+            end
+            YATF.Private.recycle_biggest_worker!(Monitor(YATF.Private.LIVE_RUN[]))
+            fetch(task)
+        end
+        @test states["holds the worker"] === YATF.Private.PASSED
+        @test states["runs after"] === YATF.Private.PASSED
+        pid(name) = run.statuses.pid[findfirst(==(name), p.items.name)]
+        @test pid("holds the worker") != pid("runs after")
+        @test occursin("restarting w1 (pid $(pid("holds the worker"))", out)
+        @test occursin("once its item is done", out)
+        @test occursin(Regex("EXIT · pid $(pid("holds the worker")) · 1 item · .* · restarted by the memory guard"), out)
+    end
+
     @testset "a run with no workers does not talk about workers" begin
         (_, run, _), out = capture_run() do
             run_states(fixture("Basic.jl"); workers=0, logs=:issues, monitor=true,

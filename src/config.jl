@@ -41,7 +41,6 @@ Base.@kwdef struct RunConfig
     failfast::Bool = false
     item_failfast::Bool = false
     logs::Symbol = :issues
-    report::Bool = false
     verbose::Bool = false
     memory_threshold::Float64 = 0.9
     full_stacktraces::Bool = false
@@ -73,7 +72,7 @@ end
 
 const RUN_KEYS = (
     :workers, :threads, :timeout, :init_timeout, :test_end_timeout, :retries,
-    :failfast, :item_failfast, :logs, :report, :verbose, :memory_threshold,
+    :failfast, :item_failfast, :logs, :verbose, :memory_threshold,
     :monitor, :monitor_interval, :full_stacktraces, :full_names, :testset_name, :coverage, :seed,
 )
 const ORDER_KEYS = (:first, :last)
@@ -140,7 +139,12 @@ function build_config(path, toml; nunits = 0, kwargs...)
     run = section(path, toml, "run", RUN_KEYS)
     # A keyword wins over the file, and the file over the default.
     pick(key, default) = something(get(kwargs, key, nothing), get(run, string(key), default))
-    positive(key, x) = x > 0 ? x : throw(ConfigError("`$key` must be positive, got $x"))
+    seconds(key, x) = (x isa Real && 0 < x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+        throw(ConfigError("`$key` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got $(repr(x))"))
+    # 0 prints at every sample, five times a second: a test's way to make the
+    # monitor print as often as it can.
+    interval(x) = (x isa Real && 0 <= x <= MAX_TIMEOUT_S) ? Int(ceil(x)) :
+        throw(ConfigError("`monitor_interval` must be a number of seconds from 0 to $MAX_TIMEOUT_S, got $(repr(x))"))
 
     threads = string(pick(:threads, "2,1"))
     w = pick(:workers, "auto")
@@ -150,9 +154,10 @@ function build_config(path, toml; nunits = 0, kwargs...)
     workers >= 0 || throw(ConfigError("`workers` must be >= 0, got $workers"))
     logs = Symbol(pick(:logs, default_logs(workers)))
     logs in LOG_MODES || throw(ConfigError("`logs` must be one of $(LOG_MODES), got $(repr(logs))"))
-    timeout = positive(:timeout, Int(ceil(pick(:timeout, 30 * 60))))
-    retries = Int(pick(:retries, 0))
-    retries >= 0 || throw(ConfigError("`retries` must be >= 0, got $retries"))
+    timeout = seconds(:timeout, pick(:timeout, 30 * 60))
+    retries = pick(:retries, 0)
+    (retries isa Integer && 0 <= retries <= MAX_RETRIES) ||
+        throw(ConfigError("`retries` must be an integer from 0 to $MAX_RETRIES, got $(repr(retries))"))
     mt = Float64(pick(:memory_threshold, 0.9))
     0 < mt <= 1 || throw(ConfigError("`memory_threshold` must be in (0, 1], got $mt"))
     failfast = Bool(pick(:failfast, false))
@@ -177,15 +182,15 @@ function build_config(path, toml; nunits = 0, kwargs...)
 
     return RunConfig(;
         workers, threads, timeout_s = timeout,
-        init_timeout_s = positive(:init_timeout, Int(ceil(pick(:init_timeout, timeout)))),
-        test_end_timeout_s = positive(:test_end_timeout, Int(ceil(pick(:test_end_timeout, timeout)))),
-        retries, failfast, item_failfast = Bool(pick(:item_failfast, failfast)), logs,
-        report = Bool(pick(:report, false)), verbose = Bool(pick(:verbose, false)),
+        init_timeout_s = seconds(:init_timeout, pick(:init_timeout, timeout)),
+        test_end_timeout_s = seconds(:test_end_timeout, pick(:test_end_timeout, timeout)),
+        retries = Int(retries), failfast, item_failfast = Bool(pick(:item_failfast, failfast)), logs,
+        verbose = Bool(pick(:verbose, false)),
         memory_threshold = mt, monitor = Bool(pick(:monitor, true)),
         full_stacktraces = Bool(pick(:full_stacktraces, false)),
         full_names = Bool(pick(:full_names, false)),
         testset_name = String(testset_name), coverage, coverage_source,
-        monitor_interval = Int(pick(:monitor_interval, 30)),
+        monitor_interval = interval(pick(:monitor_interval, 30)),
         profiles = read_profiles(path, toml, threads),
         order_first = String[string(x) for x in get(order, "first", String[])],
         order_last = String[string(x) for x in get(order, "last", String[])],

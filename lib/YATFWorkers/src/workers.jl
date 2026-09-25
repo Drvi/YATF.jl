@@ -234,7 +234,8 @@ function live_worker_pids()
         # It can end between the check and the lookup, which then throws.
         pid = try
             getpid(proc)
-        catch
+        catch e
+            is_interrupt(e) && rethrow()
             continue
         end
         push!(pids, pid)
@@ -282,6 +283,67 @@ end
 wait_exit(proc::Base.Process, seconds::Real) =
     timedwait(() -> process_exited(proc), seconds; pollint=0.02) === :ok
 
+### Interrupts #############################################################
+
+# Julia throws Ctrl-C into whichever task its first thread is running, or last ran.
+# Without an interactive thread (`-t 1`, `-t 4,0`) that is often one of the tasks
+# here: a worker's watcher, relay or reader, or a timer. Each hands it on rather
+# than end with it or take it for a failure of its own.
+
+"""
+    INTERRUPT_TARGET
+
+The task that an interrupt caught by one of this package's tasks is handed to, or
+`nothing`. Whoever starts workers sets it for as long as it wants those interrupts.
+"""
+const INTERRUPT_TARGET = Ref{Union{Nothing,Task}}(nothing)
+
+"""
+    forward_interrupt(e) -> Bool
+
+Throw `e` into [`INTERRUPT_TARGET`](@ref), once: the target is cleared as it is
+thrown into, so the same Ctrl-C caught by a second task does not interrupt the
+target's cleanup. Only from the target's own thread, where the target cannot be
+running and scheduling it is safe. Julia delivers SIGINT to thread 1, where the
+REPL and a script both run, so that is where the catching task is.
+"""
+function forward_interrupt(e::Exception)
+    t = INTERRUPT_TARGET[]
+    (t === nothing || t === current_task() || istaskdone(t)) && return false
+    (t.sticky && Threads.threadid(t) == Threads.threadid()) || return false
+    INTERRUPT_TARGET[] = nothing
+    schedule(t, e; error=true)
+    return true
+end
+
+"""
+    after(f, seconds) -> Timer
+
+`Timer(_ -> f(), seconds)`, except that an interrupt thrown into the timer's task
+while it waits is handed on and the wait goes on: in `Timer`'s own task it would
+end the task, and the call with it. Closing the timer cancels the call.
+"""
+function after(f, seconds::Real)
+    timer = Timer(seconds)
+    # Shielded: a timeout fires however the work it bounds is being cancelled.
+    shielded(() -> Threads.@spawn call_when_due(f, timer))
+    return timer
+end
+
+function call_when_due(f, timer::Timer)
+    while true
+        try
+            wait(timer)
+            break
+        catch e
+            is_interrupt(e) || return nothing   # closed: cancelled
+            forward_interrupt(e)
+        end
+    end
+    f()
+    return nothing
+end
+
 # The signal on which the runtime prints every thread's backtrace and collects a
 # short CPU profile: SIGINFO on the BSDs, SIGUSR1 on Linux. Windows has neither.
 const INSPECT_SIGNAL = Sys.iswindows() ? nothing : Sys.isbsd() ? 29 : 10
@@ -301,7 +363,8 @@ function inspect!(w::Worker)
     process_running(w.process) || return nothing
     try
         kill(w.process, INSPECT_SIGNAL)   # the worker itself, not its process group
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return nothing
     end
     wait_exit(w.process, INSPECT_SECONDS)   # a worker that exits meanwhile needs no more time
@@ -346,12 +409,22 @@ end
 
 function watch_and_terminate!(w::Worker, ev::Threads.Event)
     notify(ev)
-    wait(w.process)
+    # This task records the process's end, so it waits on through an interrupt.
+    while true
+        try
+            wait(w.process)
+            break
+        catch e
+            is_interrupt(e) || rethrow()
+            forward_interrupt(e)
+        end
+    end
     terminate!(w, w.closing ? :close : :process_exit)
     w.on_exit === nothing && return nothing
     try
         w.on_exit(w)
     catch e
+        is_interrupt(e) && return forward_interrupt(e)
         @error "YATF: recording the exit of worker $(w.pid) failed" exception = (e, catch_backtrace())
     end
     return nothing
@@ -377,10 +450,14 @@ function kill!(w::Worker)
     try
         process_exited(w.process) || signal!(w.pid, w.process, Base.SIGKILL)
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         # Already gone, or never ours to signal. Either way there is nothing left
         # to stop, and an interrupt is not the moment to complain about it.
     end
+    # What `terminate!` would do on its way out, which it skips for a worker
+    # already marked terminated.
+    untrack!(w.process)
+    close(w.socket)
     return nothing
 end
 
@@ -401,7 +478,7 @@ function Base.wait(w::Worker)
         try
             wait(t)
         catch e
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
         end
     end
     return nothing
@@ -457,7 +534,9 @@ function Worker(;
     # exited has no pid to give; `read_port` below then says how it ended.
     pid = try
         getpid(proc)
-    catch
+    catch e
+        # Interrupted here, the process would be left waiting for a cookie.
+        is_interrupt(e) && (kill(proc, Base.SIGKILL); untrack!(proc); rethrow())
         Int32(0)
     end
     cookie = bytes2hex(rand(UInt8, COOKIE_BYTES ÷ 2))
@@ -481,9 +560,14 @@ function Worker(;
         w = Worker(ReentrantLock(), ReentrantLock(), pid, proc, sock,
                    Task(nothing), Task(nothing), Task(nothing),
                    Dict{UInt64,Future}(), UInt64(0), 0, false, false, :none, on_exit)
-        e1 = Threads.Event(); w.process_watch = Threads.@spawn watch_and_terminate!(w, $e1)
-        e2 = Threads.Event(); w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, $e2)
-        e3 = Threads.Event(); w.messages = Threads.@spawn process_responses(w, $e3)
+        # Shielded: these watch the worker until it has gone, which on Ctrl-C is
+        # what the caller's teardown waits for.
+        e1, e2, e3 = Threads.Event(), Threads.Event(), Threads.Event()
+        shielded() do
+            w.process_watch = Threads.@spawn watch_and_terminate!(w, e1)
+            w.output = Threads.@spawn redirect_worker_output(redirect_io, w, redirect_fn, proc, e2)
+            w.messages = Threads.@spawn process_responses(w, e3)
+        end
         wait(e1); wait(e2); wait(e3)
         return w
     catch
@@ -521,20 +605,24 @@ function with_timeout(f, timeout::Real)
         r = try
             Some($f())
         catch e
+            is_interrupt(e) && forward_interrupt(e)
             CapturedException(e, catch_backtrace())
         end
         try
             put!(result, r)
-        catch
-            # Closed by the timer: the caller has already given up.
+        catch e
+            # Closed by the timer: the caller has already given up. Interrupted, the
+            # caller is woken by the target the interrupt goes to.
+            is_interrupt(e) && forward_interrupt(e)
         end
     end
-    timer = Timer(timeout) do _
+    timer = after(timeout) do
         close(result, ErrorException("timed out after $timeout seconds"))
     end
     try
         r = take!(result)
-        r isa CapturedException && throw(r)
+        # An interrupt stays one, so the caller does not take it for a failed start.
+        r isa CapturedException && throw(is_interrupt(r.ex) ? r.ex : r)
         return something(r)
     finally
         close(timer)
@@ -546,18 +634,24 @@ end
 # for and nothing is lost.
 function redirect_worker_output(io::IO, w::Worker, fn, proc::Base.Process, ev::Threads.Event)
     notify(ev)
-    try
-        while !eof(proc)
-            line = readline(proc)
-            isempty(line) || (fn(io, w.pid, line); flush(io))
+    while true
+        try
+            while !eof(proc)
+                line = readline(proc)
+                isempty(line) || (fn(io, w.pid, line); flush(io))
+            end
+            return nothing
+        catch e
+            # `eof` and `readline` wait on the pipe's buffer and take nothing from it
+            # until a line is whole, so an interrupt loses no output.
+            is_interrupt(e) && (forward_interrupt(e); continue)
+            # Without a relay the worker blocks as soon as the pipe fills, so it
+            # cannot be kept.
+            @error "YATF: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
+            terminate!(w, :output_error, e)
+            return nothing
         end
-    catch e
-        # Without a relay the worker blocks as soon as the pipe fills, so it
-        # cannot be kept.
-        @error "YATF: could not relay the output of worker $(w.pid); terminating it" exception=(e, catch_backtrace())
-        terminate!(w, :output_error, e)
     end
-    return nothing
 end
 
 function process_responses(w::Worker, ev::Threads.Event)
@@ -596,7 +690,13 @@ function process_responses(w::Worker, ev::Threads.Event)
             end
         end
     catch e
-        if e isa EOFError || e isa Base.IOError
+        if is_interrupt(e)
+            # A large payload is read straight into its buffer, so a read cut short
+            # has taken bytes the next one would need: the connection is done. The
+            # target the interrupt went to takes the worker down with the rest; with
+            # none, it goes now, or its requests would wait for replies nobody reads.
+            forward_interrupt(e) || kill!(w)
+        elseif e isa EOFError || e isa Base.IOError
             terminate!(w, w.closing ? :close : :connection_lost)   # the coordinator closed it, or the worker died
         else
             @error "YATF: protocol error with worker $(w.pid); terminating it" exception=(e, catch_backtrace())

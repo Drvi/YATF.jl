@@ -108,6 +108,10 @@ end
             ("""@testitem "a" tags=[foo] begin\n end\n""", "vector of symbols"),
             ("""@testitem "a" sandbox=true chain=:c begin\n end\n""", "cannot be combined"),
             ("""@testitem "a" timeout=CONST begin\n end\n""", "positive number"),
+            # Too large for what holds them, and said as a problem with the file.
+            ("""@testitem "a" timeout=5/0 begin\n end\n""", "at most 2147483647"),
+            ("""@testitem "a" timeout=1e12 begin\n end\n""", "at most 2147483647"),
+            ("""@testitem "a" retries=10000000000 begin\n end\n""", "an integer from 0 to 126"),
         )
             a, _ = scan_source(src)
             @test a isa ScanFailure
@@ -146,6 +150,11 @@ end
         @test names(Filter(tags=:fast)) == ["add works", "mul works"]
         @test names(Filter(tags=[:fast, :math])) == ["mul works"]
         @test isempty(names(Filter(name="no such item")))
+        # Several names, in any collection; anything else is said to be wrong.
+        @test names(Filter(name=["mul works", "add works"])) == ["add works", "mul works"]
+        @test names(Filter(name=("mul works",))) == ["mul works"]
+        @test_throws r"`name = :x`: expected a name, a `Regex`, or a collection of names" Filter(name=:x)
+        @test_throws ArgumentError Filter(name=[1, 2])
     end
 
     @testset "results are ordered by file and line, whatever the task order" begin

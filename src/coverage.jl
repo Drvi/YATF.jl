@@ -186,7 +186,7 @@ function collect_coverage(run)
         files, lines, hit = merge_coverage(dir, root, out)
         return CoverageSummary(out, files, lines, hit, lost, "")
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         return CoverageSummary(out, 0, 0, 0, lost, sprint(showerror, e))
     end
 end

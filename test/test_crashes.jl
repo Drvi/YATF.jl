@@ -190,6 +190,9 @@ end
             @test !rs.cancelled
             # Stamped when it started and again when it finished, in that order.
             @test 0 < rs.start_unix <= rs.end_unix
+            # From the moment every offset in it counts from, so the start plus an
+            # attempt's offset is when that attempt began.
+            @test rs.start_unix == run.t0
         end
     end
 
@@ -239,16 +242,22 @@ process_alive(pid::Integer) = ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0
 
 # Windows has no signal to send: `kill` there terminates the process outright, so
 # there is no teardown to watch.
-Sys.iswindows() ||
-@testset "an interrupt takes the workers with it, at once" begin
-    # Ctrl-C is someone asking for their terminal back: the run goes down without
-    # waiting for the item each slot has in flight, which here sleeps for ten
-    # minutes.
+
+"""
+    interrupted_run(; items, julia_args, monitor, delay, repl) -> NamedTuple
+
+Run `items` items that each sleep for ten minutes, on as many workers, in a
+coordinator of its own started with `julia_args`, and send it SIGINT `delay` seconds
+after every item is running. With `repl`, the coordinator raises the interrupt as a
+REPL does; without, it exits on it, as a script and `Pkg.test` do. Returns whether
+the items got running, how long the coordinator took to end, what it printed and
+said on stderr, and the pids of the workers it started.
+"""
+function interrupted_run(; items = 4, julia_args = String[], monitor = false, delay, repl = true)
     ready = joinpath(mktempdir(), "ready")
     script = """
-    # A script exits on SIGINT unless told otherwise; a REPL raises it, and the
-    # second of those is what is under test.
-    Base.exit_on_sigint(false)
+    # A script exits on SIGINT unless told otherwise; a REPL raises it.
+    $(repl ? "Base.exit_on_sigint(false)" : "")
     using YATF
     include(joinpath($(repr(REPO_ROOT)), "test", "helpers.jl"))
     const FIXTURES = joinpath($(repr(REPO_ROOT)), "test", "packages")
@@ -260,15 +269,19 @@ Sys.iswindows() ||
             sleep(600)
             @test true
         end
-        \"\"\" for i in 1:4], "\\n"))
+        \"\"\" for i in 1:$items], "\\n"))
+    # From 1.14 Ctrl-C cancels this script's scope, where every later wait throws
+    # again: what it says afterwards is said shielded.
     try
-        run_states(dir; workers=4, logs=:issues, monitor=false)
+        run_states(dir; workers=$items, logs=:issues, monitor=$monitor)
     catch e
-        println(stderr, "CAUGHT \$(typeof(e))")
+        YATFWorkers.shielded(() -> println(stderr, "CAUGHT \$(typeof(e))"))
     end
-    sleep(0.5)
-    alive = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
-    println(stderr, "ALIVE \$alive")
+    YATFWorkers.shielded() do
+        sleep(0.5)
+        alive = @lock YATFWorkers.LIVE_LOCK count(Base.process_running, YATFWorkers.LIVE_PROCESSES)
+        println(stderr, "ALIVE \$alive")
+    end
     """
     path, io = mktemp()
     write(io, script)
@@ -276,25 +289,30 @@ Sys.iswindows() ||
     err = Base.BufferStream()
     log = Base.BufferStream()
     proc = run(pipeline(
-        setenv(`$(Base.julia_cmd()) --project=$(REPO_ROOT) --startup-file=no $path`,
+        setenv(`$(Base.julia_cmd()) $julia_args --project=$(REPO_ROOT) --startup-file=no $path`,
                "JULIA_LOAD_PATH" => string(REPO_ROOT, ":", joinpath(REPO_ROOT, "test"), ":")),
         stdout = log, stderr = err,
     ); wait = false)
-    # The items say when they are running, so the interrupt lands with all four of
-    # them mid-item: not during an environment build that can take minutes, and not
+    # The items say when they are running, so the interrupt lands with all of them
+    # mid-item: not during an environment build that can take minutes, and not
     # while a worker is still starting and has yet to print the pid looked for below.
-    running() = all(i -> isfile(ready * string(i)), 1:4)
+    running() = all(i -> isfile(ready * string(i)), 1:items)
     deadline = time() + 300
     while time() < deadline && process_running(proc) && !running()
-        sleep(0.5)
+        sleep(0.1)
     end
-    @test running()
-    # A real interrupt comes long after the stall watchdog first looked, and on 1.12
-    # it lands in whichever task last ran on the run's thread: the interrupt has to
-    # reach the run whatever has run by then.
-    sleep(YATF.Private.STALL_CHECK_S + 1)
+    got_running = running()
+    sleep(delay)
     t0 = time()
     kill(proc, Base.SIGINT)
+    # Bounded: an interrupt that is lost would hold the test for the items' ten
+    # minutes, and the time it took is what is checked. The workers go too: each is
+    # in a process group of its own, holds the coordinator's stderr, and would keep
+    # the output from ending until its item did.
+    if timedwait(() -> process_exited(proc), 120) !== :ok
+        run(ignorestatus(`pkill -9 -P $(getpid(proc))`))
+        kill(proc, Base.SIGKILL)
+    end
     wait(proc)
     elapsed = time() - t0
     close(err)
@@ -303,31 +321,83 @@ Sys.iswindows() ||
     printed = read(log, String)
     started = [parse(Int, m.captures[1]) for m in eachmatch(r"· pid (\d+)", printed)]
     rm(path; force=true)
-    # Generously above the second it takes, and far below the ten minutes an item
-    # here sleeps for: what is checked is that it does not wait for them.
-    @test elapsed < 30
-    # Asked from outside the run, because that is where it matters: whatever the
-    # coordinator got to do on its way down, no worker of its is still running. A
-    # worker takes a moment to die after the signal reaches it.
-    @test length(started) == 4
+    return (; got_running, elapsed, out, printed, started)
+end
+
+# What the coordinator catches: an `InterruptException`, or from 1.14 the
+# `CancellationRequest` that Ctrl-C has become.
+const CAUGHT_INTERRUPT = r"CAUGHT (InterruptException|(Base\.)?CancellationRequest)$"m
+
+# Asked from outside the run, because that is where it matters: whatever the
+# coordinator got to do on its way down, no worker of its is still running. A
+# worker takes a moment to die after the signal reaches it.
+function all_gone(pids)
     deadline = time() + 10
-    while time() < deadline && any(process_alive, started)
+    while time() < deadline && any(process_alive, pids)
         sleep(0.2)
     end
-    @test !any(process_alive, started)
+    return !any(process_alive, pids)
+end
+
+Sys.iswindows() ||
+@testset "an interrupt takes the workers with it, at once" begin
+    # Ctrl-C is someone asking for their terminal back: the run goes down without
+    # waiting for the item each slot has in flight, which here sleeps for ten
+    # minutes. A real interrupt comes long after the stall watchdog first looked:
+    # it has to reach the run whatever has run by then.
+    r = interrupted_run(; items = 4, delay = YATF.Private.STALL_CHECK_S + 1)
+    @test r.got_running
+    # Generously above the second it takes, and far below the ten minutes an item
+    # here sleeps for: what is checked is that it does not wait for them.
+    @test r.elapsed < 30
+    @test length(r.started) == 4
+    @test all_gone(r.started)
     # The report never happens — the exception takes the run out before it — so the
     # run says what it got through on its way past. The items it took a worker away
     # from did not fail and are counted, not reported one by one. On 1.12 nothing
     # unwinds to say this, and the exit hook is what says it instead.
-    @test occursin("interrupted after 0 of 4 test items", printed)
-    @test occursin("4 cancelled", printed)
-    @test !occursin("the worker running this item died", printed)
-    @test !occursin("ERR ", printed)
+    @test occursin("interrupted after 0 of 4 test items", r.printed)
+    @test occursin("4 cancelled", r.printed)
+    @test !occursin("the worker running this item died", r.printed)
+    @test !occursin("ERR ", r.printed)
     # The run itself sees the exception from 1.13. On 1.12 it is delivered to
     # whichever task thread 1 is running, which between items is one that has
     # already finished and has nothing left to catch it; the process dies there.
     if VERSION >= v"1.13"
-        @test occursin("CAUGHT InterruptException", out)
-        @test occursin("ALIVE 0", out)
+        @test occursin(CAUGHT_INTERRUPT, r.out)
+        @test occursin("ALIVE 0", r.out)
     end
+end
+
+Sys.iswindows() ||
+@testset "an interrupt reaches the run whichever of its tasks catches it" begin
+    # Without an interactive thread every task the run starts shares the thread
+    # Ctrl-C is thrown into: the monitor's, which wakes five times a second, or
+    # with no monitor a worker's output relay or message reader. Sent a second
+    # after the items start, before the stall watchdog first looks.
+    for monitor in (true, false)
+        r = interrupted_run(; items = 2, julia_args = ["--threads=1,0"], monitor, delay = 1.0)
+        @test r.got_running
+        @test r.elapsed < 30
+        @test all_gone(r.started)
+        @test occursin("interrupted after 0 of 2 test items", r.printed)
+        @test !occursin("could not relay", r.printed * r.out)
+        @test !occursin("resource monitor stopped", r.printed * r.out)
+        VERSION >= v"1.13" && @test occursin(CAUGHT_INTERRUPT, r.out)
+    end
+end
+
+Sys.iswindows() ||
+@testset "a script stopped by Ctrl-C blames its workers' deaths on nothing else" begin
+    # A script, and `Pkg.test`, exit on SIGINT: the exit hooks close the run. The
+    # run's own hook stops the workers before anything lets the slots run, so no
+    # slot finds its worker gone and puts it down to the out-of-memory killer.
+    r = interrupted_run(; items = 2, delay = 1.0, repl = false)
+    @test r.got_running
+    @test r.elapsed < 30
+    @test all_gone(r.started)
+    @test occursin("interrupted after 0 of 2 test items", r.printed)
+    @test occursin("2 cancelled", r.printed)
+    @test !occursin("out-of-memory", r.printed)
+    @test !occursin("LOST", r.printed)
 end

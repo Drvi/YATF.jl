@@ -181,13 +181,13 @@ function parse_testitem(ex::Expr, path, line, errors, known_setups)
             tags = Symbol[x for x in v]
         elseif key === :timeout
             v = literal(val)
-            (v isa Real && v > 0) ||
-                return err("`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, got `$(_show(val))`")
+            (v isa Real && 0 < v <= MAX_TIMEOUT_S) ||
+                return err("`@testitem $(repr(name))`: `timeout` must be a positive number of seconds, at most $MAX_TIMEOUT_S, got `$(_show(val))`")
             timeout = Int32(ceil(v))
         elseif key === :retries
             v = literal(val)
-            (v isa Integer && v >= 0) ||
-                return err("`@testitem $(repr(name))`: `retries` must be a non-negative integer, got `$(_show(val))`")
+            (v isa Integer && 0 <= v <= MAX_RETRIES) ||
+                return err("`@testitem $(repr(name))`: `retries` must be an integer from 0 to $MAX_RETRIES, got `$(_show(val))`")
             retries = Int32(v)
         elseif key === :failfast
             v = literal(val)

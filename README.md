@@ -144,8 +144,8 @@ YATF.chores()                            # what the suite needs tidying; fix=tru
 ```
 
 A tag expression is names joined with `&&` and `||`, each optionally negated with
-`!`; `&&` binds tighter, and there are no parentheses. `name` also takes a set of
-names.
+`!`; `&&` binds tighter, and there are no parentheses. `name` also takes several
+names, as a vector or a set.
 
 `YATF.chores()` reports what a suite needs looking after: anything a run would
 refuse to start on, in the test items or in `TestItems.toml`; setups that are not
@@ -173,7 +173,7 @@ given.
 | `verbose` | print every item's results and output, passing ones included |
 | `memory_threshold` | the share of the machine's memory in use at which the run holds off on new items; 0.9 by default |
 | `monitor` | watch memory and show the progress line; on by default |
-| `monitor_interval` | how often the progress line is printed when there is no terminal to redraw it on; 30 seconds by default |
+| `monitor_interval` | how often the progress line is printed when there is no terminal to redraw it on; 30 seconds by default, and 0 prints it five times a second |
 | `full_stacktraces` | keep YATF's own frames in a failing item's backtrace |
 | `full_names` | write every item's name whole, where by default one much longer than the rest is shortened to a prefix of its own (see [The plan](#the-plan)) |
 | `testset_name` | what the run's testset is called in the summary; `"YATF"` by default. Runs of several calls under one `@testset` are told apart by it |
@@ -320,8 +320,10 @@ the list after it says what the peak was summed over (`coordinator + 8 workers +
 spawned`, say).
 
 If memory gets tight the run holds off on new items, collects garbage, and only
-then restarts the largest worker. The hold is bounded, so pressure caused by
-something else on the machine slows a run down but never stalls it.
+then restarts the largest worker, once the item it is running has finished: a
+running item is never stopped for memory, which may be someone else's. The hold is
+bounded, so pressure caused by something else on the machine slows a run down but
+never stalls it.
 
 A run that goes longer without any item finishing than one attempt at any of them
 may take (the largest `timeout`, the profiles' `init` and `test_end` limits, a

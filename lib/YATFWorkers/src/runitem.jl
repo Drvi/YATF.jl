@@ -343,7 +343,7 @@ function eval_block!(ts::Test.AbstractTestSet, spec::ItemSpec, code::Expr, modna
             end
         end
     catch err
-        err isa InterruptException && rethrow()
+        is_interrupt(err) && rethrow()
         if !is_failfast_error(err)
             try
                 stack = Base.current_exceptions()

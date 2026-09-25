@@ -221,19 +221,25 @@ function start_monitor!(m::Monitor)
     try
         ensure_checked!()
     catch e
+        is_interrupt(e) && rethrow()
         @warn "YATF: per-process memory accounting is unavailable here" exception = e maxlog = 1
     end
     # A task keeps the logger of the scope that started it, and the monitor starts
     # before the run's own is in place: its warnings go through `printline` whoever
     # starts it, or they land on the status line it draws.
     logger = RunLogger(current_logger(), run_of(m))
-    m.task = Threads.@spawn with_logger(logger) do
-        try
-            monitor_loop(m)
-        catch e
-            e isa InterruptException && rethrow()
-            @atomic m.enabled = false
-            @warn "YATF: the resource monitor stopped; the run continues without it" exception = e
+    # Shielded: the run stops it, and it watches the run's teardown too.
+    m.task = shielded() do
+        Threads.@spawn with_logger(logger) do
+            try
+                monitor_loop(m)
+            catch e
+                # Ctrl-C, when this was the task its thread last ran: the run is
+                # stopping, and needs no monitor to do it.
+                is_interrupt(e) && return YATFWorkers.forward_interrupt(e)
+                @atomic m.enabled = false
+                @warn "YATF: the resource monitor stopped; the run continues without it" exception = e
+            end
         end
     end
     return m
@@ -303,8 +309,11 @@ function sample!(m::Monitor)
     end
     load1 = Float32(cpu_load())
     s = Sample(t, phase, Int16(nprocs), Int16(nworkers), total_rss, largest, largest_pid, used, total, load1)
-    m.ring_head = mod1(m.ring_head + 1, RING_SAMPLES)
-    m.samples[m.ring_head] = s
+    # The sample before the head that points at it: a reader between the two would
+    # get the slot's previous contents, a sample from minutes ago.
+    head = mod1(m.ring_head + 1, RING_SAMPLES)
+    m.samples[head] = s
+    m.ring_head = head
     update_stats!(m, s)
     return s
 end
@@ -874,7 +883,7 @@ function guard!(m::Monitor)
     if over > GUARD_GC_SECONDS && now - m.last_restart > GUARD_RESTART_COOLDOWN
         m.last_restart = now
         m.stats.guard_actions += 1
-        restart_biggest_worker!(m, s)
+        recycle_biggest_worker!(m)
     elseif over > GUARD_BACKPRESSURE_SECONDS && now - m.last_gc > GUARD_GC_SECONDS
         m.last_gc = now
         m.stats.guard_actions += 1
@@ -884,37 +893,31 @@ function guard!(m::Monitor)
             (w === nothing || slot.current != 0) && continue   # do not disturb a running item
             try
                 YATFWorkers.remote_eval(w, :(GC.gc(true)))
-            catch
+            catch e
+                is_interrupt(e) && rethrow()
             end
         end
     end
     return nothing
 end
 
-function restart_biggest_worker!(m::Monitor, s::Sample)
+# The largest worker, measured now, is replaced once its slot is between units.
+function recycle_biggest_worker!(m::Monitor)
     run = run_of(m)
-    victim = nothing
+    victim, most = nothing, Int64(-1)
     for slot in run.slots
         w = slot.worker
-        w === nothing && continue
-        (victim === nothing || Int32(w.pid) == s.largest_pid) && (victim = slot)
+        (w === nothing || (@atomic slot.recycle)) && continue
+        rss = process_rss(w.pid)
+        rss > most && ((victim, most) = (slot, rss))
     end
     victim === nothing && return nothing
     w = victim.worker
     w === nothing && return nothing
-    print_worker_line(
-        run, victim.id, "KILL", string(
-            "pid ", w.pid,
-            " · memory guard: pressure above ", round(Int, 100 * run.plan.cfg.memory_threshold),
-            "% · restarting to free memory",
-            victim.current == 0 ? "" : string(" · was running ", repr(run.plan.items.name[victim.current]))
-        )
-    )
-    # The slot task sees this as its worker dying, which it already knows how to
-    # handle: the item is recorded, and retried if retries remain.
-    try
-        YATFWorkers.terminate!(w, :memory_guard)
-    catch
-    end
+    @atomic victim.recycle = true
+    say(run, "memory is above ", round(Int, 100 * run.plan.cfg.memory_threshold), "%; restarting w",
+        victim.id, " (pid ", w.pid, most > 0 ? string(", ", fmt_bytes(most)) : "", ")",
+        victim.current == 0 ? "" : " once its item is done")
     return nothing
 end
+

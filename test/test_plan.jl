@@ -475,6 +475,31 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
         @test why_column(History(seconds, Dict{String, Int}(), 0.0))["c1"] == "[order] first"
     end
 
+    @testset "[order] last naming any member of a chain sends the chain last" begin
+        dir = make_pkg("ChainLast", "test/a_test.jl" => declared("one", "two"; opts = "chain=:c") * declared("three"))
+        toml = joinpath(dir, "test", "TestItems.toml")
+        for (listed, order) in (["one"] => ["three", "one", "two"], ["two"] => ["three", "one", "two"],
+                                ["three"] => ["one", "two", "three"])
+            write(toml, "[order]\nlast = [$(repr(only(listed)))]\n")
+            p = plan_dir(dir; workers = 1)
+            @test dispatch_order(p) == order
+            @test p.units.why[p.items.unit[findfirst(==(only(listed)), p.items.name)]] === YATF.Private.PINNED_LAST
+        end
+        # Pinned by the member listed first, as `first` is.
+        write(toml, "[order]\nlast = [\"two\", \"three\"]\n")
+        @test dispatch_order(plan_dir(dir; workers = 1)) == ["one", "two", "three"]
+        write(toml, "[order]\nlast = [\"three\", \"two\"]\n")
+        @test dispatch_order(plan_dir(dir; workers = 1)) == ["three", "one", "two"]
+        # A chain runs as one, so it cannot be both first and last; nor can an item.
+        write(toml, "[order]\nfirst = [\"one\"]\nlast = [\"two\"]\n")
+        err = try plan_dir(dir) catch e; e end
+        @test err isa ConfigError
+        @test occursin("chain `c` runs as one, and `first` names \"one\" while `last` names \"two\"", err.msg)
+        write(toml, "[order]\nfirst = [\"three\"]\nlast = [\"three\"]\n")
+        err = try plan_dir(dir) catch e; e end
+        @test err isa ConfigError && occursin("\"three\" is named by both", err.msg)
+    end
+
     @testset "the table is in the order the run would start the items, and says where" begin
         rows(p) = filter(l -> occursin("_test.jl:", l), split(sprint(print_plan, p), '\n'))
         worker(l) = match(r"·\s+(w\d+) ·", l).captures[1]

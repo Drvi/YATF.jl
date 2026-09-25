@@ -128,7 +128,8 @@ function warn_ignored(item::RawItem, sandboxed::Bool)
         set && push!(given, string("`", key, "` (", why, ")"))
     end
     isempty(given) && return nothing
-    @warn "YATF: running `$(item.name)` here, so these are ignored: " * join(given, ", ") maxlog = 1
+    # Once per item, not once per session: `maxlog` counts by message id.
+    @warn "YATF: running `$(item.name)` here, so these are ignored: " * join(given, ", ") maxlog = 1 _id = (:yatf_ignored, item.name)
     return nothing
 end
 

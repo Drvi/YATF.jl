@@ -19,6 +19,10 @@ mutable struct Slot
     # process is gone.
     dying_log::String
     const dying_lines::Vector{String}
+    # Set by the memory guard: replace this slot's worker before its next unit. The
+    # slot owns its worker, so the guard asks rather than kills: an item is never
+    # stopped for memory the machine may be short of on someone else's account.
+    @atomic recycle::Bool
 end
 
 """
@@ -111,13 +115,15 @@ is_paused(q::Queues) = @lock q.lock q.paused
 # through.
 const MAX_BACKPRESSURE_SECONDS = 30.0
 
-function wait_while_paused(q::Queues)
+function wait_while_paused(q::Queues, slot::Slot)
     is_paused(q) || return nothing
     deadline = time() + MAX_BACKPRESSURE_SECONDS
-    while is_paused(q) && !is_cancelled(q) && time() < deadline
+    # A slot asked to replace its worker does it now, which frees memory sooner
+    # than waiting does.
+    while is_paused(q) && !is_cancelled(q) && !(@atomic slot.recycle) && time() < deadline
         sleep(0.2)
     end
-    if is_paused(q) && !is_cancelled(q)
+    if is_paused(q) && !is_cancelled(q) && time() >= deadline
         set_paused!(q, false)
         @warn "YATF: memory has stayed tight for $(round(Int, MAX_BACKPRESSURE_SECONDS))s; " *
             "continuing rather than stalling the run" maxlog = 1
@@ -207,12 +213,16 @@ function execute(p::Plan, target)
         YATFWorkers.Worker[], ReentrantLock(), Set{Int32}(), nothing
     )
     cfg.coverage && mkpath(coverage_dir(logdir))
+    # Ctrl-C caught by any task the run starts is thrown into this one, which is
+    # where the run knows how to stop.
+    outer = YATFWorkers.INTERRUPT_TARGET[]
+    YATFWorkers.INTERRUPT_TARGET[] = current_task()
     cfg.monitor && (run.monitor = start_monitor!(Monitor(run; print_interval = cfg.monitor_interval)))
     for s in 1:nslots(p)
         push!(
             run.slots, Slot(
                 SlotIdx(s), p.profiles[p.pools[p.slot_pool[s]].profile],
-                nothing, 0.0, 0, ItemIdx(0), "", String[]
+                nothing, 0.0, 0, ItemIdx(0), "", String[], false
             )
         )
     end
@@ -222,7 +232,8 @@ function execute(p::Plan, target)
     finally
         # Wherever the run stopped: a throw before the first item would otherwise
         # leave the monitor running and the error printed over its line.
-        stop_monitor!(run.monitor)
+        shielded(() -> stop_monitor!(run.monitor))
+        YATFWorkers.INTERRUPT_TARGET[] = outer
     end
 end
 
@@ -232,7 +243,7 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
         with_test_env(target, run) do
             # Opened once the test environment is active: its manifest is part of
             # what the file records.
-            run.runstate = open_runstate(p)
+            run.runstate = open_runstate(p, run.t0)
             check_replayed_environment(run)
             with_load_path(setup_path) do
                 profile_projects!(run, p)
@@ -260,31 +271,36 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                     (@atomic run.stalled) && throw(RunStalled(limit))
                 catch e
                     stalled = @atomic run.stalled
-                    if e isa InterruptException || stalled
+                    if is_interrupt(e) || stalled
                         interrupted = true
-                        kill_workers!(run)
+                        shielded(() -> kill_workers!(run))
                     end
                     stalled ? throw(RunStalled(limit)) : rethrow()
                 finally
-                    close(watchdog)
-                    # Reaching here at all means the run unwound, so the exit hook
-                    # has nothing left to close.
-                    LIVE_RUN[] = nothing
-                    set_phase!(run.monitor, PHASE_REPORT)
-                    stop_monitor!(run.monitor)
-                    shutdown!(run)
-                    # Every worker has exited, so every tracefile there will be is written.
-                    cfg.coverage && (run.coverage = collect_coverage(run))
-                    run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
-                    finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
-                    # A replay deletes no run state, the one it runs least of all.
-                    if isempty(p.cfg.replayed_from)
-                        prune_runstates(p.root)
-                        sweep_runstate_dirs()
+                    # Shielded: after a cancellation every wait in this task throws
+                    # again, and this has to finish.
+                    shielded() do
+                        close(watchdog)
+                        # Reaching here at all means the run unwound, so the exit
+                        # hook has nothing left to close.
+                        LIVE_RUN[] = nothing
+                        set_phase!(run.monitor, PHASE_REPORT)
+                        stop_monitor!(run.monitor)
+                        shutdown!(run)
+                        # Every worker has exited, so every tracefile there will be
+                        # is written.
+                        cfg.coverage && (run.coverage = collect_coverage(run))
+                        run.monitor === nothing || write_memory!(run.runstate, run.monitor.stats)
+                        finish_run_state!(run.runstate; cancelled = is_cancelled(run.queues))
+                        # A replay deletes no run state, the one it runs least of all.
+                        if isempty(p.cfg.replayed_from)
+                            prune_runstates(p.root)
+                            sweep_runstate_dirs()
+                        end
+                        # The exception on its way out stops the report from being
+                        # made, so what the run got through is said here or nowhere.
+                        interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
                     end
-                    # The exception on its way out stops the report from being
-                    # made, so what the run got through is said here or nowhere.
-                    interrupted && print_conclusion(run, (@atomic run.stalled) ? :stalled : :interrupted)
                 end
                 run
             end
@@ -374,7 +390,7 @@ function test_env(target, announce = nothing)
             TEST_ENVS[proj] = (env, env_stamp(target))
             return env
         catch e
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
             throw(
                 ConfigError(
                     "could not build a test environment for $(relpath_or_path(proj)): " *
@@ -449,9 +465,9 @@ end
 
 # A run state we cannot write is a run state we do without: the tests matter more
 # than the record of them.
-function open_runstate(p::Plan)
+function open_runstate(p::Plan, start::Float64)
     try
-        return init_run_state(new_runstate_path(p.root), p)
+        return init_run_state(new_runstate_path(p.root), p; start)
     catch e
         @warn "YATF: could not open a run state file; continuing without one" exception = e
         return nothing
@@ -594,8 +610,8 @@ function precompile_phase(run::Run, p::Plan, target)
     return nothing
 end
 
-const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(f.use_pkgimages, ' ', f.debug_level, " *
-    "' ', f.check_bounds, ' ', f.inline, ' ', f.opt_level)"
+# Every field, in order: the set differs between versions (1.14 adds `coverage`).
+const CACHE_FLAGS_CODE = "f = Base.CacheFlags(); print(join((getfield(f, i) for i in 1:nfields(f)), ' '))"
 
 """
     cache_flags_for(julia_args) -> Base.CacheFlags
@@ -610,10 +626,9 @@ function cache_flags_for(julia_args::Cmd)
         String
     )
     f = split(out)
-    length(f) == 5 || error("YATF: could not read the cache flags of `julia $julia_args`: $out")
-    return Base.CacheFlags(
-        parse(Bool, f[1]), parse(Int, f[2]), parse(Int, f[3]), parse(Bool, f[4]), parse(Int, f[5])
-    )
+    T = Base.CacheFlags
+    length(f) == fieldcount(T) || error("YATF: could not read the cache flags of `julia $julia_args`: $out")
+    return T((parse(fieldtype(T, i), f[i]) for i in 1:fieldcount(T))...)
 end
 
 """
@@ -664,7 +679,7 @@ function profile_flags(prof::Profile)
     return try
         isempty(prof.julia_args) ? Base.CacheFlags() : cache_flags_for(Cmd(prof.julia_args))
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         @warn "YATF: could not read the cache flags of profile `$(prof.name)`; its \
                workers will compile what they need themselves" exception = e
         nothing
@@ -686,7 +701,7 @@ function precompile_configs(run::Run, configs, project, what::AbstractString)
             )
         end
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         @warn "YATF: could not precompile the test environment for $what; its workers \
                will compile what they need themselves" exception = e
     finally
@@ -722,7 +737,7 @@ function precompile_setups(run::Run, p::Plan, target)
         try
             Base.compilecache(pkg, out, out)
         catch e
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
             detail = strip(String(take!(out)))
             throw(
                 ConfigError(
@@ -739,22 +754,32 @@ end
 ### Workers ################################################################
 
 function run_on_workers(run::Run, target)
-    tasks = map(run.slots) do slot
-        Threads.@spawn begin
-            s = $slot
-            try
-                run_slot(run, s, target)
-            catch e
-                if e isa InterruptException
-                    cancel!(run.queues)
-                    record_stopped_item!(run, s)
-                    rethrow()
+    # On the run's own thread, as the watchdog is. Interrupting a slot, which an
+    # interrupt and a stall both do, schedules its task, and scheduling a task that
+    # is running on another thread corrupts the scheduler; a task on this thread
+    # cannot be running while the one scheduling it is. A slot's own work is small
+    # beside its item's, which runs in the worker: 1200 trivial items on 8 workers
+    # take 0.8s. Shielded, so that a cancellation reaches this task alone, which
+    # stops the slots itself.
+    tasks = shielded() do
+        map(run.slots) do slot
+            @async begin
+                s = $slot
+                try
+                    run_slot(run, s, target)
+                catch e
+                    if is_interrupt(e)
+                        YATFWorkers.forward_interrupt(e)
+                        cancel!(run.queues)
+                        record_stopped_item!(run, s)
+                        rethrow()
+                    end
+                    # This slot is finished, not the run: its units stay in its
+                    # queue for the others to steal, so one bad item does not stop
+                    # a suite.
+                    @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
+                        "left for the other workers" exception = (e, catch_backtrace())
                 end
-                # This slot is finished, not the run: its units stay in its
-                # queue for the others to steal, so one bad item does not stop
-                # a suite.
-                @error "YATF: worker slot $(s.id) stopped; its remaining items are " *
-                    "left for the other workers" exception = (e, catch_backtrace())
             end
         end
     end
@@ -766,19 +791,26 @@ function run_on_workers(run::Run, target)
         # dispatching and kill the processes rather than wait for them, or an item
         # that sleeps for two minutes holds the interrupt that long. The slot tasks
         # are still waited for: `shutdown!` must not find a slot starting a worker.
-        cancel!(run.queues)
-        if e isa InterruptException
-            kill_workers!(run)
-            interrupt_slots!(tasks)
+        # A slot that caught Ctrl-C and could not hand it on fails with it, which is
+        # the interrupt all the same; one the stall watchdog interrupted is not.
+        interrupt = is_interrupt(e) ? e :
+            e isa TaskFailedException && is_interrupt(e.task.result) && !(@atomic run.stalled) ?
+            e.task.result : nothing
+        shielded() do
+            cancel!(run.queues)
+            if interrupt !== nothing
+                kill_workers!(run)
+                interrupt_slots!(tasks)
+            end
+            foreach(
+                t -> (
+                    try
+                        wait(t)
+                    catch end
+                ), tasks
+            )
         end
-        foreach(
-            t -> (
-                try
-                    wait(t)
-                catch end
-            ), tasks
-        )
-        rethrow()
+        interrupt === nothing ? rethrow() : throw(interrupt)
     end
     check_finished(run)
     return nothing
@@ -823,10 +855,14 @@ end
 
 Hand the interrupt to each slot task rather than wait for it to notice. Killing
 the workers frees a slot waiting on one and cancelling stops a slot between items,
-but a slot building an environment or held back by the memory guard would wait for
-whatever it is waiting on.
+but a slot starting a worker or held back by the memory guard would wait for
+whatever it is waiting on. Called from the run's own thread, where every slot task
+is.
 """
 function interrupt_slots!(tasks)
+    # These interrupts are the run's own. A slot hands back only the user's, and
+    # handing these back would cut short the run's wait for its slots.
+    YATFWorkers.INTERRUPT_TARGET[] = nothing
     for t in tasks
         (t === current_task() || istaskdone(t)) && continue
         try
@@ -887,26 +923,32 @@ returned timer ends the watchdog.
 function start_watchdog(run::Run, limit::Real)
     every = min(STALL_CHECK_S, limit / 4)
     timer = Timer(every; interval = every)
-    main = current_task()
     # On the run's own thread, so that interrupting the run's task, which a stall does
-    # under `workers=0`, happens only while that task waits. Julia 1.12 throws Ctrl-C
-    # into whichever task that thread ran last, and that can be this one: the loop is
-    # its own rather than a timer's callback, so the interrupt can be caught here and
-    # passed on to the run's task. In a timer's task it would end the task, unseen.
-    @async try
-        while true
+    # under `workers=0`, happens only while that task waits. Julia throws Ctrl-C into
+    # whichever task that thread ran last, and that can be this one: the loop is its
+    # own rather than a timer's callback, so the interrupt is caught here and handed
+    # on, and the watch goes on. Shielded, as the slots are.
+    shielded(() -> @async watch(run, timer, limit))
+    return timer
+end
+
+function watch(run::Run, timer::Timer, limit::Real)
+    while true
+        try
             wait(timer)
             (@atomic run.stalled) && continue
             time() - (@atomic run.last_finish) > limit && stall!(run, limit)
-        end
-    catch e
-        if e isa InterruptException
-            istaskdone(main) || schedule(main, e; error = true)
-        elseif !(e isa EOFError)   # EOFError: the timer was closed, so the run is over
-            @error "YATF: the stall watchdog stopped" exception = (e, catch_backtrace())
+        catch e
+            e isa EOFError && break   # the timer was closed, so the run is over
+            if is_interrupt(e)
+                YATFWorkers.forward_interrupt(e)
+            else
+                @error "YATF: the stall watchdog stopped" exception = (e, catch_backtrace())
+                break
+            end
         end
     end
-    return timer
+    return nothing
 end
 
 # Everything the run started comes down: nothing more is handed out, the tasks
@@ -925,7 +967,9 @@ end
 
 function run_slot(run::Run, slot::Slot, target)
     while true
-        wait_while_paused(run.queues)
+        recycle_worker!(run, slot)
+        wait_while_paused(run.queues, slot)
+        (@atomic slot.recycle) && continue
         claim = claim!(run.queues, slot.id)
         if claim.kind === :done
             break
@@ -939,6 +983,13 @@ function run_slot(run::Run, slot::Slot, target)
         run_unit!(run, slot, claim.unit, target)
     end
     stop_worker!(run, slot)
+    return nothing
+end
+
+# Between units, never inside one: a chain's later items depend on its process.
+function recycle_worker!(run::Run, slot::Slot)
+    (; success) = @atomicreplace slot.recycle true => false
+    success && stop_worker!(run, slot, "restarted by the memory guard")
     return nothing
 end
 
@@ -972,7 +1023,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
                 on_exit = w -> worker_ended!(run, slot.id, w)
             )
         catch e
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
             last_err = e
             attempt <= WORKER_START_RETRIES && sleep(1)
             continue
@@ -999,7 +1050,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             # The process is up; it is the `init` expression that failed or hung.
             YATFWorkers.terminate!(w, :init_failed)
             wait(w)
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
             if e isa YATFWorkers.RemoteException || e isa TimeoutException
                 # The expression itself is at fault: another process would only
                 # fail the same way. A timeout already names the expression it
@@ -1085,7 +1136,7 @@ function flush_dying_log!(slot::Slot)
                 end
             end
         catch e
-            e isa InterruptException && rethrow()
+            is_interrupt(e) && rethrow()
             # The log is a convenience; losing a dying process's backtrace is not
             # a reason to disturb the run that is still going.
         end
@@ -1127,7 +1178,7 @@ function init_worker!(run::Run, slot::Slot, w::YATFWorkers.Worker)
     return nothing
 end
 
-function stop_worker!(run::Run, slot::Slot)
+function stop_worker!(run::Run, slot::Slot, why::AbstractString = "")
     w = slot.worker
     w === nothing && return nothing
     slot.worker = nothing
@@ -1136,13 +1187,17 @@ function stop_worker!(run::Run, slot::Slot)
     try
         close(w)
     catch e
+        is_interrupt(e) && rethrow()
         @error "YATF: could not stop worker $(w.pid)" exception = (e, catch_backtrace())
     end
     p = w.process
     status = !process_exited(p) ? " · still running" :
         p.exitcode == 0 && p.termsignal == 0 ? "" : string(" · ", YATFWorkers.exit_description(p))
     print_worker_line(
-        run, slot.id, "EXIT", string("pid ", w.pid, " · ", plural(ran, "item"), " · ", fmt_seconds(alive), status)
+        run, slot.id, "EXIT", string(
+            "pid ", w.pid, " · ", plural(ran, "item"), " · ", fmt_seconds(alive), status,
+            isempty(why) ? "" : string(" · ", why)
+        )
     )
     return nothing
 end
@@ -1156,8 +1211,6 @@ function died_how(run::Run, slot::Slot, w::YATFWorkers.Worker)
     alone = by === :connection_lost || by === :process_exit
     if alone && w.process.termsignal == 9
         how *= ", which nothing in this run sent: usually the out-of-memory killer"
-    elseif by === :memory_guard
-        how *= ", stopped by the memory guard"
     elseif !alone
         how *= string(", stopped after ", replace(String(by), '_' => ' '))
     end
@@ -1173,8 +1226,11 @@ time, and [`report_unfinished_run`](@ref) is the only reader.
 const LIVE_RUN = Ref{Any}(nothing)
 
 # Registered when a run reaches its test phase; a process that never gets that far
-# has nothing to say at exit.
+# has nothing to say at exit. Exit hooks run newest first, so registering the one
+# that kills leftover workers before it puts the report ahead of that: the report
+# stops the workers itself, and says why.
 const ensure_exit_report = OncePerProcess{Nothing}() do
+    YATFWorkers.ensure_cleanup_hook()
     atexit(report_unfinished_run)
     nothing
 end
@@ -1193,14 +1249,27 @@ function report_unfinished_run()
     run === nothing && return nothing
     LIVE_RUN[] = nothing
     try
-        stop_monitor!(run.monitor)
+        # First, before anything here can let a slot run: one that found its worker
+        # dead would report a death nothing explains, and blame the OOM killer.
+        # Taken from its slot and killed here, the worker is one the run stopped.
         cancel!(run.queues)
+        for slot in run.slots
+            w = slot.worker
+            w === nothing && continue
+            slot.worker = nothing
+            YATFWorkers.kill!(w)
+        end
+        # Told to stop, not waited for: `stop_monitor!` takes the printer and waits
+        # for the monitor's task, and a task frozen by the exit holding either
+        # would hang it.
+        run.monitor === nothing || (@atomic run.monitor.stop = true)
         # Nothing unwound, so the slots never recorded what they were holding.
         # They are frozen where they were, and each still names its item.
         foreach(slot -> record_stopped_item!(run, slot), run.slots)
         finish_run_state!(run.runstate; cancelled = true)
         if trylock(run.printer)
             try
+                clear_status_line(run.monitor)
                 print_conclusion(run, :interrupted)
             finally
                 unlock(run.printer)
@@ -1283,7 +1352,7 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
             # Failfast waits for the last attempt: stopping the run under a retry
             # would record the failure as a cancellation.
             p.cfg.failfast && cancel!(run.queues) === false &&
-                print_failfast(run, first(p.units.span[u]))
+                print_failfast(run, first(i for i in p.units.span[u] if is_non_pass(run.statuses.state[i])))
             return nothing
         end
         # Retrying a chain restarts it from its first item: re-running one item of
@@ -1342,7 +1411,7 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     w = try
         ensure_worker!(run, slot, target, p.units.exclusive[p.items.unit[i]])
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         began!(run, i, slot.id, attempt, 0)
         record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
         return false
@@ -1355,7 +1424,7 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
     catch e
         # An interrupt leaves it set: the slot is unwinding, and what it was
         # running is the one thing `record_stopped_item!` needs from it.
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         slot.current = ItemIdx(0)
         return handle_dispatch_failure!(run, slot, i, attempt, e, max_attempts)
     end
@@ -1376,7 +1445,7 @@ function attempt_here!(run::Run, slot::Slot, i::ItemIdx, _, attempt::Int8, max_a
         printline(run, item_line(run, nothing, i, attempt, outcome(r)))
         with_test_end(r, spec, slot.profile.test_end)
     catch e
-        if e isa InterruptException
+        if is_interrupt(e)
             (@atomic run.stalled) && record_error!(run, i, slot, attempt, TIMEDOUT, STALLED_NOTE)
             rethrow()
         end
@@ -1408,7 +1477,7 @@ function dispatch(run::Run, w::YATFWorkers.Worker, spec::ItemSpec, timeout::Int,
     catch e
         # The item ran; it is the profile's own code that did not come back. Saying
         # "the worker running this item died" here would point at the wrong code.
-        (e isa TimeoutException || e isa InterruptException) && rethrow()
+        (e isa TimeoutException || is_interrupt(e)) && rethrow()
         throw(TestEndFailure(slot.profile.name, e))
     end
     return merge_test_end(res, endres)
@@ -1440,7 +1509,7 @@ severity(s::ItemState) = s === ERRORED ? 2 : s === FAILED ? 1 : 0
 # dispatch. A reply that arrived first is buffered, and `fetch` returns a buffered
 # value even from a closed channel, so a reply racing its deadline wins.
 function fetch_within(fut, seconds::Real, on_timeout::Exception)
-    timer = Timer(seconds) do _
+    timer = YATFWorkers.after(seconds) do
         close(fut.value, on_timeout)
     end
     try

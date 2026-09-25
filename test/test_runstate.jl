@@ -326,6 +326,23 @@ end
         write(joinpath(wt, ".git"), "gitdir: " * joinpath(dir, ".git") * "\n")
         @test project_revision(wt) == sha
 
+        # A worktree on a branch, laid out as `git worktree add` lays it out: its
+        # own directory holds HEAD, and the branch is in the repository's.
+        main = mktempdir()
+        mkpath(joinpath(main, ".git", "refs", "heads"))
+        write(joinpath(main, ".git", "HEAD"), "ref: refs/heads/main\n")
+        write(joinpath(main, ".git", "refs", "heads", "feature"), sha * "\n")
+        own = joinpath(main, ".git", "worktrees", "feature")
+        mkpath(own)
+        write(joinpath(own, "HEAD"), "ref: refs/heads/feature\n")
+        write(joinpath(own, "commondir"), "../..\n")
+        wt = mktempdir()
+        write(joinpath(wt, ".git"), "gitdir: " * own * "\n")
+        @test project_revision(wt) == sha
+        rm(joinpath(main, ".git", "refs", "heads", "feature"))
+        write(joinpath(main, ".git", "packed-refs"), "$sha refs/heads/feature\n")
+        @test project_revision(wt) == sha
+
         @test project_revision(mktempdir()) == ""        # not a checkout
         @test project_revision("/nonexistent/path") == ""
     end

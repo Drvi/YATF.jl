@@ -2,8 +2,12 @@
 # reads per platform. They read C structs at hard-coded offsets, so
 # `platform_selfcheck!` checks them against an independent source before they are
 # trusted, and on disagreement the monitor reports machine-level numbers only.
+# A reading that fails is -1, except that Ctrl-C passes through: the monitor calls
+# these five times a second, so an interrupt can land inside one.
 
 module Platform
+
+using YATFWorkers: is_interrupt
 
 export process_rss, child_pids, machine_memory, available_fraction, cpu_load, cpu_count,
     platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
@@ -52,7 +56,8 @@ function rss_linux(pid::Integer)
     isfile(path) || return Int64(-1)
     fields = try
         split(read(path, String))
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return Int64(-1)
     end
     length(fields) >= 2 || return Int64(-1)
@@ -74,7 +79,8 @@ function children_linux(pid::Integer)
                 p === nothing || push!(out, p)
             end
         end
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return out
     end
     return unique!(out)
@@ -96,7 +102,8 @@ function rss_windows(pid::Integer)
         )
         ok == 0 && return Int64(-1)
         return Int64(only(reinterpret(UInt64, @view buf[17:24])))
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return Int64(-1)
     finally
         ccall(:CloseHandle, Cint, (Ptr{Cvoid},), handle)
@@ -182,7 +189,8 @@ function meminfo_available()
             end
             (total > 0 && avail >= 0) && break
         end
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return -1.0
     end
     (total > 0 && avail >= 0) || return -1.0
@@ -216,7 +224,8 @@ function cgroup_available()
             end
         end
         return clamp((limit - max(current - reclaimable, 0)) / limit, 0.0, 1.0)
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return -1.0
     end
 end
@@ -267,7 +276,8 @@ function cpu_load()
     Sys.iswindows() && return -1.0
     load = try
         first(Sys.loadavg())
-    catch
+    catch e
+        is_interrupt(e) && rethrow()
         return -1.0
     end
     return load >= 0 ? Float64(load) : -1.0
@@ -333,7 +343,7 @@ function platform_selfcheck!()
         # neighbourhood; a wrong struct offset does not.
         (rss > 0 && maxrss > 0 && rss < 100 * maxrss && rss > maxrss ÷ 100) || return false
         if !Sys.iswindows()
-            proc = run(`$(Base.julia_cmd()[1]) -e "sleep(20)"`; wait = false)
+            proc = run(`$(Base.julia_cmd()[1]) --startup-file=no --history-file=no -e "sleep(20)"`; wait = false)
             try
                 found = false
                 for _ in 1:100
@@ -347,8 +357,9 @@ function platform_selfcheck!()
         end
         PER_PROCESS_OK[] = true
         return true
-    catch
+    catch e
         PER_PROCESS_OK[] = false
+        is_interrupt(e) && rethrow()
         return false
     end
 end

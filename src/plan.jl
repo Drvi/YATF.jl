@@ -190,6 +190,7 @@ function validate_order(raw, cfg)
     for n in Iterators.flatten((cfg.order_first, cfg.order_last))
         n in names || push!(missing_, n)
     end
+    check_order_conflicts(raw, cfg)
     isempty(missing_) && return
     throw(ConfigError(sprint() do io
         println(io, "[order] of TestItems.toml names test items that do not exist:")
@@ -198,6 +199,29 @@ function validate_order(raw, cfg)
             println(io, "  ", repr(n), isempty(near) ? "" : "  (did you mean $(join(map(repr, near), " or "))?)")
         end
     end))
+end
+
+# A chain runs as one, so it cannot go both first and last; neither can an item.
+function check_order_conflicts(raw, cfg)
+    first_, last_ = Set(cfg.order_first), Set(cfg.order_last)
+    both = String[]
+    for n in cfg.order_first
+        n in last_ && push!(both, string(repr(n), " is named by both"))
+    end
+    chains = Dict{Symbol, Vector{String}}()
+    for it in raw
+        it.chain === NO_CHAIN || push!(get!(chains, it.chain, String[]), it.name)
+    end
+    for (chain, members) in sort!(collect(chains); by = first)
+        f = [m for m in members if m in first_]
+        l = [m for m in members if m in last_]
+        (isempty(f) || isempty(l) || f == l) && continue
+        push!(both, string("chain `", chain, "` runs as one, and `first` names ", join(map(repr, f), ", "),
+                           " while `last` names ", join(map(repr, l), ", ")))
+    end
+    isempty(both) && return nothing
+    throw(ConfigError("[order] of TestItems.toml puts these both first and last:\n" *
+                      join(("  " * b for b in both), "\n")))
 end
 
 # Cheap edit-distance-ish suggestion: a typo'd name should not send anyone hunting.
@@ -352,7 +376,10 @@ function order_pool!(pool::Vector{Int}, units::Vector{UnitDraft}, nslots::Int, c
     share = sum(u -> units[u].est_s, pool; init = 0.0) / max(nslots, 1)
     for u in pool
         d = units[u]
-        p = minimum(it -> get(pin, it.name, 0), d.items)
+        # The pinned member listed earliest places a chain, whichever its unpinned
+        # members are; `validate_order` rules out a chain on both lists.
+        p = minimum(it -> get(pin, it.name, typemax(Int)), d.items)
+        p == typemax(Int) && (p = 0)
         at = (d.items[1].file, d.items[1].line)
         ago, k = findmin(it -> get(history.failed, it.name, typemax(Int)), d.items)
         d.failed_ago = ago == typemax(Int) ? Int32(-1) : Int32(ago)

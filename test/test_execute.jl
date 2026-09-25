@@ -289,9 +289,11 @@ end
             @test occursin(r"caused by: the first(.|\n)*n_test\.jl", shown["while handling another"])
         end
         # Asked for, the worker's frames are kept. Not under an error inside a `@test`:
-        # `Test` cuts that one at the test itself, whatever runs beneath.
+        # `Test` cuts that one at the test itself, whatever runs beneath; and from
+        # 1.14 it cuts an error outside any `@test` at the item's file too.
         full = reports(; workers=1, full_stacktraces=true)
-        @test occursin("runitem.jl", full["outside any test"]) && occursin("runitem.jl", full["in a task"])
+        VERSION < v"1.14-" &&
+            @test occursin("runitem.jl", full["outside any test"]) && occursin("runitem.jl", full["in a task"])
     end
 
     @testset "skip is honoured, statically and dynamically" begin
@@ -320,6 +322,20 @@ end
         # has failed too: stopping under the retry would record it as cancelled.
         @test count(s -> s === FAILED || s === ERRORED, values(states)) == 1
         @test any(==(UNSEEN), values(states)) || length(states) == 1
+    end
+
+    @testset "failfast names the member of a chain that failed" begin
+        dir = make_pkg("FailfastChain", "test/t_test.jl" => """
+            @testitem "c passes" chain=:c begin
+                @test true
+            end
+            @testitem "c fails" chain=:c begin
+                @test false
+            end
+            """)
+        (states, _, _), out = capture_run(() -> run_states(dir; workers=1, failfast=true, logs=:issues, monitor=false))
+        @test states["c fails"] === FAILED
+        @test occursin("stopping after \"c fails\" failed (failfast)", out)
     end
 
     @testset "an item's RUN and DONE lines are drawn by the coordinator, on a worker or not" begin

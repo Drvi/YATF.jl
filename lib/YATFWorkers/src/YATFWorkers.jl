@@ -17,6 +17,30 @@ using Serialization
 using Sockets
 using Test: Test
 
+# Ctrl-C arrives as an `InterruptException`, thrown into whichever task thread 1 last
+# ran; from Julia 1.14, as a `CancellationRequest` at the next wait of every task the
+# foreground's cancellation token governs, a token that tasks inherit from the scope
+# they are started in.
+@static if isdefined(Base, :CancellationRequest)
+    is_interrupt(@nospecialize(e)) = e isa InterruptException || e isa Base.CancellationRequest
+else
+    is_interrupt(@nospecialize(e)) = e isa InterruptException
+end
+
+"""
+    shielded(f)
+
+Run `f` out of reach of the caller's cancellation token, from Julia 1.14: a task
+started inside is not cancelled along with the caller's work, and cleanup inside
+completes while that work is being cancelled, where every wait would otherwise
+throw again. Before 1.14, `f()`.
+"""
+@static if isdefined(Base, :CANCEL_TOKEN)
+    shielded(f) = with(f, Base.CANCEL_TOKEN => nothing)
+else
+    shielded(f) = f()
+end
+
 include("runitem.jl")
 include("workers.jl")
 

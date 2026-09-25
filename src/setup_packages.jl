@@ -233,10 +233,11 @@ random_uuid() = Base.UUID(
 )
 
 # The `module name` a top-level statement defines, or `nothing`. A module with a
-# docstring parses as the docstring's macro call around the module.
+# docstring parses as the docstring's macro call around the module. Its name and
+# body are its last two arguments: from 1.14 a syntax version comes first.
 function module_expr(ex, name::Symbol)
     ex isa Expr || return nothing
-    ex.head === :module && return ex.args[2] === name ? ex : nothing
+    ex.head === :module && return ex.args[end - 1] === name ? ex : nothing
     ex.head === :macrocall && return module_expr(ex.args[end], name)
     return nothing
 end
@@ -247,7 +248,7 @@ function package_binding(ex::Expr, name::Symbol, pkg::Symbol)
     for a in ex.args
         m = module_expr(a, name)
         m === nothing && continue
-        for st in m.args[3].args
+        for st in m.args[end].args
             st isa Expr && (st.head === :using || st.head === :import) || continue
             for b in st.args
                 b isa Expr && b.head === :. && b.args == Any[pkg] && return pkg
@@ -320,7 +321,8 @@ function relocate(code::String, ex::Expr, name::String, pkg::Union{Nothing, Stri
     kind(i) = string(JuliaSyntax.kind(toks[i]))
     first_byte(i) = Int(first(toks[i].range))
     last_byte(i) = Int(last(toks[i].range))
-    blank(i) = kind(i) in ("Whitespace", "NewlineWs", "Comment")
+    # From 1.14 a zero-width token follows `module`, the syntax version.
+    blank(i) = kind(i) in ("Whitespace", "NewlineWs", "Comment") || isempty(toks[i].range)
     next_token(i) = (j = i + 1; while j <= n && blank(j); j += 1; end; j)
     prev_token(i) = (j = i - 1; while j >= 1 && blank(j); j -= 1; end; j)
     bound = pkg === nothing ? nothing : package_binding(ex, Symbol(name), Symbol(pkg))

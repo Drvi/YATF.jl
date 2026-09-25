@@ -799,9 +799,10 @@ source_of(p::Plan, i::Integer) = LineNumberNode(Int(p.items.line[i]), p.files[p.
 
 # An error the run synthesized, recorded into `ts` without `Test` printing it: the
 # run prints what it records itself. `Test.Error` renders its message from the
-# exception stack, so the stack carries it.
+# exception stack, so the stack carries it. The backtrace has the element type
+# `catch_backtrace` gives, which `Test` asserts before it scrubs one.
 function add_error!(ts::Test.AbstractTestSet, msg::AbstractString, source::LineNumberNode)
-    stack = Base.ExceptionStack([(exception = ErrorException(msg), backtrace = Ptr{Nothing}[])])
+    stack = Base.ExceptionStack([(exception = ErrorException(msg), backtrace = Union{Ptr{Nothing}, Base.InterpreterIP}[])])
     with_testset_printing(false) do
         Test.record(ts, Test.Error(:nontest_error, Expr(:tuple), ErrorException(msg), stack, source))
     end

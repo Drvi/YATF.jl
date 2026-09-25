@@ -8,6 +8,11 @@ const DEFAULT_PROFILE = :default
 
 const USE_RUN_DEFAULT = Int32(-1)
 
+# The most an item's `retries` and a `timeout` can be: an item's attempts are counted
+# in an `Int8`, and its own timeout is held in an `Int32` of seconds.
+const MAX_RETRIES = Int(typemax(Int8)) - 1
+const MAX_TIMEOUT_S = Int(typemax(Int32))
+
 """
     RawItem
 
@@ -158,7 +163,16 @@ struct Filter
     line::Int32
 end
 Filter(; name = nothing, tags = nothing, paths = String[], line = 0) =
-    Filter(name, _astags(tags), collect(paths), Int32(line))
+    Filter(_asname(name), _astags(tags), collect(paths), Int32(line))
+
+_asname(n::Union{Nothing, Regex}) = n
+_asname(n::AbstractString) = String(n)
+function _asname(n)
+    (applicable(iterate, n) && all(x -> x isa AbstractString, n)) || throw(ArgumentError(
+        "`name = $(repr(n))`: expected a name, a `Regex`, or a collection of names"
+    ))
+    return Set{String}(n)
+end
 
 _astags(::Nothing) = nothing
 _astags(t::Symbol) = [t]

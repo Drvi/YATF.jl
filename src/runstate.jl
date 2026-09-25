@@ -245,13 +245,13 @@ function run_meta(p::Plan)
 end
 
 """
-    init_run_state(path, plan; dry_run=false) -> RunStateFile
+    init_run_state(path, plan; dry_run=false, start=time()) -> RunStateFile
 
 Write everything that is known before the run starts, including a full status
 section of `unseen` records, so that every later write is an overwrite at a
-known offset.
+known offset. `start` is the moment every offset in the file counts from.
 """
-function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false)
+function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false, start::Float64 = time())
     mkpath(dirname(path))
     io = open(path, "w+")
     strings = StringTable()
@@ -324,7 +324,7 @@ function init_run_state(path::AbstractString, p::Plan; dry_run::Bool = false)
 
     write_record(io, Ref(Header(
         RS_MAGIC, RS_VERSION, dry_run ? RS_FLAG_DRY_RUN : UInt32(0), nitems(p), length(p.units),
-        length(p.profiles), 0, time(), 0.0, off_strings, off_meta, off_profiles, off_units,
+        length(p.profiles), 0, start, 0.0, off_strings, off_meta, off_profiles, off_units,
         off_items, off_status, off_memory, off_events
     )))
     write(io, zeros(UInt8, RS_HEADER_BYTES - sizeof(Header)))
@@ -371,6 +371,7 @@ function update!(f, rsf::Union{Nothing, RunStateFile}, at::Integer)
         f(rsf.io)
         flush(rsf.io)
     catch e
+        is_interrupt(e) && rethrow()
         @warn "YATF: could not write the run state" exception = e maxlog = 1
     end
     return nothing
@@ -576,7 +577,7 @@ function read_run_state(path::AbstractString)
             memory, events, truncated
         )
     catch e
-        e isa InterruptException && rethrow()
+        is_interrupt(e) && rethrow()
         # Any exception, not a list of expected ones: the caller has a run to finish
         # and no use for a file it cannot read. Reader bugs still surface, because
         # the round-trip tests assert on what a written file reads back as.
@@ -885,6 +886,10 @@ function project_revision(root::AbstractString)
         # A detached HEAD holds the commit itself; otherwise it names a ref.
         startswith(head, "ref:") || return head
         ref = String(strip(head[5:end]))
+        # A worktree's own directory holds its HEAD; the branches it names are in
+        # the repository's, which `commondir` points at.
+        common = joinpath(gitdir, "commondir")
+        isfile(common) && (gitdir = abspath(gitdir, String(strip(read(common, String)))))
         loose = joinpath(gitdir, ref)
         isfile(loose) && return String(strip(read(loose, String)))
         packed = joinpath(gitdir, "packed-refs")

@@ -135,10 +135,21 @@ end
     @testset "values are validated" begin
         for toml in ("[run]\nworkers = -1\n", "[run]\ntimeout = 0\n", "[run]\nretries = -1\n",
                      "[run]\nmemory_threshold = 1.5\n", "[run]\nlogs = \"loud\"\n",
-                     "[run]\nworkers = \"most\"\n")
+                     "[run]\nworkers = \"most\"\n", "[run]\nmonitor_interval = -5\n",
+                     "[run]\nmonitor_interval = nan\n", "[run]\ntimeout = inf\n",
+                     "[run]\ntimeout = 1e12\n", "[run]\nretries = 1000\n", "[run]\nretries = 1.5\n",
+                     "[run]\ninit_timeout = nan\n")
             with_toml(toml) do dir
                 @test_throws ConfigError read_config(dir)
             end
+        end
+        # The same from a keyword, and the message says what is allowed.
+        with_toml("") do dir
+            @test_throws r"`monitor_interval` must be a number of seconds from 0" read_config(dir; monitor_interval = -1)
+            @test read_config(dir; monitor_interval = 0).monitor_interval == 0
+            @test_throws r"`retries` must be an integer from 0 to 126, got 127" read_config(dir; retries = 127)
+            @test read_config(dir; retries = 126).retries == 126
+            @test read_config(dir; timeout = 1.5).timeout_s == 2
         end
     end
 

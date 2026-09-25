@@ -301,7 +301,7 @@ using YATFWorkers: YATFWorkers
         slot = YATF.Private.Slot(
             YATF.Private.SlotIdx(1),
             YATF.Private.Profile(YATF.Private.DEFAULT_PROFILE), nothing, 0.0, 0, YATF.Private.ItemIdx(0),
-            path, String[]
+            path, String[], false
         )
         for i in 1:3
             YATF.Private.keep_dying_line!(slot, "signal $i")

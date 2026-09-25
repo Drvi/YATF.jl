@@ -36,7 +36,7 @@ using TOML: TOML
 using YATFWorkers: YATFWorkers, ItemState, UNSEEN, RUNNING, PASSED, FAILED, ERRORED, TIMEDOUT,
     SKIPPED, BROKEN_CHAIN, CANCELLED, is_non_pass, ItemSpec, ItemResult,
     current_testitem, in_testitem, in_yatf_run, run_item,
-    with_testset_printing, without_enclosing_testset, PATHSEP
+    with_testset_printing, without_enclosing_testset, PATHSEP, is_interrupt, shielded
 
 include("types.jl")
 include("macros.jl")
@@ -83,7 +83,7 @@ framework's own frames in a failing item's stacktrace; trimmed by default), `see
 (every item draws its random numbers from this and its own name; random unless
 given, and printed at the start of the run).
 
-Output: `logs` (`:issues`, `:batched`, `:eager`), `report`, `verbose`,
+Output: `logs` (`:issues`, `:batched`, `:eager`), `verbose`,
 `monitor`, `monitor_interval`, `testset_name`, `coverage` (count which lines of
 `src/` and `ext/` the workers run, merged into `lcov.info` at the package's root;
 also `YATF_COVERAGE`, which a keyword overrides and which overrides the file).
