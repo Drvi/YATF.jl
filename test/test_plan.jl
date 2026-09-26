@@ -222,7 +222,10 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
                     if c.kind === :done
                         filter!(!=(s), live)
                     elseif c.kind === :rebind
-                        c.pool in p.pending || push!(wrong, "seed $seed: slot $s rebound to pool $(c.pool), which had a slot")
+                        # Only to a pool that still has something to hand out.
+                        pool = p.pools[c.pool]
+                        any(u -> !q.claimed[u], first(pool.head):last(pool.tail)) ||
+                            push!(wrong, "seed $seed: slot $s rebound to pool $(c.pool), which had nothing left")
                         serves[s] = c.pool
                     else
                         handed[c.unit] += 1
@@ -234,6 +237,126 @@ planned(p) = [p.items.name[i] for (k, pool) in enumerate(p.pools)
             end
             @test isempty(wrong)
         end
+    end
+
+    @testset "a slot whose pool runs dry moves to where it takes the most work off the others" begin
+        # Twelve default units of a second, and single units under two profiles of
+        # their own; `big` has eight.
+        dir = make_pkg(
+            "Refill",
+            "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
+            "test/p_test.jl" => declared("p1"; opts = "sandbox=:tiny"),
+            "test/b_test.jl" => declared(("b$i" for i in 1:8)...; opts = "sandbox=:big"),
+            "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n[profiles.big]\nthreads = \"1\"\n",
+        )
+        second = Dict(n => 1.0 for n in [["a$i" for i in 1:12]; ["b$i" for i in 1:8]; "p1"])
+        known = History(second, Dict{String, Int}(), 0.0)
+        Q, claim!, cold_cost, ColdCost = YATF.Private.Queues, YATF.Private.claim!, YATF.Private.cold_cost,
+            YATF.Private.ColdCost
+        profile_of(p, c) = p.profiles[p.units.profile[c.unit]].name
+        pool_named(p, name) = findfirst(k -> p.profiles[k.profile].name === name, p.pools)
+        tiny_slot(p) = findfirst(==(pool_named(p, :tiny)), p.slot_pool)
+
+        # Without `big`: default has two slots, `tiny` one.
+        solo = make_pkg("RefillTwo", "test/a_test.jl" => declared(("a$i" for i in 1:12)...),
+                        "test/p_test.jl" => declared("p1"; opts = "sandbox=:tiny"),
+                        "test/TestItems.toml" => "[profiles.tiny]\nthreads = \"1\"\n")
+        p = plan_dir(solo; workers = 3, history = known)
+        s = tiny_slot(p)
+        default = pool_named(p, :default)
+        @test count(==(default), p.slot_pool) == 2
+        q = Q(p)
+        @test profile_of(p, claim!(q, s)) === :tiny
+        c = claim!(q, s)
+        @test c.kind === :rebind && c.pool == default
+        # From there it takes default units, as one of the pool's own slots would.
+        c = claim!(q, s)
+        @test c.kind === :unit && profile_of(p, c) === :default
+        @test q.serving[default] == 3
+
+        # A fresh default worker that takes longer to be ready than the six seconds
+        # each default slot has left is not started: the slot is done.
+        q = Q(p)
+        claim!(q, s)
+        q.stats[default].starts, q.stats[default].start_s = 1, 20.0
+        @test claim!(q, s).kind === :done
+        @test q.serving[pool_named(p, :tiny)] == 0
+
+        # A unit without an estimate counts as the pool's own average so far: twelve
+        # of a hundredth of a second each leave a default slot nothing a worker that
+        # takes half a second to start would save it.
+        p0 = plan_dir(solo; workers = 3)
+        q = Q(p0)
+        claim!(q, s)
+        q.stats[default].starts, q.stats[default].start_s = 1, 0.5
+        q.stats[default].units, q.stats[default].took_s = 4, 0.04
+        @test claim!(q, s).kind === :done
+        q = Q(p0)                      # before any has run, a unit counts as a second
+        claim!(q, s)
+        q.stats[default].starts, q.stats[default].start_s = 1, 0.5
+        @test claim!(q, s).kind === :rebind
+        # An estimate is scaled by how the run's units took against theirs.
+        q = Q(p)
+        claim!(q, s)
+        q.stats[default].starts, q.stats[default].start_s = 1, 1.0
+        q.stats[default].estimated_s, q.stats[default].estimated_took_s = 4.0, 0.4
+        @test claim!(q, s).kind === :done
+
+        # A pool no slot serves is taken however much a fresh worker costs: nothing
+        # else will run it.
+        p1 = plan_dir(solo; workers = 1, history = known)
+        @test p1.pending == [pool_named(p1, :tiny)]
+        q = Q(p1)
+        q.stats[pool_named(p1, :tiny)].starts, q.stats[pool_named(p1, :tiny)].start_s = 1, 1000.0
+        kinds = Symbol[]
+        while (c = claim!(q, 1)).kind !== :done
+            c.kind === :rebind && push!(kinds, c.kind)
+        end
+        @test kinds == [:rebind]
+
+        # With `big` as well, four slots: two default, one each for `big` and `tiny`.
+        # Default has six seconds left per slot and `big` eight, so `tiny`'s slot goes
+        # to `big`.
+        p = plan_dir(dir; workers = 4, history = known)
+        @test count(==(pool_named(p, :default)), p.slot_pool) == 2
+        q = Q(p)
+        s = tiny_slot(p)
+        claim!(q, s)
+        c = claim!(q, s)
+        @test c.kind === :rebind && c.pool == pool_named(p, :big)
+
+        # What a fresh worker costs: measured in its pool once the run has seen it
+        # there, across the run's pools before that, and from earlier runs before either.
+        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(2.0, 0.5)))
+        q = Q(p)
+        tiny = pool_named(p, :tiny)
+        @test cold_cost(q, default) == 2.5
+        q.stats[tiny].starts, q.stats[tiny].start_s = 2, 1.0
+        @test cold_cost(q, default) == 0.5 + 0.5
+        q.stats[tiny].cold, q.stats[tiny].cold_compile_s = 2, 10.0
+        q.stats[tiny].warm, q.stats[tiny].warm_compile_s = 2, 0.0
+        @test cold_cost(q, default) == 0.5 + 5.0
+        q.stats[default].starts, q.stats[default].start_s = 1, 0.3
+        q.stats[default].cold, q.stats[default].cold_compile_s = 2, 1.0
+        q.stats[default].warm, q.stats[default].warm_compile_s = 4, 0.4
+        @test cold_cost(q, default) ≈ 0.3 + (0.5 - 0.1)
+        # A first item that compiled less than the later ones is no extra cost.
+        q.stats[default].cold_compile_s = 0.0
+        @test cold_cost(q, default) ≈ 0.3
+
+        # The dry run predicts the same: `tiny`'s slot goes on with default units, and
+        # does not when earlier runs say a fresh worker costs more than it would save.
+        p = plan_dir(solo; workers = 3, history = known)
+        on_tiny(p) = [p.items.name[i] for (_, w, i) in YATF.Private.run_order(p).items if w == tiny_slot(p)]
+        @test first(on_tiny(p)) == "p1"
+        @test length(on_tiny(p)) > 1 && all(startswith("a"), on_tiny(p)[2:end])
+        costly = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(20.0, 0.0)))
+        @test on_tiny(costly) == ["p1"]
+        # A slot that moves is charged the fresh worker before its first unit there:
+        # `p1`'s second, then a second and a half.
+        p = plan_dir(solo; workers = 3, history = History(second, Dict{String, Int}(), 0.0, ColdCost(1.0, 0.5)))
+        starts = [t for (t, w, i) in YATF.Private.run_order(p).items if w == tiny_slot(p)]
+        @test starts[1:2] ≈ [0.0, 2.5]
     end
 
     @testset "a chain is ordered as one item, by its members' total" begin

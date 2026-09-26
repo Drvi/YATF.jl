@@ -260,8 +260,11 @@ A run hands out, in this order:
 6. the items `[order] last` names.
 
 The first four and the last go to whichever worker is free, and a worker that
-finishes its own stretch takes over half of the longest one left. `why here` says
-which rule placed an item, when it was not file order.
+finishes its own stretch takes over half of the longest one left. A worker whose
+profile has nothing left restarts under the profile whose workers have the most
+left each, when that saves more than a fresh worker costs: starting, and compiling
+what the others already have. `why here` says which rule placed an item, when it
+was not file order.
 
 A name much longer than the rest is shortened to `r"^…"`, here and in a run's
 `RUN` and `DONE` lines: a prefix that no other item's name in the suite starts
@@ -310,6 +313,7 @@ The run ends with what it cost, stage by stage, followed by `Test`'s usual summa
 <b>│ </b>testing · 1.8s · tree max  1.0G · child max  452M · coordinator + 2 workers · 87% compile
 <b>│ </b>(summed resident sizes over-count pages the processes share)
 <b>│ </b>machine · 57.7G of 64.0G in use at peak
+<b>│ </b>cpu · 9% of 18 threads for this run's processes, 14% for the whole machine (averages over the run)
 <b>└ </b>run state: ~/.julia/yatf/runs/MyPackage-8db4f545/1790247276-96211.yatf
 </pre>
 
@@ -318,6 +322,13 @@ and whatever they spawn, such as `Pkg` precompiling or a process a test starts.
 `tree max` is the peak of their sum, `child max` the largest single process, and
 the list after it says what the peak was summed over (`coordinator + 8 workers + 3
 spawned`, say).
+
+`cpu` gives two averages over the whole run, each a share of the machine's CPU
+threads: how much of them the run's processes used — the coordinator, the workers
+and every process they started and waited for — and how busy the machine was with
+everything counted. A run far below the machine is sharing it; a run near the top
+of it will not go faster with more workers. On Windows, which keeps no total for a
+process's children, only the machine's share is given.
 
 If memory gets tight the run holds off on new items, collects garbage, and only
 then restarts the largest worker, once the item it is running has finished: a

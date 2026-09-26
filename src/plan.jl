@@ -95,6 +95,20 @@ mutable struct Startup
 end
 Startup() = Startup(0.0, 0.0, 0.0)
 
+"""
+    ColdCost
+
+What a fresh worker costs before it runs as fast as one that has been running: the
+seconds from starting its process to its being ready for an item, and the compile
+time its first unit takes beyond what a later unit takes. 0 where nothing was
+measured.
+"""
+struct ColdCost
+    start_s::Float64
+    compile_s::Float64
+end
+ColdCost() = ColdCost(0.0, 0.0)
+
 struct Plan
     items::Items
     units::Units
@@ -106,6 +120,7 @@ struct Plan
     slot_pool::Vector{Int32}                 # slot -> pool
     slot_units::Vector{UnitRange{UnitIdx}}   # slot -> its stretch of its pool's body
     pending::Vector{Int32}                   # pools with no slot yet, in pickup order
+    cold::ColdCost                           # what earlier runs measured a fresh worker to cost
     setups::Vector{Symbol}               # setups to precompile
     cfg::RunConfig
     root::String
@@ -128,15 +143,17 @@ itemlocation(p::Plan, i::Integer) = p.locations[i]
     History
 
 What earlier runs measured, keyed by item name: how long each item took and how
-many runs ago it last did not pass (0 for the newest run); and when the newest
-run started (0 without one). Empty on a first run: nothing has an estimate, and
-the body is cut by count.
+many runs ago it last did not pass (0 for the newest run); when the newest run
+started (0 without one); and what a fresh worker cost. Empty on a first run:
+nothing has an estimate, and the body is cut by count.
 """
 struct History
     seconds::Dict{String, Float64}
     failed::Dict{String, Int}
     since::Float64
+    cold::ColdCost
 end
+History(seconds, failed, since) = History(seconds, failed, since, ColdCost())
 History() = History(Dict{String, Float64}(), Dict{String, Int}(), 0.0)
 
 """
@@ -164,7 +181,7 @@ function plan(
     for (k, pool) in enumerate(pools)
         order_pool!(pool, units, slots[k], cfg, history, changed)
     end
-    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names))
+    return materialize(units, pools, slots, profiles, cfg, root, selection, sort(suite_names), history.cold)
 end
 
 function validate_profiles(raw, cfg)
@@ -307,7 +324,8 @@ end
 # memory and duplicated compilation. Every pool gets a slot while there are slots
 # to give, the most work first; the rest go where the most work per slot is, never
 # more slots than a pool has units. A pool left without a slot is taken by the
-# first slot whose own pool runs out of work.
+# first slot whose own pool runs out of work, and a slot whose pool runs out goes
+# on where it takes the most off the others (`claim!`).
 function count_slots(pools::Vector{Vector{Int}}, units::Vector{UnitDraft}, cfg::RunConfig)
     work = map(pools) do pool
         w = sum(u -> units[u].est_s, pool; init = 0.0)
@@ -426,7 +444,7 @@ end
 function materialize(
         units::Vector{UnitDraft}, pools::Vector{Vector{Int}}, slots::Vector{Int},
         profiles::Vector{Profile}, cfg::RunConfig, root::AbstractString, selection::AbstractString,
-        suite_names::Vector{String}
+        suite_names::Vector{String}, cold::ColdCost
     )
     # Pool by pool, in the order each hands out its units: item index order is the
     # order of the plan, which is what the dry run prints and what the run state
@@ -488,7 +506,7 @@ function materialize(
     return Plan(
         items, Units(uspan, uprofile, uexcl, uchain, uest, uwhy, uago, ufailed, uchanged), files, relfiles,
         String[string(relfiles[fileidx[i]], ":", line[i]) for i in eachindex(name)],
-        profiles, ps, slot_pool, slot_units, pending, sort!(unique!(all_setups)), cfg,
+        profiles, ps, slot_pool, slot_units, pending, cold, sort!(unique!(all_setups)), cfg,
         String(root), Startup(), String(selection), suite_names
     )
 end

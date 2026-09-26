@@ -7,7 +7,7 @@ using YATF.Private: prepare, execute, report, Monitor, MemStats, start_monitor!,
 using Base.ScopedValues: with
 using YATF.Private: printline, with_status_line_off
 using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memory,
-                     platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
+                     platform_selfcheck!, ensure_checked!, PER_PROCESS_OK, cpu_ticks, process_cpu_seconds
 
 @testset "platform bindings" begin
     @testset "self-check" begin
@@ -34,6 +34,26 @@ using YATF.Private.Platform: process_rss, child_pids, process_tree, machine_memo
                 ps = 1024 * parse(Int, strip(read(`ps -o rss= -p $(getpid())`, String)))
                 @test isapprox(process_rss(getpid()), ps; rtol = 0.1)
             end
+        end
+    end
+
+    @testset "CPU time: the machine's, and this process's with its reaped children's" begin
+        busy, total, threads = cpu_ticks()
+        @test threads == length(Sys.cpu_info())
+        @test 0 < busy < total
+        if Sys.iswindows()
+            @test process_cpu_seconds() == -1.0
+        else
+            # Against `clock()`, which counts this process's CPU time its own way.
+            spin(seconds) = (t = time(); x = 0.0; while time() - t < seconds; x += sin(x); end; x)
+            clock() = ccall(:clock, Clong, ()) / 1e6
+            a, c0 = process_cpu_seconds(), clock()
+            spin(0.3)
+            b, c1 = process_cpu_seconds(), clock()
+            @test isapprox(b - a, c1 - c0; atol = 0.05)
+            # A child's counts once it has exited and been waited for.
+            run(`$(Base.julia_cmd()[1]) --startup-file=no -e "t = time(); x = 0.0; while time() - t < 0.5; global x += sin(x); end"`)
+            @test process_cpu_seconds() - b >= 0.45
         end
     end
 
@@ -179,6 +199,25 @@ end
             @test occursin("testing", out)
             @test occursin("over-count", out)   # the caveat is stated, not hidden
         end
+        @test occursin(Sys.iswindows() ? r"cpu · \d+% of \d+ threads for the whole machine \(average over the run\)\n" :
+                       r"cpu · \d+% of \d+ threads for this run's processes, \d+% for the whole machine \(averages over the run\)\n", out)
+    end
+
+    @testset "how busy the run kept the CPUs, and the machine" begin
+        R, F = YATF.Private.CpuReading, YATF.Private.FIELD
+        line(a, b) = sprint(io -> YATF.Private.print_cpu(io, a, b))
+        # Ten seconds on four threads: the machine busy for 30 of the 40
+        # thread-seconds, the run's processes for 12 of them.
+        a = R(1_000, 10_000, 4, 5.0, 100.0)
+        @test line(a, R(31_000, 50_000, 4, 17.0, 110.0)) ==
+              "  cpu$(F)30% of 4 threads for this run's processes, 75% for the whole machine (averages over the run)\n"
+        # Without a total for the run's processes, the machine alone.
+        machine_only = "  cpu$(F)75% of 4 threads for the whole machine (average over the run)\n"
+        @test line(R(1_000, 10_000, 4, -1.0, 100.0), R(31_000, 50_000, 4, -1.0, 110.0)) == machine_only
+        # A run that used more than the machine could give is a reading gone wrong.
+        @test line(a, R(31_000, 50_000, 4, 55.0, 110.0)) == machine_only
+        # Without an end reading there is nothing to say.
+        @test line(a, R()) == ""
     end
 
     @testset "no stage claims more than the run as a whole" begin
@@ -635,7 +674,7 @@ end
         # One process, so nothing to total and nothing to compare against.
         @test !occursin("tree max", summary)
         @test !occursin("child max", summary)
-        @test !occursin("processes", summary)
+        @test !occursin(r"\d+ process", summary)
         @test !occursin("coordinator", summary)
         @test !occursin("over-count", summary)
     end

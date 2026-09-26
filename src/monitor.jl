@@ -4,7 +4,7 @@
 # off, says so once, and the tests carry on.
 
 using .Platform: process_rss, process_tree, machine_memory, cpu_load, cpu_count,
-    ensure_checked!, PER_PROCESS_OK
+    cpu_ticks, process_cpu_seconds, ensure_checked!, PER_PROCESS_OK
 
 # The scan is over before the monitor exists. Resolving the environment and
 # precompiling are one stage: the same process does both, back to back.
@@ -54,6 +54,24 @@ PhaseStats(; entered = 0.0, peak_total = 0, peak_single = 0, nprocs_at_peak = 0,
     PhaseStats(entered, peak_total, peak_single, nprocs_at_peak, workers_at_peak, starts)
 
 """
+    CpuReading
+
+The machine's CPU time at one moment: milliseconds its threads have spent busy and
+in all since boot, how many threads, this process's and its reaped children's CPU
+seconds (-1 where the platform keeps no total for children), and when it was taken.
+Two readings give how busy the run kept the machine, and how busy the machine was.
+"""
+struct CpuReading
+    busy_ms::UInt64
+    total_ms::UInt64
+    threads::Int
+    run_s::Float64
+    at::Float64
+end
+CpuReading() = CpuReading(0, 0, 0, -1.0, 0.0)
+cpu_reading() = CpuReading(cpu_ticks()..., process_cpu_seconds(), time())
+
+"""
     MemStats
 
 The aggregates worth having after the fact, per stage and for the whole run.
@@ -73,6 +91,10 @@ Base.@kwdef mutable struct MemStats
     machine_peak_used::Int64 = 0
     machine_total::Int64 = 0
     guard_actions::Int = 0
+    # Taken on the run's thread: the first before the monitor's task starts, the
+    # second once it has stopped and the workers have exited and been reaped.
+    cpu_start::CpuReading = CpuReading()
+    cpu_end::CpuReading = CpuReading()
 end
 
 phase_stats(st::MemStats, p::RunPhase) = st.phases[Int(p) + 1]
@@ -205,7 +227,7 @@ function Monitor(run; interval = 0.2, print_interval = 30.0)
     linebuf = IOBuffer()
     # The run is already in its first stage by the time it has a monitor — nothing
     # calls `set_phase!` to enter the one it starts in.
-    stats = MemStats()
+    stats = MemStats(; cpu_start = cpu_reading())
     entered = time()
     @atomic phase_stats(stats, PHASE_SETUP).entered = entered
     n = nslots(run.plan)
@@ -884,8 +906,30 @@ function print_memory_summary(io::IO, m::Monitor; indent::AbstractString = "  ")
         io, indent, "machine", FIELD, fmt_bytes(st.machine_peak_used), " of ",
         fmt_bytes(st.machine_total), " in use at peak"
     )
+    print_cpu(io, st.cpu_start, st.cpu_end; indent)
     st.guard_actions > 0 &&
         println(io, indent, "guard", FIELD, plural(st.guard_actions, "action"))
+    return nothing
+end
+
+# Once every worker has exited and been reaped: before that, what a worker has used
+# is not in its parent's count.
+record_cpu_end!(m::Union{Nothing, Monitor}) = (m === nothing || (m.stats.cpu_end = cpu_reading()); nothing)
+
+# How busy the run kept the machine's CPU threads, and how busy the machine was:
+# the two differ by whatever else was running. Where the run's own time is unknown,
+# or comes out beyond what the machine could give, only the machine's is said.
+function print_cpu(io::IO, a::CpuReading, b::CpuReading; indent::AbstractString = "  ")
+    (b.at > a.at && b.total_ms > a.total_ms && b.threads > 0) || return nothing
+    machine = round(Int, 100 * (b.busy_ms - a.busy_ms) / (b.total_ms - a.total_ms))
+    run = a.run_s >= 0 && b.run_s >= a.run_s ? (b.run_s - a.run_s) / ((b.at - a.at) * b.threads) : -1.0
+    print(io, indent, "cpu", FIELD)
+    if 0 <= run <= 1.05
+        println(io, round(Int, 100 * min(run, 1.0)), "% of ", b.threads, " threads for this run's processes, ",
+                machine, "% for the whole machine (averages over the run)")
+    else
+        println(io, machine, "% of ", b.threads, " threads for the whole machine (average over the run)")
+    end
     return nothing
 end
 

@@ -1,8 +1,11 @@
 # Running a plan: one task per slot. A slot takes its pool's head first, then walks
 # its own stretch of the pool's body, takes half of the largest stretch left when
-# its own is done, then the pool's tail, and rebinds to a pool no slot serves when
-# its own has nothing left. `workers` caps live processes throughout: the run takes
-# longer rather than start a process the caller did not authorize.
+# its own is done, then the pool's tail. When its own pool has nothing left it
+# rebinds, restarting its process under another pool's profile: to a pool no slot
+# serves, or else to the pool whose slots have the most work left each, when that
+# is more than a fresh worker costs there. `workers` caps live processes
+# throughout: the run takes longer rather than start a process the caller did not
+# authorize.
 
 using Base: SIGKILL
 
@@ -30,11 +33,35 @@ mutable struct Slot
 end
 
 """
+    PoolStats
+
+What the run has measured of one pool, for deciding where a slot whose own pool
+has run dry does the most good: how long the pool's workers took to be ready; the
+compile time of items that ran first on a fresh process, and of items that ran on
+one that had run others; and how long its units took, against their estimates
+where they had one.
+"""
+mutable struct PoolStats
+    starts::Int
+    start_s::Float64
+    cold::Int                    # items that ran first on a fresh process
+    cold_compile_s::Float64
+    warm::Int                    # items that ran on a process that had run others
+    warm_compile_s::Float64
+    units::Int
+    took_s::Float64
+    estimated_s::Float64         # the estimates of the units that had one
+    estimated_took_s::Float64    # and what those units took
+end
+PoolStats() = PoolStats(0, 0.0, 0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0)
+
+"""
     Queues
 
 Every cursor a run has, behind one lock: each pool's head and tail, and each slot's
-stretch of its pool's body. A run claims a few thousand times, so an uncontended
-lock costs nothing, and one lock rules out racing cursors.
+stretch of its pool's body; and what the run has measured of each pool, which the
+slots write and a slot whose pool ran dry reads. A run claims a few thousand times,
+so an uncontended lock costs nothing, and one lock rules out racing cursors.
 """
 mutable struct Queues
     const lock::ReentrantLock
@@ -46,6 +73,11 @@ mutable struct Queues
     const pool::Vector{Int32}        # per slot: the pool it serves
     const pending::Vector{Int32}     # pools no slot serves yet, in pickup order
     const claimed::BitVector         # per unit: handed out already
+    const serving::Vector{Int}       # per pool: slots working for it
+    const est::Vector{Float64}       # per unit: estimated seconds, 0 for none
+    const typical::Float64           # a unit without an estimate, before the run has timed any
+    const stats::Vector{PoolStats}   # per pool
+    const prior::ColdCost            # what a fresh worker cost in earlier runs
     cancelled::Bool
     paused::Bool        # the memory guard is holding new work back
 end
@@ -54,7 +86,10 @@ Queues(p::Plan) = Queues(
     ReentrantLock(), p.pools,
     UnitIdx[first(k.head) for k in p.pools], UnitIdx[first(k.tail) for k in p.pools],
     UnitIdx[first(r) for r in p.slot_units], UnitIdx[last(r) for r in p.slot_units],
-    copy(p.slot_pool), copy(p.pending), falses(length(p.units)), false, false
+    copy(p.slot_pool), copy(p.pending), falses(length(p.units)),
+    [count(==(k), p.slot_pool) for k in eachindex(p.pools)],
+    p.units.est_s, typical_estimate(p.units.est_s), [PoolStats() for _ in p.pools], p.cold,
+    false, false
 )
 
 struct Claim
@@ -98,14 +133,83 @@ function claim!(q::Queues, s::Integer)
             return next!(q, q.from, s)
         end
         q.tail[k] <= last(q.pools[k].tail) && return next!(q, q.tail, k)
+        # Its own pool has nothing left: the slot moves to another, whose profile
+        # its next process is started with.
         if !isempty(q.pending)
-            k = popfirst!(q.pending)
-            q.pool[s] = k
-            q.from[s], q.to[s] = first(q.pools[k].body), last(q.pools[k].body)
-            return Claim(:rebind, UnitIdx(0), k)
+            j = popfirst!(q.pending)
+            q.from[s], q.to[s] = first(q.pools[j].body), last(q.pools[j].body)
+        else
+            j = neediest_pool(q, k)
+            if j == 0
+                q.serving[k] -= 1
+                return Claim(:done)
+            end
+            # An empty stretch: it takes what is left of the pool's head, then the
+            # second half of the largest stretch, as any of the pool's slots would.
+            q.from[s], q.to[s] = UnitIdx(1), UnitIdx(0)
         end
-        return Claim(:done)
+        q.pool[s] = j
+        q.serving[k] -= 1
+        q.serving[j] += 1
+        return Claim(:rebind, UnitIdx(0), j)
     end
+end
+
+# The pool a slot whose own pool `k` has run dry does the most good in, or 0 for
+# none: the one whose slots have the most unclaimed work each, if that is more than
+# a fresh worker costs there. A worker that joins late starts its process and
+# compiles what the pool's others compiled long ago, so it has to take more work off
+# them than that.
+function neediest_pool(q::Queues, k::Integer)
+    best, most = 0, 0.0
+    for j in eachindex(q.pools)
+        j == k && continue
+        share = remaining_work(q, j) / max(q.serving[j], 1)
+        share > most && share > cold_cost(q, j) && ((best, most) = (j, share))
+    end
+    return best
+end
+
+# Pool `j`'s unclaimed work, in seconds: each unit's estimate, scaled by how this
+# run's units have taken against theirs, and a unit without one at the pool's
+# average so far. A pool's units are consecutive: its head, its body, its tail.
+function remaining_work(q::Queues, j::Integer)
+    st = q.stats[j]
+    scale = st.estimated_s > 0 ? st.estimated_took_s / st.estimated_s : 1.0
+    unknown = st.units > 0 ? st.took_s / st.units : q.typical
+    pool = q.pools[j]
+    total = 0.0
+    for u in first(pool.head):last(pool.tail)
+        q.claimed[u] && continue
+        total += q.est[u] > 0 ? q.est[u] * scale : unknown
+    end
+    return total
+end
+
+# What a fresh worker in pool `j` costs before it is as fast as the pool's others:
+# starting its process, and compiling what they already have. Measured in the pool
+# once the run has seen it there, across the run's pools before that, and taken
+# from earlier runs before the run has seen it at all.
+function cold_cost(q::Queues, j::Integer)
+    st = q.stats[j]
+    starts = sum(x -> x.starts, q.stats)
+    start = st.starts > 0 ? st.start_s / st.starts :
+        starts > 0 ? sum(x -> x.start_s, q.stats) / starts : q.prior.start_s
+    excess(cold_s, cold, warm_s, warm) = max(0.0, cold_s / cold - warm_s / warm)
+    cold, warm = sum(x -> x.cold, q.stats), sum(x -> x.warm, q.stats)
+    compile = st.cold > 0 && st.warm > 0 ? excess(st.cold_compile_s, st.cold, st.warm_compile_s, st.warm) :
+        cold > 0 && warm > 0 ?
+        excess(sum(x -> x.cold_compile_s, q.stats), cold, sum(x -> x.warm_compile_s, q.stats), warm) :
+        q.prior.compile_s
+    return start + compile
+end
+
+# A worker process of slot `s` took `seconds` to be ready for its first item.
+note_start!(q::Queues, s::Integer, seconds::Real) = @lock q.lock begin
+    st = q.stats[q.pool[s]]
+    st.starts += 1
+    st.start_s += seconds
+    nothing
 end
 
 cancel!(q::Queues) = @lock q.lock (was = q.cancelled; q.cancelled = true; was)
@@ -149,6 +253,9 @@ struct Statuses
     attempt::Vector{Int8}
     slot::Vector{SlotIdx}
     pid::Vector{Int32}       # the process its last attempt ran in, 0 for none
+    # Where its last attempt came among the items its process ran, 1 for a fresh
+    # process and 0 for none; a fresh process has yet to compile what the others have.
+    seq::Vector{Int16}
     elapsed::Vector{Float32}
     compile::Vector{Float32}
     testsets::Vector{Any}
@@ -156,7 +263,7 @@ end
 
 Statuses(n::Integer) = Statuses(
     falses(n), falses(n), fill(UNSEEN, n), zeros(Float32, n), zeros(Int8, n), fill(SlotIdx(0), n),
-    zeros(Int32, n), zeros(Float32, n), zeros(Float32, n),
+    zeros(Int32, n), zeros(Int16, n), zeros(Float32, n), zeros(Float32, n),
     Vector{Any}(nothing, n)
 )
 
@@ -301,6 +408,7 @@ function run_phases(run::Run, p::Plan, target, setup_path::AbstractString)
                         set_phase!(run.monitor, PHASE_REPORT)
                         stop_monitor!(run.monitor)
                         shutdown!(run)
+                        record_cpu_end!(run.monitor)
                         # Every worker has exited, so every tracefile there will be
                         # is written.
                         cfg.coverage && (run.coverage = collect_coverage(run))
@@ -1027,6 +1135,7 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
     prof = slot.profile
     last_err = nothing
     for attempt in 1:(WORKER_START_RETRIES + 1)
+        began = time()
         w = try
             YATFWorkers.Worker(;
                 julia_args = run.plan.cfg.coverage ?
@@ -1049,11 +1158,11 @@ function start_worker(run::Run, slot::Slot, target, exclusive::Bool = false)
             attempt <= WORKER_START_RETRIES && sleep(1)
             continue
         end
-        t = time() - run.t0
-        append_event!(run.runstate, EVENT_WORKER_UP, 0, slot.id, w.pid, t, t)
+        append_event!(run.runstate, EVENT_WORKER_UP, 0, slot.id, w.pid, began - run.t0, time() - run.t0)
         try
             init_worker!(run, slot, w)
             slot.started_at = time()
+            note_start!(run.queues, slot.id, slot.started_at - began)
             slot.worker_items = 0
             count_worker_start!(run.monitor)
             print_worker_line(
@@ -1365,6 +1474,7 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
     max_attempts = attempts_for(p, u)
     for attempt in 1:max_attempts
         broken = run_unit_once!(run, slot, u, target, Int8(attempt), max_attempts)
+        note_attempt!(run, slot, u)
         has_non_pass(run, u) || return nothing
         if attempt == max_attempts
             # Out of attempts. A chain cut short by a dead worker has lost the state
@@ -1379,6 +1489,38 @@ function run_unit!(run::Run, slot::Slot, u::UnitIdx, target)
         # Retrying a chain restarts it from its first item: re-running one item of
         # a sequence that mutates state does not mean anything.
         reset_unit!(run, u)
+    end
+    return nothing
+end
+
+# What one attempt at unit `u` on `slot` measured, for the scheduler: how long the
+# unit took against its estimate, and each item's compile time, as a fresh process's
+# first item or a later one. Only an attempt whose items all ran and timed
+# themselves counts: an outcome the run decided took as long as it was allowed.
+function note_attempt!(run::Run, slot::Slot, u::UnitIdx)
+    st = run.statuses
+    span = run.plan.units.span[u]
+    any(i -> st.synthetic[i] || st.state[i] === UNSEEN || st.state[i] === CANCELLED, span) && return nothing
+    took = sum(i -> Float64(st.elapsed[i]), span)
+    est = run.plan.units.est_s[u]
+    q = run.queues
+    @lock q.lock begin
+        ps = q.stats[q.pool[slot.id]]
+        ps.units += 1
+        ps.took_s += took
+        if est > 0
+            ps.estimated_s += est
+            ps.estimated_took_s += took
+        end
+        for i in span
+            if st.seq[i] == 1
+                ps.cold += 1
+                ps.cold_compile_s += st.compile[i]
+            elseif st.seq[i] > 1
+                ps.warm += 1
+                ps.warm_compile_s += st.compile[i]
+            end
+        end
     end
     return nothing
 end
@@ -1443,11 +1585,13 @@ function attempt_on_worker!(run::Run, slot::Slot, i::ItemIdx, target, attempt::I
         ensure_worker!(run, slot, target, p.units.exclusive[p.items.unit[i]])
     catch e
         is_interrupt(e) && rethrow()
+        run.statuses.seq[i] = 0
         began!(run, i, slot.id, attempt, 0)
         record_error!(run, i, slot, attempt, ERRORED, sprint(showerror, e))
         return false
     end
     spec = item_spec(run, i, slot, attempt)
+    run.statuses.seq[i] = Int16(min(slot.worker_items + 1, typemax(Int16)))
     began!(run, i, slot.id, attempt, w.pid)
     @atomic slot.current = i
     result = try
@@ -1681,7 +1825,8 @@ function record!(
         recompile = stats.recompile_ns / 1.0e9, alloc_mb = stats.bytes / 2^20,
         peak_rss_mb = stats.maxrss / 2^20, pid = st.pid[i]
     )
-    append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0; item = i, attempt)
+    append_event!(run.runstate, EVENT_ATTEMPT, UInt8(state), slot, st.pid[i], st.start[i], ended - run.t0;
+                  item = i, attempt, seq = st.seq[i])
     @atomic run.last_finish = time()
     report_item!(run, i, state, count_done!(run, i), note)
     return nothing

@@ -75,9 +75,11 @@ end
 
 The order the run is expected to start the items in, and where: its own dispatch
 (`claim!`) played out with each unit taking as long as the recorded runs say, and a
-unit nothing is recorded for counting as a typical one. `items` holds `(start,
-worker, item)` in that order, a chain's members spread over its time; `work` is each
-worker's estimated seconds. A run without workers takes the units in plan order.
+unit nothing is recorded for counting as a typical one. A worker that moves to
+another profile's items first pays what the recorded runs say a fresh worker costs.
+`items` holds `(start, worker, item)` in that order, a chain's members spread over
+its time; `work` is each worker's estimated seconds. A run without workers takes
+the units in plan order.
 """
 function run_order(p::Plan)
     typical = typical_estimate(p.units.est_s)
@@ -105,7 +107,7 @@ function run_order(p::Plan)
         s = argmin(k -> (done[k], free[k], k), 1:nslots(p))
         claim = claim!(q, s)
         claim.kind === :done && (done[s] = true; continue)
-        claim.kind === :rebind && continue
+        claim.kind === :rebind && (free[s] += cold_cost(q, claim.pool); continue)
         started!(free[s], s, claim.unit)
         free[s] += est[claim.unit]
     end

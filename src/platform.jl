@@ -10,7 +10,7 @@ module Platform
 using YATFWorkers: is_interrupt
 
 export process_rss, child_pids, machine_memory, available_fraction, cpu_load, cpu_count,
-    platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
+    cpu_ticks, process_cpu_seconds, platform_selfcheck!, ensure_checked!, PER_PROCESS_OK
 
 const PER_PROCESS_OK = Ref(false)
 
@@ -335,6 +335,51 @@ end
 How many hardware threads the load average is spread over.
 """
 cpu_count() = Sys.CPU_THREADS
+
+"""
+    cpu_ticks() -> (busy, total, threads)
+
+Milliseconds the machine's CPU threads have spent busy, and in all, since boot,
+summed over the `threads` of them: two readings give the share of the time in
+between that the machine was busy, whatever it was busy with.
+"""
+function cpu_ticks()
+    busy = total = UInt64(0)
+    cpus = Sys.cpu_info()
+    for c in cpus
+        b = c.var"cpu_times!user" + c.var"cpu_times!nice" + c.var"cpu_times!sys" + c.var"cpu_times!irq"
+        busy += b
+        total += b + c.var"cpu_times!idle"
+    end
+    return busy, total, length(cpus)
+end
+
+const RUSAGE_SELF = Cint(0)
+const RUSAGE_CHILDREN = Cint(-1)
+const RUSAGE_BYTES = 256   # `struct rusage` is 144 on the 64-bit platforms; room to spare
+
+"""
+    process_cpu_seconds() -> Float64
+
+The user and system time of this process and of every child it has waited for, in
+seconds, or `-1.0` where the platform keeps no total for children (Windows). A
+worker's time counts once it has exited and been reaped.
+"""
+function process_cpu_seconds()
+    Sys.iswindows() && return -1.0
+    total = 0.0
+    buf = zeros(UInt8, RUSAGE_BYTES)
+    for who in (RUSAGE_SELF, RUSAGE_CHILDREN)
+        ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), who, buf) == 0 || return -1.0
+        # `ru_utime` then `ru_stime`, each a 16-byte `struct timeval`: seconds as an
+        # Int64, then microseconds. Those are an Int32 on macOS and an Int64 on
+        # Linux, below a million either way, so the low four bytes hold them.
+        for at in (0, 16)
+            total += reinterpret(Int64, buf[at .+ (1:8)])[1] + reinterpret(Int32, buf[at .+ (9:12)])[1] / 1e6
+        end
+    end
+    return total
+end
 
 """
     machine_memory() -> (used, total)

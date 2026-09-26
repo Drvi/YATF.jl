@@ -442,6 +442,14 @@ end
             @test sort([rs.items[e.item].name for e in attempts]) == ["a", "b", "throws"]
             @test all(e -> e.pid == up.pid && e.t1 >= e.t0, attempts)
             @test [e.state for e in attempts if rs.items[e.item].name != "throws"] == [PASSED, PASSED]
+            # Each attempt says where it came among its process's items, and the start
+            # how long the process took to come up: what the next run's plan expects a
+            # fresh worker to cost.
+            @test [e.seq for e in sort(attempts; by = e -> e.t0)] == [1, 2, 3]
+            @test up.t1 > up.t0
+            cold = history(pkg).cold
+            @test cold.start_s ≈ up.t1 - up.t0
+            @test cold.compile_s >= 0
             # An item that throws took time and memory like any other.
             @test all(s -> s.pid == up.pid && s.peak_rss_mb > 0 && s.elapsed > 0, rs.statuses)
             @test occursin("run it again", sprint(show, MIME"text/plain"(), rs))

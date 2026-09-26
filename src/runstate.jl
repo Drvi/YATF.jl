@@ -134,11 +134,11 @@ struct EventRecord
     attempt::Int8
     reserved::UInt8
     slot::Int16
-    reserved2::Int16
+    seq::Int16    # for an attempt, where it came among its process's items: 1 for a fresh one, 0 unknown
     item::Int32
     pid::Int32
     t0::Float32   # seconds since the run started: when it began
-    t1::Float32   # when it ended; a worker's start has t1 == t0
+    t1::Float32   # when it ended; for a worker's start, when its process was up
     exitcode::Int32
     signal::Int32
 end
@@ -393,11 +393,12 @@ end
 
 function append_event!(
         rsf::Union{Nothing, RunStateFile}, kind::UInt8, state::Integer, slot::Integer, pid::Integer,
-        t0::Real, t1::Real; item::Integer = 0, attempt::Integer = 0, exitcode::Integer = 0, signal::Integer = 0
+        t0::Real, t1::Real; item::Integer = 0, attempt::Integer = 0, exitcode::Integer = 0, signal::Integer = 0,
+        seq::Integer = 0
     )
     update!(rsf, -1) do io
         rsf.event_ref[] = EventRecord(
-            kind, UInt8(state), Int8(attempt), 0x00, Int16(slot), Int16(0), Int32(item), Int32(pid),
+            kind, UInt8(state), Int8(attempt), 0x00, Int16(slot), Int16(seq), Int32(item), Int32(pid),
             Float32(t0), Float32(t1), Int32(exitcode), Int32(signal)
         )
         write_record(io, rsf.event_ref)
@@ -451,15 +452,18 @@ end
     RunStateEvent
 
 One thing that happened during a run, in the order it happened: `kind` is
-`:attempt` (an attempt at `item` ended in `state`), `:worker_up` or `:worker_down`
-(the process `pid` of `slot` started or ended; `ended_by`, `exitcode` and `signal`
-say why and how). Times are seconds since the run started.
+`:attempt` (an attempt at `item` ended in `state`; `seq` is where it came among the
+items its process ran, 1 for a fresh process and 0 when not recorded), `:worker_up`
+or `:worker_down` (the process `pid` of `slot` started or ended; `ended_by`,
+`exitcode` and `signal` say why and how). Times are seconds since the run started;
+a worker's start runs from launching its process to the process being up.
 """
 struct RunStateEvent
     kind::Symbol
     state::ItemState
     ended_by::Symbol
     attempt::Int8
+    seq::Int16
     slot::Int16
     item::Int32
     pid::Int32
@@ -567,7 +571,7 @@ function read_run_state(path::AbstractString)
                 e.kind == EVENT_WORKER_DOWN ? :worker_down : :unknown
             state = kind === :attempt && e.state <= UInt8(CANCELLED) ? ItemState(e.state) : UNSEEN
             ended_by = kind === :worker_down ? worker_end(e.state) : :none
-            push!(events, RunStateEvent(kind, state, ended_by, e.attempt, e.slot, e.item, e.pid, e.t0, e.t1, e.exitcode, e.signal))
+            push!(events, RunStateEvent(kind, state, ended_by, e.attempt, e.seq, e.slot, e.item, e.pid, e.t0, e.t1, e.exitcode, e.signal))
             at += RS_EVENT_BYTES
         end
         return RunStateRecord(
@@ -867,9 +871,10 @@ end
 """
     history(root) -> History
 
-Per-item durations and last-run failures, taken from the most recent runs, and
-when the newest of them started. Only items that actually ran contribute; a name
-that has never been seen simply has no estimate and is scheduled as if it were new.
+Per-item durations and last-run failures, taken from the most recent runs, when
+the newest of them started, and what a fresh worker cost in them. Only items that
+actually ran contribute; a name that has never been seen simply has no estimate and
+is scheduled as if it were new.
 """
 function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
     seconds = Dict{String, Float64}()
@@ -895,7 +900,38 @@ function history(root::AbstractString; nruns::Int = HISTORY_RUNS)
             is_non_pass(st.state) && (failed[it.name] = ago)
         end
     end
-    return History(seconds, failed, since)
+    return History(seconds, failed, since, recorded_cold_cost(recent))
+end
+
+# What a fresh worker cost across `runs`: how long its process took to come up, and
+# how much longer a process's first item spent compiling than its later ones did.
+# 0 for what the runs did not record.
+function recorded_cold_cost(runs::Vector{RunStateRecord})
+    starts, start_s = 0, 0.0
+    cold, cold_s, warm, warm_s = 0, 0.0, 0, 0.0
+    for rs in runs
+        seq = Dict{Tuple{Int32, Int8}, Int16}()   # (item, attempt) => where it came on its process
+        for e in rs.events
+            if e.kind === :attempt && e.seq > 0
+                seq[(e.item, e.attempt)] = e.seq
+            elseif e.kind === :worker_up && e.t1 > e.t0
+                starts += 1
+                start_s += e.t1 - e.t0
+            end
+        end
+        for (i, st) in enumerate(rs.statuses)
+            n = get(seq, (Int32(i), st.attempt), Int16(0))
+            if n == 1
+                cold += 1; cold_s += st.compile
+            elseif n > 1
+                warm += 1; warm_s += st.compile
+            end
+        end
+    end
+    return ColdCost(
+        starts > 0 ? start_s / starts : 0.0,
+        cold > 0 && warm > 0 ? max(0.0, cold_s / cold - warm_s / warm) : 0.0
+    )
 end
 
 """

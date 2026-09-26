@@ -244,12 +244,13 @@ end
         @test length(unique(r.pid for r in rows)) == 1   # a chain is one worker
     end
 
-    @testset "an idle slot never steals work belonging to another profile" begin
+    @testset "an idle slot never runs work belonging to another profile in its own process" begin
         # One quick item in the default pool and three slow ones in a pool with
         # different julia flags: the default slot drains first and goes looking for
-        # work. What it must not find is an item declared to run under flags its
+        # work. What it must not do is run an item declared to run under flags its
         # own process was not started with — that item would be reported as a pass
-        # without ever having been run the way it was written.
+        # without ever having been run the way it was written. It may go on with
+        # them in a process started with their flags, which each item checks.
         dir = make_pkg(
             "NoCrossPoolSteal",
             "test/t_test.jl" => string(
@@ -269,10 +270,38 @@ end
             journal(path)
         end
         @test length(rows) == 4
-        # The three bounds items shared one process; the quick one had its own.
+        # The quick one's process ran none of the bounds items.
         checked = unique(r.pid for r in rows if startswith(r.name, "checked"))
-        @test length(checked) == 1
         @test only(r.pid for r in rows if r.name == "quick") ∉ checked
+    end
+
+    @testset "a slot whose profile's items are done goes on with another profile's" begin
+        # One quick item under a profile of its own, and two seconds of default
+        # items. The profile's slot is done at once, and a fresh default worker in
+        # it takes far less than the second each default slot would otherwise have
+        # left, so it restarts under the default profile and takes a share.
+        dir = make_pkg(
+            "Refilled",
+            "test/t_test.jl" => string(
+                journal_item("tiny"; opts = "sandbox=:tiny", body = "@test ENV[\"TINY\"] == \"1\""),
+                (journal_item("d$i"; body = "sleep(0.1)\n@test !haskey(ENV, \"TINY\")") for i in 1:20)...,
+            ),
+            "test/TestItems.toml" => "[profiles.tiny]\nenv = { TINY = \"1\" }\n",
+        )
+        rows = with_journal() do path
+            states, run, p = run_states(dir; workers = 2, logs = :issues, monitor = false)
+            @test all(==(PASSED), values(states))
+            ran = [run.statuses.slot[i] for i in 1:nitems(p) if p.items.name[i] != "tiny"]
+            tiny_slot = run.statuses.slot[findfirst(==("tiny"), p.items.name)]
+            # Default items ran on both slots, the profile's among them.
+            @test sort(unique(ran)) == [1, 2]
+            @test tiny_slot in ran
+            journal(path)
+        end
+        # In a process of its own, not the one the profile's item ran in: each item
+        # checked it ran under its own profile's environment.
+        tiny_pid = only(r.pid for r in rows if r.name == "tiny")
+        @test tiny_pid ∉ [r.pid for r in rows if r.name != "tiny"]
     end
 
     @testset "the last unit in a queue can still be stolen" begin
